@@ -5,12 +5,9 @@ the prompt stays within a sane size.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from app.config import settings
 from app.models import Lesson
-
-_UPLOAD_ROOT = Path(settings.upload_dir)
+from app.services.file_storage import resolve_stored_file
 
 
 def _pdf_to_text(path: Path) -> str:
@@ -35,8 +32,8 @@ def lesson_context(lesson: Lesson) -> str:
     text = ""
     files = getattr(lesson, "uploaded_files", []) or []
     if files and files[0].storage_path:
-        path = _UPLOAD_ROOT / files[0].storage_path
-        if path.exists():
+        path = resolve_stored_file(files[0].storage_path)
+        if path is not None:
             text = _pdf_to_text(path)
 
     if not text.strip() and lesson.slides:

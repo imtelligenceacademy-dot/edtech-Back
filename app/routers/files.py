@@ -6,8 +6,6 @@ their scope).
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
@@ -22,6 +20,7 @@ from app.models import Lesson, LessonAssignment, UploadedFile, User
 from app.models.enums import Role
 from app.schemas.file import UploadedFileOut, UploadResult
 from app.services.auto_assign import assign_uploaded_file
+from app.services.file_storage import resolve_stored_file, upload_root
 from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
 
@@ -29,7 +28,6 @@ router = APIRouter(prefix="/api/files", tags=["files"])
 
 PDF_CONTENT_TYPE = "application/pdf"
 PDF_MAGIC = b"%PDF-"
-_UPLOAD_ROOT = Path(settings.upload_dir)
 
 
 def _max_bytes() -> int:
@@ -70,8 +68,9 @@ async def upload_file(
 
     file_id = new_id("file")
     stored_name = f"{file_id}.pdf"
-    _UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-    (_UPLOAD_ROOT / stored_name).write_bytes(content)
+    root = upload_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / stored_name).write_bytes(content)
 
     uploaded = UploadedFile(
         id=file_id,
@@ -150,8 +149,8 @@ def download_file(
     if not _can_access(db, current, uploaded):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
 
-    path = _UPLOAD_ROOT / uploaded.storage_path
-    if not path.exists():
+    path = resolve_stored_file(uploaded.storage_path)
+    if path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file missing")
 
     return FileResponse(
@@ -193,7 +192,9 @@ def delete_file(
 
     # Remove the bytes from disk too, ignoring if already gone.
     if uploaded.storage_path:
-        (_UPLOAD_ROOT / uploaded.storage_path).unlink(missing_ok=True)
+        path = resolve_stored_file(uploaded.storage_path)
+        if path is not None:
+            path.unlink(missing_ok=True)
 
     db.delete(uploaded)
     db.commit()
