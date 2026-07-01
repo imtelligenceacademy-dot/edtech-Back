@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     anthropic_model: str = "claude-sonnet-4-6"
     ai_max_context_chars: int = 24000
     ai_timeout_seconds: int = 30
+    ai_teacher_daily_limit: int = 40
+    ai_teacher_hourly_limit: int = 15
+    ai_admin_daily_limit: int = 15
+    ai_admin_hourly_limit: int = 5
 
     # --- Email delivery for DB backups ------------------------------------ #
     # Resend (https://resend.com) is preferred for production. If a Resend API

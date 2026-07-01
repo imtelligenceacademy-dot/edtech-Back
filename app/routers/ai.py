@@ -24,7 +24,7 @@ from app.schemas.ai import (
     AIHealth,
     AIUsageStats,
 )
-from app.services.ai_usage import record_ai_usage, usage_stats
+from app.services.ai_usage import AILimitExceeded, enforce_ai_limit, record_ai_usage, usage_stats
 from app.services.lesson_access import is_lesson_available
 from app.services.llm import ChatMessage, get_provider
 from app.services.pdf_text import lesson_context
@@ -148,6 +148,10 @@ def chat(
     current: User = Depends(require_capability("use-ai-assistant")),
 ) -> AIChatResponse:
     system, messages, source_ref = _build_prompt(db, current, payload)
+    try:
+        enforce_ai_limit(db, current, "teacher")
+    except AILimitExceeded as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message) from exc
     record_ai_usage(db, current, "teacher")
     provider = get_provider()
     try:
@@ -168,6 +172,18 @@ def chat_stream(
 ) -> StreamingResponse:
     # Everything DB-bound is resolved before the generator runs.
     system, messages, source_ref = _build_prompt(db, current, payload)
+    try:
+        enforce_ai_limit(db, current, "teacher")
+    except AILimitExceeded as exc:
+        def limited_stream():
+            yield f"data: {json.dumps({'error': exc.message})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+        return StreamingResponse(
+            limited_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     record_ai_usage(db, current, "teacher")
     provider = get_provider()
 
@@ -231,6 +247,18 @@ def admin_chat_stream(
     current: User = Depends(require_roles(Role.school_admin)),
 ) -> StreamingResponse:
     system, messages, school_name = _build_admin_prompt(db, current, payload)
+    try:
+        enforce_ai_limit(db, current, "admin")
+    except AILimitExceeded as exc:
+        def limited_stream():
+            yield f"data: {json.dumps({'error': exc.message})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+        return StreamingResponse(
+            limited_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
     record_ai_usage(db, current, "admin")
     provider = get_provider()
 
@@ -283,6 +311,10 @@ def admin_report(
     context, _ = build_school_context(db, current)
     system = f"{_REPORT_SYSTEM}\n\n<SCHOOL DATA>\n{context}\n</SCHOOL DATA>"
     provider = get_provider()
+    try:
+        enforce_ai_limit(db, current, "admin")
+    except AILimitExceeded as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message) from exc
     try:
         narrative = provider.chat(
             system, [{"role": "user", "content": "Write the school report now."}]

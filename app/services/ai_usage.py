@@ -12,11 +12,50 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import AiUsage, User
 from app.models.enums import Role
 from app.utils import new_id
 
 from collections.abc import Sequence
+
+
+class AILimitExceeded(RuntimeError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
+
+def enforce_ai_limit(db: Session, user: User, kind: str) -> None:
+    """Raise when a user has exhausted their hourly or daily AI quota."""
+    if kind == "teacher":
+        hourly_limit = settings.ai_teacher_hourly_limit
+        daily_limit = settings.ai_teacher_daily_limit
+        label = "teacher AI assistant"
+    else:
+        hourly_limit = settings.ai_admin_hourly_limit
+        daily_limit = settings.ai_admin_daily_limit
+        label = "school-admin AI assistant"
+
+    now = datetime.now(timezone.utc)
+    hour_start = now - timedelta(hours=1)
+    day_start = now - timedelta(days=1)
+
+    base = select(func.count(AiUsage.id)).where(
+        AiUsage.user_id == user.id,
+        AiUsage.kind == kind,
+    )
+    last_hour = db.scalar(base.where(AiUsage.created_at >= hour_start)) or 0
+    if hourly_limit > 0 and last_hour >= hourly_limit:
+        raise AILimitExceeded(
+            f"You've reached the {label} hourly limit ({hourly_limit}). Please try again later."
+        )
+
+    last_day = db.scalar(base.where(AiUsage.created_at >= day_start)) or 0
+    if daily_limit > 0 and last_day >= daily_limit:
+        raise AILimitExceeded(
+            f"You've reached the {label} daily limit ({daily_limit}). Please try again tomorrow."
+        )
 
 
 def record_ai_usage(db: Session, user: User, kind: str) -> None:
