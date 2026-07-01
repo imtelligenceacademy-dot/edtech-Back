@@ -5,7 +5,8 @@ Security properties:
 - Account lockout after N failed attempts within a window.
 - Uniform error messages so the endpoint does not leak whether an email exists.
 - Refresh-token rotation: each refresh revokes the old token and issues a new one.
-- Tokens are delivered only as httpOnly cookies.
+- Tokens are delivered as httpOnly cookies, with the access token also returned
+  for cross-site mobile fallback clients.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ def _aware(dt: datetime | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _issue_session(db: Session, response: Response, user: User, request: Request) -> None:
+def _issue_session(db: Session, response: Response, user: User, request: Request) -> str:
     """Mint an access cookie and a fresh, persisted refresh token."""
     access = create_access_token(user_id=user.id, role=user.role.value)
     set_access_cookie(response, access)
@@ -74,6 +75,7 @@ def _issue_session(db: Session, response: Response, user: User, request: Request
         )
     )
     set_refresh_cookie(response, raw_refresh)
+    return access
 
 
 # Public self-signup is intentionally not offered — only the Super Admin
@@ -132,7 +134,7 @@ def login(
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)
 
-    _issue_session(db, response, user, request)
+    access = _issue_session(db, response, user, request)
     record_event(
         db, event=SecurityEvent.normal_login, status=SecurityStatus.ok,
         ip=ip, device=device, user=user,
@@ -140,7 +142,12 @@ def login(
     db.commit()
 
     return SessionUser(
-        user_id=user.id, name=user.name, email=user.email, role=user.role, school_id=user.school_id
+        user_id=user.id,
+        name=user.name,
+        email=user.email,
+        role=user.role,
+        school_id=user.school_id,
+        access_token=access,
     )
 
 
@@ -162,9 +169,9 @@ def refresh(request: Request, response: Response, db: Session = Depends(get_db))
 
     # Rotate: revoke the presented token, issue a new pair.
     record.revoked = True
-    _issue_session(db, response, user, request)
+    access = _issue_session(db, response, user, request)
     db.commit()
-    return MessageResponse(message="Token refreshed")
+    return MessageResponse(message="Token refreshed", access_token=access)
 
 
 @router.post("/logout", response_model=MessageResponse)

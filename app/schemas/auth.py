@@ -26,7 +26,9 @@ class SessionUser(CamelModel):
     email: EmailStr
     role: Role
     school_id: str | None = None
+    access_token: str | None = Field(default=None, serialization_alias="accessToken")
 
 
 class MessageResponse(CamelModel):
     message: str
+    access_token: str | None = Field(default=None, serialization_alias="accessToken")
