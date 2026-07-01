@@ -1,4 +1,4 @@
-"""Super-admin database backup: download the full DB as .db, or email it."""
+"""Super-admin database backup, email, wipe, and restore."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from app.services.backup import (
     EmailNotConfigured,
     InvalidBackup,
     backup_filename,
+    backup_upload_hint,
     restore_database,
     send_backup_email,
     snapshot_bytes,
@@ -105,8 +106,12 @@ async def restore_db(
     db: Session = Depends(get_db),
     _: User = Depends(require_roles(Role.super_admin)),
 ) -> MessageResponse:
-    if not file.filename or not file.filename.lower().endswith(".db"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Upload a .db file")
+    expected = backup_upload_hint()
+    if not file.filename or not file.filename.lower().endswith(expected):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Upload a {expected} backup file",
+        )
     content = await file.read()
     db.rollback()  # release the session's read lock before the write
     try:
