@@ -1,0 +1,27 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Data / ORM
+sqlalchemy==2.0.36
+alembic==1.14.0
+psycopg[binary]==3.2.3       # PostgreSQL driver (production); SQLite needs none
+
+# Validation / settings
+pydantic==2.10.4
+pydantic-settings==2.7.1
+email-validator==2.2.0
+
+# Security
+argon2-cffi==23.1.0          # Argon2id password hashing (OWASP recommended)
+pyjwt==2.10.1                # JWT access / refresh tokens
+
+# Misc
+python-multipart==0.0.20     # form parsing (login)
+
+# AI assistant
+httpx==0.28.1                # calling LLM provider HTTP APIs
+pypdf==5.1.0                 # extracting lesson PDF text for grounding
+
+# Reports
+python-docx==1.1.2           # generating Word (.docx) reports
