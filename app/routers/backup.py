@@ -17,6 +17,7 @@ from app.models.enums import Role
 from app.schemas.base import CamelModel
 from app.services.backup import (
     EmailNotConfigured,
+    EmailDeliveryFailed,
     InvalidBackup,
     backup_filename,
     backup_upload_hint,
@@ -63,10 +64,12 @@ def email_db(
         send_backup_email(recipients, data, filename, payload.note)
     except EmailNotConfigured as e:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)) from e
+    except EmailDeliveryFailed as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Failed to send the backup email. Check the SMTP settings and try again.",
+            detail="Failed to send the backup email. Check the email provider settings.",
         ) from exc
     return MessageResponse(
         message=f"Backup emailed to {len(recipients)} recipient(s): {', '.join(recipients)}"

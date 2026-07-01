@@ -38,6 +38,10 @@ class EmailNotConfigured(RuntimeError):
     pass
 
 
+class EmailDeliveryFailed(RuntimeError):
+    pass
+
+
 class InvalidBackup(ValueError):
     pass
 
@@ -285,7 +289,11 @@ def _send_via_resend(
         json=payload,
         timeout=60,
     )
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = resp.text[:500] if resp.text else str(exc)
+        raise EmailDeliveryFailed(f"Resend rejected the email: {detail}") from exc
 
 
 def _send_via_smtp(
@@ -302,12 +310,15 @@ def _send_via_smtp(
             data, maintype="application", subtype="octet-stream", filename=filename
         )
 
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as server:
-        if settings.smtp_tls:
-            server.starttls()
-        if settings.smtp_user:
-            server.login(settings.smtp_user, settings.smtp_password)
-        server.send_message(msg)
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as server:
+            if settings.smtp_tls:
+                server.starttls()
+            if settings.smtp_user:
+                server.login(settings.smtp_user, settings.smtp_password)
+            server.send_message(msg)
+    except Exception as exc:
+        raise EmailDeliveryFailed(f"SMTP failed: {exc}") from exc
 
 
 def send_email(
@@ -321,9 +332,13 @@ def send_email(
         try:
             _send_via_resend(recipients, subject, text, attachment)
             return
-        except Exception:
+        except EmailDeliveryFailed:
             if not settings.smtp_host:
                 raise
+            logger.warning("Resend send failed; falling back to SMTP.", exc_info=True)
+        except Exception as exc:
+            if not settings.smtp_host:
+                raise EmailDeliveryFailed(f"Resend failed: {exc}") from exc
             logger.warning("Resend send failed; falling back to SMTP.", exc_info=True)
 
     if not settings.smtp_host:
