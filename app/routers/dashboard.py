@@ -30,7 +30,13 @@ def super_admin_overview(
     teacher_count = (
         db.scalar(select(func.count(User.id)).where(User.role == Role.teacher)) or 0
     )
-    lesson_count = db.scalar(select(func.count(Lesson.id))) or 0
+    lesson_rows = db.execute(select(Lesson.id, Lesson.grade, Lesson.lesson_no)).all()
+    lesson_count = len(
+        {
+            (grade, lesson_no) if lesson_no is not None else ("legacy", lesson_id)
+            for lesson_id, grade, lesson_no in lesson_rows
+        }
+    )
     pending_count = (
         db.scalar(select(func.count(User.id)).where(User.status == UserStatus.pending)) or 0
     )
