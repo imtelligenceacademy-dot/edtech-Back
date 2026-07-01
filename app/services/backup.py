@@ -327,19 +327,13 @@ def send_email(
     text: str,
     attachment: Attachment | None = None,
 ) -> None:
-    """Send an email using Resend first, then SMTP if configured."""
+    """Send an email using Resend when configured, otherwise SMTP."""
     if settings.resend_api_key:
         try:
             _send_via_resend(recipients, subject, text, attachment)
             return
-        except EmailDeliveryFailed:
-            if not settings.smtp_host:
-                raise
-            logger.warning("Resend send failed; falling back to SMTP.", exc_info=True)
         except Exception as exc:
-            if not settings.smtp_host:
-                raise EmailDeliveryFailed(f"Resend failed: {exc}") from exc
-            logger.warning("Resend send failed; falling back to SMTP.", exc_info=True)
+            raise EmailDeliveryFailed(f"Resend failed: {exc}") from exc
 
     if not settings.smtp_host:
         raise EmailNotConfigured(
