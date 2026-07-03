@@ -45,11 +45,18 @@ from app.security import (
 )
 from app.utils import client_ip, new_id, user_agent
 
+import secrets
+
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 _INVALID_CREDENTIALS = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password"
 )
+
+# A throwaway Argon2 hash verified when the email is unknown, so a failed login
+# for a non-existent account costs the same time as one for a real account.
+# Without this, the response timing leaks whether an email is registered.
+_DUMMY_PASSWORD_HASH = hash_password(secrets.token_urlsafe(16))
 
 
 def _aware(dt: datetime | None) -> datetime | None:
@@ -105,7 +112,13 @@ def login(
             detail="Account temporarily locked. Try again later.",
         )
 
-    valid = bool(user) and verify_password(payload.password, user.password_hash)
+    # Always run one Argon2 verify (against a dummy hash for unknown emails) so
+    # the timing doesn't reveal whether the account exists.
+    if user:
+        valid = verify_password(payload.password, user.password_hash)
+    else:
+        verify_password(payload.password, _DUMMY_PASSWORD_HASH)
+        valid = False
 
     if not valid:
         if user:
