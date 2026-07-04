@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import PurePath
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
@@ -110,7 +111,8 @@ async def restore_db(
     _: User = Depends(require_roles(Role.super_admin)),
 ) -> MessageResponse:
     expected = backup_upload_hint()
-    if not file.filename or not file.filename.lower().endswith(expected):
+    suffix = PurePath(file.filename or "").suffix.lower()
+    if suffix and suffix != expected:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Upload a {expected} backup file",

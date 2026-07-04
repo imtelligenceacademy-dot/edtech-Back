@@ -131,6 +131,7 @@ app.add_middleware(
     allow_credentials=True,  # required for cookie-based auth
     allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
+    expose_headers=["Content-Disposition"],
 )
 
 for r in (auth, users, schools, lessons, progress, reports, security, files, dashboard, ai, backup, access_requests):
