@@ -11,7 +11,7 @@ Security properties:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
@@ -27,7 +27,7 @@ from app.cookies import (
 )
 from app.database import get_db
 from app.deps import get_current_user
-from app.models import RefreshToken, User
+from app.models import LoginThrottle, RefreshToken, User
 from app.models.enums import SecurityEvent, SecurityStatus, UserStatus
 from app.schemas.auth import (
     LoginRequest,
@@ -63,6 +63,86 @@ def _aware(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _account_lock_minutes(failed_count: int) -> int:
+    lockouts = max(1, failed_count // settings.max_failed_logins)
+    minutes = settings.lockout_minutes * (2 ** (lockouts - 1))
+    return min(minutes, settings.max_lockout_minutes)
+
+
+def _get_ip_throttle(db: Session, ip: str) -> LoginThrottle | None:
+    if not ip:
+        return None
+    throttle = db.get(LoginThrottle, ip)
+    if throttle is None:
+        throttle = LoginThrottle(ip=ip)
+        db.add(throttle)
+        db.flush()
+    return throttle
+
+
+def _enforce_ip_throttle(db: Session, ip: str, now: datetime) -> None:
+    if not ip:
+        return
+    throttle = db.get(LoginThrottle, ip)
+    if throttle is None:
+        return
+    if throttle.blocked_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="This network is blocked from signing in.",
+        )
+    locked_until = _aware(throttle.locked_until)
+    if locked_until and locked_until > now:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many login attempts from this network. Try again later.",
+        )
+    if locked_until:
+        throttle.locked_until = None
+        throttle.failed_count = 0
+        throttle.window_started_at = None
+
+
+def _record_ip_failure(db: Session, ip: str, now: datetime) -> None:
+    throttle = _get_ip_throttle(db, ip)
+    if throttle is None or throttle.blocked_at is not None:
+        return
+
+    window_start = _aware(throttle.window_started_at)
+    expired = (
+        window_start is None
+        or window_start <= now - timedelta(minutes=settings.login_ip_window_minutes)
+    )
+    if expired:
+        throttle.window_started_at = now
+        throttle.failed_count = 0
+
+    throttle.failed_count += 1
+    if throttle.failed_count >= settings.login_ip_max_failures:
+        throttle.cycle_count += 1
+        throttle.failed_count = 0
+        throttle.window_started_at = None
+        if throttle.cycle_count >= settings.login_ip_ban_cycles:
+            throttle.blocked_at = now
+            throttle.locked_until = None
+            throttle.reason = "Repeated failed login cycles"
+        else:
+            throttle.locked_until = now + timedelta(minutes=settings.lockout_minutes)
+
+
+def _clear_ip_failures(db: Session, ip: str) -> None:
+    if not ip:
+        return
+    throttle = db.get(LoginThrottle, ip)
+    if throttle is None or throttle.blocked_at is not None:
+        return
+    throttle.failed_count = 0
+    throttle.cycle_count = 0
+    throttle.window_started_at = None
+    throttle.locked_until = None
+    throttle.reason = ""
 
 
 def _issue_session(db: Session, response: Response, user: User, request: Request) -> str:
@@ -101,6 +181,7 @@ def login(
 
     # Lockout check (constant-ish path; still verify a dummy hash to reduce timing signal).
     now = datetime.now(timezone.utc)
+    _enforce_ip_throttle(db, ip, now)
     if user and user.locked_until and _aware(user.locked_until) > now:
         record_event(
             db, event=SecurityEvent.blocked_second_device, status=SecurityStatus.blocked,
@@ -121,18 +202,18 @@ def login(
         valid = False
 
     if not valid:
+        _record_ip_failure(db, ip, now)
         if user:
             user.failed_login_count += 1
             if user.failed_login_count >= settings.max_failed_logins:
-                from datetime import timedelta
-
-                user.locked_until = now + timedelta(minutes=settings.lockout_minutes)
-                user.failed_login_count = 0
+                user.locked_until = now + timedelta(
+                    minutes=_account_lock_minutes(user.failed_login_count)
+                )
             record_event(
                 db, event=SecurityEvent.new_ip, status=SecurityStatus.warning,
                 ip=ip, device=device, user=user,
             )
-            db.commit()
+        db.commit()
         raise _INVALID_CREDENTIALS
 
     if user.status == UserStatus.pending:
@@ -143,6 +224,7 @@ def login(
     # Success: reset lockout, upgrade hash if needed, stamp login, issue session.
     user.failed_login_count = 0
     user.locked_until = None
+    _clear_ip_failures(db, ip)
     user.last_login_at = now
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)

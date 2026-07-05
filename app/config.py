@@ -44,6 +44,10 @@ class Settings(BaseSettings):
 
     max_failed_logins: int = 5
     lockout_minutes: int = 15
+    max_lockout_minutes: int = 1440
+    login_ip_max_failures: int = 5
+    login_ip_window_minutes: int = 15
+    login_ip_ban_cycles: int = 2
 
     # --- Lesson sequencing ------------------------------------------------- #
     # After a teacher completes a lesson, the next lesson in the same

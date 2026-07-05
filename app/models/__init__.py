@@ -14,6 +14,7 @@ from app.models.enums import (
 from app.models.access_request import AccessRequest
 from app.models.ai_usage import AiUsage
 from app.models.lesson import Lesson, LessonAssignment, Slide
+from app.models.login_throttle import LoginThrottle
 from app.models.progress import Progress
 from app.models.report import Report
 from app.models.school import School
@@ -37,6 +38,7 @@ __all__ = [
     "Lesson",
     "Slide",
     "LessonAssignment",
+    "LoginThrottle",
     "AccessRequest",
     "Progress",
     "Report",
