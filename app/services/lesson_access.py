@@ -101,6 +101,7 @@ def compute_access(db: Session, teacher: User) -> dict[str, LessonAccess]:
         # `pending_unlock_at` is the time the next lesson is waiting on (if any).
         gate_open = True
         pending_unlock_at: datetime | None = None
+        sequence_blocked = False
         for lesson in track:
             p = progress.get(lesson.id)
             override = bool(p and p.unlocked_override)
@@ -116,15 +117,19 @@ def compute_access(db: Session, teacher: User) -> dict[str, LessonAccess]:
                     status=COMPLETED,
                     message="Completed — ask your admin to reopen it.",
                 )
-                completed_at = p.completed_at if p else None
-                if completed_at is not None:
-                    unlock_at = _as_utc(completed_at) + wait
-                    gate_open = now >= unlock_at
-                    pending_unlock_at = None if gate_open else unlock_at
-                else:
-                    # Completed but no timestamp recorded (legacy row): unlock now.
-                    gate_open = True
+                if sequence_blocked:
+                    gate_open = False
                     pending_unlock_at = None
+                else:
+                    completed_at = p.completed_at if p else None
+                    if completed_at is not None:
+                        unlock_at = _as_utc(completed_at) + wait
+                        gate_open = now >= unlock_at
+                        pending_unlock_at = None if gate_open else unlock_at
+                    else:
+                        # Completed but no timestamp recorded (legacy row): unlock now.
+                        gate_open = True
+                        pending_unlock_at = None
                 continue
 
             # The teacher's active lesson: the first not-completed lesson, or a
@@ -148,6 +153,8 @@ def compute_access(db: Session, teacher: User) -> dict[str, LessonAccess]:
             # until it is completed and its own wait elapses.
             gate_open = False
             pending_unlock_at = None
+            if not override:
+                sequence_blocked = True
 
     return out
 
