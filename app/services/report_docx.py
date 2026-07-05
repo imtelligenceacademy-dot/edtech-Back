@@ -82,7 +82,9 @@ def _finish(doc: Document) -> io.BytesIO:
 
 
 # --------------------------------------------------------------------------- #
-def _school_sections(db: Session, doc: Document, school: School) -> None:
+def _school_sections(
+    db: Session, doc: Document, school: School, include_security: bool = False
+) -> None:
     teachers = list(
         db.scalars(
             select(User).where(User.school_id == school.id, User.role == Role.teacher)
@@ -99,13 +101,17 @@ def _school_sections(db: Session, doc: Document, school: School) -> None:
         if lesson_ids
         else {}
     )
-    logs = list(
-        db.scalars(
-            select(SecurityLog)
-            .where(SecurityLog.school_id == school.id)
-            .order_by(SecurityLog.timestamp.desc())
-            .limit(50)
+    logs = (
+        list(
+            db.scalars(
+                select(SecurityLog)
+                .where(SecurityLog.school_id == school.id)
+                .order_by(SecurityLog.timestamp.desc())
+                .limit(50)
+            )
         )
+        if include_security
+        else []
     )
 
     usage = usage_by_user(db, tids)
@@ -117,10 +123,15 @@ def _school_sections(db: Session, doc: Document, school: School) -> None:
     alerts = sum(1 for l in logs if l.status != SecurityStatus.ok)
 
     _heading(doc, "Summary")
+    headers = ["Active teachers", "Assignments", "Avg completion", "Late", "AI (teachers)", "AI (admin)"]
+    row = [str(active), str(len(progress)), f"{avg}%", str(late), str(ai["teacher"]), str(ai["admin"])]
+    if include_security:
+        headers.insert(4, "Security alerts")
+        row.insert(4, str(alerts))
     _table(
         doc,
-        ["Active teachers", "Assignments", "Avg completion", "Late", "Security alerts", "AI (teachers)", "AI (admin)"],
-        [[str(active), str(len(progress)), f"{avg}%", str(late), str(alerts), str(ai["teacher"]), str(ai["admin"])]],
+        headers,
+        [row],
     )
 
     _heading(doc, "Teachers")
@@ -179,21 +190,22 @@ def _school_sections(db: Session, doc: Document, school: School) -> None:
         ],
     )
 
-    _heading(doc, "Security log")
-    _table(
-        doc,
-        ["User", "Event", "Status", "Device", "Time"],
-        [
+    if include_security:
+        _heading(doc, "Security log")
+        _table(
+            doc,
+            ["User", "Event", "Status", "Device", "Time"],
             [
-                l.user_name,
-                l.event.value,
-                l.status.value,
-                (l.device or "")[:40],
-                l.timestamp.strftime("%Y-%m-%d %H:%M"),
-            ]
-            for l in logs
-        ],
-    )
+                [
+                    l.user_name,
+                    l.event.value,
+                    l.status.value,
+                    (l.device or "")[:40],
+                    l.timestamp.strftime("%Y-%m-%d %H:%M"),
+                ]
+                for l in logs
+            ],
+        )
 
 
 def _clean_inline(text: str) -> str:
@@ -235,7 +247,7 @@ def build_school_ai_report(
     doc.add_paragraph()
 
     if school:
-        _school_sections(db, doc, school)
+        _school_sections(db, doc, school, include_security=False)
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return _finish(doc), f"IM-Telligence AI Report - {school_name} - {date}.docx"
 
@@ -246,7 +258,7 @@ def build_school_report(db: Session, school_id: str, generated_by: str) -> tuple
     doc = Document()
     _title_block(doc, "School Report", school_name, generated_by)
     if school:
-        _school_sections(db, doc, school)
+        _school_sections(db, doc, school, include_security=False)
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     return _finish(doc), f"IM-Telligence Report - {school_name} - {date}.docx"
 
@@ -258,7 +270,13 @@ def build_super_report(
 
     # Scoped to one school -> same as the school report.
     if school_id:
-        return build_school_report(db, school_id, generated_by)
+        school = db.get(School, school_id)
+        school_name = school.name if school else "School"
+        doc = Document()
+        _title_block(doc, "School Report", school_name, generated_by)
+        if school:
+            _school_sections(db, doc, school, include_security=True)
+        return _finish(doc), f"IM-Telligence Report - {school_name} - {date}.docx"
 
     # Platform-wide overview.
     doc = Document()
@@ -323,6 +341,6 @@ def build_super_report(
         doc.add_page_break()
         _heading(doc, s.name, size=16)
         _meta_line(doc, f"{s.city or '—'}, {s.country or '—'}")
-        _school_sections(db, doc, s)
+        _school_sections(db, doc, s, include_security=True)
 
     return _finish(doc), f"IM-Telligence Platform Report - {date}.docx"
