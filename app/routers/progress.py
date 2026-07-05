@@ -60,7 +60,10 @@ def _resolve_percent(payload: ProgressUpdate, total: int) -> int:
         return 100
     if payload.slide is not None:
         # No total known yet -> 0 (still marks the lesson as opened).
-        return max(0, min(100, round(payload.slide / total * 100))) if total > 0 else 0
+        # Slide-based progress is a bookmark, not completion. Keep it below
+        # 100 so only the explicit "Mark complete" action finishes and locks
+        # the lesson.
+        return max(0, min(99, round(payload.slide / total * 100))) if total > 0 else 0
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="Provide a slide number or set complete=true",
