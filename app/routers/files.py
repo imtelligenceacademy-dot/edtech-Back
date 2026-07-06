@@ -201,6 +201,14 @@ def link_file_to_lesson(
     return uploaded
 
 
+def _delete_file_bytes(uploaded: UploadedFile) -> None:
+    """Remove the stored PDF bytes from disk, ignoring if already gone."""
+    if uploaded.storage_path:
+        path = resolve_stored_file(uploaded.storage_path)
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
 def delete_file(
     file_id: str,
@@ -211,12 +219,26 @@ def delete_file(
     if uploaded is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
-    # Remove the bytes from disk too, ignoring if already gone.
-    if uploaded.storage_path:
-        path = resolve_stored_file(uploaded.storage_path)
-        if path is not None:
-            path.unlink(missing_ok=True)
+    lesson_id = uploaded.linked_lesson_id
+    if lesson_id:
+        # The file backs a curriculum lesson — delete the whole lesson so it also
+        # disappears from teachers and Access Control. Deleting the Lesson cascades
+        # its assignments, progress, access requests, and slides (all ondelete=
+        # CASCADE). Remove every PDF backing it (this one + any re-uploads) too.
+        siblings = list(
+            db.scalars(select(UploadedFile).where(UploadedFile.linked_lesson_id == lesson_id))
+        )
+        for f in siblings:
+            _delete_file_bytes(f)
+            db.delete(f)
+        lesson = db.get(Lesson, lesson_id)
+        if lesson is not None:
+            db.delete(lesson)
+    else:
+        # Unlinked file (e.g. an ICT Fair file is handled elsewhere; unsorted
+        # uploads) — just remove the file itself.
+        _delete_file_bytes(uploaded)
+        db.delete(uploaded)
 
-    db.delete(uploaded)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)

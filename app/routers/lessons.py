@@ -8,7 +8,7 @@ Scoping:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -16,8 +16,9 @@ from datetime import datetime, timezone
 
 from app.database import get_db
 from app.deps import assert_school_scope, get_current_user, require_capability, require_roles
-from app.models import AccessRequest, Lesson, LessonAssignment, Progress, Slide, User
+from app.models import AccessRequest, Lesson, LessonAssignment, Progress, Slide, UploadedFile, User
 from app.models.enums import Role, UserStatus
+from app.services.file_storage import resolve_stored_file
 from app.schemas.lesson import (
     AssignmentRequest,
     LessonCreate,
@@ -147,6 +148,30 @@ def create_lesson(
     db.commit()
     db.refresh(lesson)
     return _to_out(lesson)
+
+
+@router.delete("/{lesson_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
+def delete_lesson(
+    lesson_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_capability("upload-files")),
+) -> Response:
+    """Fully remove a lesson: its backing PDF files (bytes + rows), plus its
+    assignments, progress, access requests, and slides (all ondelete=CASCADE).
+    After this the lesson is gone for teachers and in Access Control."""
+    lesson = db.get(Lesson, lesson_id)
+    if lesson is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found")
+
+    for f in db.scalars(select(UploadedFile).where(UploadedFile.linked_lesson_id == lesson_id)):
+        if f.storage_path:
+            path = resolve_stored_file(f.storage_path)
+            if path is not None:
+                path.unlink(missing_ok=True)
+        db.delete(f)
+    db.delete(lesson)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{lesson_id}/assign", response_model=LessonOut)
