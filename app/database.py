@@ -83,7 +83,18 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "year": "INTEGER NOT NULL DEFAULT 2",
         "course": "VARCHAR(16)",
     },
+    "users": {
+        "ict_fair_access": "BOOLEAN NOT NULL DEFAULT 0",
+    },
 }
+
+
+def _dialect_ddl(ddl: str) -> str:
+    """Postgres rejects `DEFAULT 0/1` for BOOLEAN columns (it wants false/true),
+    while `DEFAULT 0` is the portable form for SQLite. Translate on Postgres."""
+    if not IS_SQLITE and "BOOLEAN" in ddl.upper():
+        return ddl.replace("DEFAULT 0", "DEFAULT false").replace("DEFAULT 1", "DEFAULT true")
+    return ddl
 
 
 def ensure_added_columns() -> None:
@@ -92,7 +103,7 @@ def ensure_added_columns() -> None:
     Runs on both SQLite (dev) and Postgres (prod) since Alembic isn't set up
     yet. On a fresh DB `create_all` already includes every column, so the
     inspector check below makes this a no-op there; on an existing DB it adds
-    only the genuinely missing columns. Each entry's DDL is dialect-neutral."""
+    only the genuinely missing columns."""
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
     with engine.begin() as conn:
@@ -102,4 +113,4 @@ def ensure_added_columns() -> None:
             present = {c["name"] for c in inspector.get_columns(table)}
             for name, ddl in columns.items():
                 if name not in present:
-                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}"))
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {_dialect_ddl(ddl)}"))

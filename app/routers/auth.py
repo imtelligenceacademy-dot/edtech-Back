@@ -242,6 +242,7 @@ def login(
         email=user.email,
         role=user.role,
         school_id=user.school_id,
+        ict_fair_access=user.ict_fair_access,
         access_token=access,
     )
 
@@ -297,5 +298,10 @@ def logout_all(
 @router.get("/me", response_model=SessionUser)
 def me(user: User = Depends(get_current_user)) -> SessionUser:
     return SessionUser(
-        user_id=user.id, name=user.name, email=user.email, role=user.role, school_id=user.school_id
+        user_id=user.id,
+        name=user.name,
+        email=user.email,
+        role=user.role,
+        school_id=user.school_id,
+        ict_fair_access=user.ict_fair_access,
     )

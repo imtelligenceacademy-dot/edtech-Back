@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, DateTime, Enum, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -40,6 +40,10 @@ class User(Base, TimestampMixin):
 
     # Language of instruction for teachers: "en" | "fr" | "both". Null otherwise.
     language: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+
+    # Whether this teacher can see the ICT Fair section (per-account permission,
+    # granted at account create/edit). Independent of grades/lessons.
+    ict_fair_access: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     last_login_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 

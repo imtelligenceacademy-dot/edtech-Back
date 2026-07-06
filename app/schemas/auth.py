@@ -26,6 +26,7 @@ class SessionUser(CamelModel):
     email: EmailStr
     role: Role
     school_id: str | None = None
+    ict_fair_access: bool = False
     access_token: str | None = Field(default=None, serialization_alias="accessToken")
 
 

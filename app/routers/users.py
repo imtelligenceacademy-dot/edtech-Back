@@ -76,6 +76,7 @@ def create_user(
             if payload.role == Role.teacher and payload.language
             else None
         ),
+        ict_fair_access=payload.ict_fair_access if payload.role == Role.teacher else False,
     )
     db.add(user)
     db.flush()  # persist the user before assignments reference it
@@ -131,15 +132,19 @@ def _apply_role_and_school(db: Session, user: User, data: dict) -> Role:
 def _apply_teacher_fields(
     user: User, payload: UserUpdate, data: dict, effective_role: Role
 ) -> None:
-    """Grades and language only apply to teachers; clear them for other roles."""
+    """Grades, language, and ICT Fair access only apply to teachers; clear them
+    for other roles."""
     if effective_role != Role.teacher:
         user.grades = []
         user.language = None
+        user.ict_fair_access = False
         return
     if "grades" in data and data["grades"] is not None:
         user.grades = data["grades"]
     if "language" in data and payload.language is not None:
         user.language = payload.language.value
+    if "ict_fair_access" in data and data["ict_fair_access"] is not None:
+        user.ict_fair_access = data["ict_fair_access"]
 
 
 @router.patch("/{user_id}", response_model=UserOut)

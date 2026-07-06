@@ -35,6 +35,7 @@ class UserOut(CamelModel):
     school_id: str | None = None
     grades: list[str] = Field(default_factory=list)
     language: Language | None = None
+    ict_fair_access: bool = False
     created_at: datetime
     last_login_at: datetime | None = None
 
@@ -47,6 +48,7 @@ class UserCreate(CamelModel):
     school_id: str | None = None
     grades: list[str] = Field(default_factory=list)
     language: Language | None = None
+    ict_fair_access: bool = False
 
     @field_validator("grades")
     @classmethod
@@ -67,6 +69,7 @@ class UserUpdate(CamelModel):
     school_id: str | None = None
     grades: list[str] | None = None
     language: Language | None = None
+    ict_fair_access: bool | None = None
 
     @field_validator("grades")
     @classmethod

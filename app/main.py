@@ -26,6 +26,7 @@ from app.routers import (
     auth,
     backup,
     dashboard,
+    fair,
     files,
     lessons,
     progress,
@@ -134,7 +135,7 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-for r in (auth, users, schools, lessons, progress, reports, security, files, dashboard, ai, backup, access_requests):
+for r in (auth, users, schools, lessons, progress, reports, security, files, dashboard, ai, backup, access_requests, fair):
     app.include_router(r.router)
 
 

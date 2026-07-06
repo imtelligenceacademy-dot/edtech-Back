@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_capability
-from app.models import Lesson, LessonAssignment, UploadedFile, User
+from app.models import FairProject, Lesson, LessonAssignment, UploadedFile, User
 from app.models.enums import Role
 from app.schemas.file import UploadedFileOut, UploadResult
 from app.services.auto_assign import assign_uploaded_file
@@ -39,7 +39,15 @@ def list_files(
     db: Session = Depends(get_db),
     _: User = Depends(require_capability("upload-files")),
 ) -> list[UploadedFile]:
-    return list(db.scalars(select(UploadedFile).order_by(UploadedFile.created_at.desc())))
+    # Exclude PDFs backing ICT Fair projects — those live in their own section.
+    fair_file_ids = select(FairProject.file_id).where(FairProject.file_id.isnot(None))
+    return list(
+        db.scalars(
+            select(UploadedFile)
+            .where(UploadedFile.id.notin_(fair_file_ids))
+            .order_by(UploadedFile.created_at.desc())
+        )
+    )
 
 
 @router.post("", response_model=UploadResult, status_code=status.HTTP_201_CREATED)
@@ -126,6 +134,10 @@ async def upload_file(
 def _can_access(db: Session, user: User, uploaded: UploadedFile) -> bool:
     if user.role == Role.super_admin:
         return True
+    # ICT Fair PDFs open for teachers who have been granted fair access.
+    fair_file = db.scalar(select(FairProject.id).where(FairProject.file_id == uploaded.id))
+    if fair_file is not None:
+        return user.role == Role.teacher and bool(user.ict_fair_access)
     if uploaded.linked_lesson_id is None:
         return False
     lesson = db.get(Lesson, uploaded.linked_lesson_id)

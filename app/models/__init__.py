@@ -13,6 +13,7 @@ from app.models.enums import (
 )
 from app.models.access_request import AccessRequest
 from app.models.ai_usage import AiUsage
+from app.models.fair_project import FairProject
 from app.models.lesson import Lesson, LessonAssignment, Slide
 from app.models.login_throttle import LoginThrottle
 from app.models.progress import Progress
@@ -46,4 +47,5 @@ __all__ = [
     "SecurityLog",
     "RefreshToken",
     "UploadedFile",
+    "FairProject",
 ]
