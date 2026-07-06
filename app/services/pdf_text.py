@@ -6,7 +6,7 @@ the prompt stays within a sane size.
 from __future__ import annotations
 
 from app.config import settings
-from app.models import Lesson
+from app.models import Lesson, UploadedFile
 from app.services.file_storage import resolve_stored_file
 
 
@@ -42,3 +42,13 @@ def lesson_context(lesson: Lesson) -> str:
         )
 
     return text.strip()[: settings.ai_max_context_chars]
+
+
+def uploaded_file_context(uploaded: UploadedFile | None) -> str:
+    """Return grounding text for a standalone uploaded PDF."""
+    if uploaded is None or not uploaded.storage_path:
+        return ""
+    path = resolve_stored_file(uploaded.storage_path)
+    if path is None:
+        return ""
+    return _pdf_to_text(path).strip()[: settings.ai_max_context_chars]

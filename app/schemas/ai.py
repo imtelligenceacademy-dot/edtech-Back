@@ -15,6 +15,7 @@ class ChatTurn(CamelModel):
 class AIChatRequest(CamelModel):
     message: str = Field(min_length=1, max_length=4000)
     lesson_id: str | None = None
+    fair_project_id: str | None = None
     history: list[ChatTurn] = Field(default_factory=list, max_length=20)
 
 

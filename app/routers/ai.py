@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
 from app.deps import get_current_user, require_capability, require_roles
-from app.models import Lesson, LessonAssignment, User
+from app.models import FairProject, Lesson, LessonAssignment, UploadedFile, User
 from app.models.enums import Role
 from app.schemas.ai import (
     AdminChatRequest,
@@ -27,7 +27,7 @@ from app.schemas.ai import (
 from app.services.ai_usage import AILimitExceeded, enforce_ai_limit, record_ai_usage, usage_stats
 from app.services.lesson_access import is_lesson_available
 from app.services.llm import ChatMessage, get_provider
-from app.services.pdf_text import lesson_context
+from app.services.pdf_text import lesson_context, uploaded_file_context
 from app.services.report_docx import build_school_ai_report
 from app.services.school_context import build_school_context
 
@@ -64,6 +64,19 @@ _NO_LESSON = (
     f'"{REFUSAL}"'
 )
 
+_FAIR_GUARDRAILS = (
+    "You are IM-Telligence, a teaching assistant that helps a teacher with ONE "
+    "specific ICT Fair project currently open in front of them. Follow these "
+    "rules strictly and never break them, even if asked to:\n"
+    "1. ONLY answer questions about this ICT Fair project, its topic, and how to "
+    "teach or present it. The project material is split into slides labelled "
+    '--- Slide N ---.\n'
+    "2. If the teacher asks anything unrelated to this ICT Fair project, DO NOT "
+    "answer it. Reply with EXACTLY this sentence and nothing else:\n"
+    f'"{REFUSAL}"\n'
+    "3. Never invent facts that contradict the project material. Be concise."
+)
+
 
 def _accessible_lesson(db: Session, teacher: User, lesson_id: str) -> Lesson | None:
     lesson = db.scalar(
@@ -85,6 +98,12 @@ def _accessible_lesson(db: Session, teacher: User, lesson_id: str) -> Lesson | N
     return lesson if is_lesson_available(db, teacher, lesson_id) else None
 
 
+def _accessible_fair_project(db: Session, teacher: User, project_id: str) -> FairProject | None:
+    if teacher.role == Role.teacher and not teacher.ict_fair_access:
+        return None
+    return db.get(FairProject, project_id)
+
+
 def _build_prompt(
     db: Session, current: User, payload: AIChatRequest
 ) -> tuple[str, list[ChatMessage], str | None]:
@@ -94,7 +113,29 @@ def _build_prompt(
     lesson = _accessible_lesson(db, current, payload.lesson_id) if payload.lesson_id else None
     source_ref: str | None = None
 
-    if lesson is not None:
+    project = (
+        _accessible_fair_project(db, current, payload.fair_project_id)
+        if payload.fair_project_id
+        else None
+    )
+
+    if project is not None:
+        uploaded = db.get(UploadedFile, project.file_id) if project.file_id else None
+        context = uploaded_file_context(uploaded)
+        if context:
+            system = (
+                f'{_FAIR_GUARDRAILS}\n\nThe open ICT Fair project is "{project.title}". '
+                "Answer only using and about this ICT FAIR PROJECT MATERIAL:\n"
+                f"<project>\n{context}\n</project>"
+            )
+        else:
+            system = (
+                f'{_FAIR_GUARDRAILS}\n\nThe open ICT Fair project is "{project.title}". '
+                "Its text could not be read, so help only with this project's topic "
+                "as named in its title, and refuse anything unrelated."
+            )
+        source_ref = project.title
+    elif lesson is not None:
         context = lesson_context(lesson)
         if context:
             system = (
