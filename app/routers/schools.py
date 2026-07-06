@@ -28,6 +28,7 @@ def _to_out(db: Session, school: School) -> SchoolOut:
         name=school.name,
         country=school.country,
         city=school.city,
+        program_year=school.program_year,
         teacher_count=teacher_count or 0,
         admin_count=admin_count or 0,
         created_at=school.created_at,
@@ -52,7 +53,11 @@ def create_school(
     _: User = Depends(require_capability("view-all-schools")),
 ) -> SchoolOut:
     school = School(
-        id=new_id("sch"), name=payload.name.strip(), country=payload.country, city=payload.city
+        id=new_id("sch"),
+        name=payload.name.strip(),
+        country=payload.country,
+        city=payload.city,
+        program_year=payload.program_year,
     )
     db.add(school)
     db.commit()
@@ -78,6 +83,8 @@ def update_school(
         school.country = data["country"]
     if "city" in data and data["city"] is not None:
         school.city = data["city"]
+    if "program_year" in data and data["program_year"] is not None:
+        school.program_year = data["program_year"]
 
     db.commit()
     db.refresh(school)

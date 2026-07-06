@@ -19,6 +19,7 @@ class SchoolOut(CamelModel):
     name: str
     country: str
     city: str
+    program_year: int = 1
     teacher_count: int = 0
     admin_count: int = 0
     created_at: datetime | None = None
@@ -28,6 +29,7 @@ class SchoolCreate(CamelModel):
     name: str = Field(min_length=2, max_length=160)
     country: str = Field(default="", max_length=80)
     city: str = Field(default="", max_length=80)
+    program_year: int = Field(default=1, ge=1, le=2)
 
 
 class SchoolUpdate(CamelModel):
@@ -36,3 +38,4 @@ class SchoolUpdate(CamelModel):
     name: str | None = Field(default=None, min_length=2, max_length=160)
     country: str | None = Field(default=None, max_length=80)
     city: str | None = Field(default=None, max_length=80)
+    program_year: int | None = Field(default=None, ge=1, le=2)

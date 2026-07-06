@@ -22,6 +22,8 @@ class LessonOut(CamelModel):
     subject: str
     school_id: str | None = None
     language: str | None = None
+    year: int | None = None
+    course: str | None = None  # "python" | "microbit" | null
     lesson_no: int | None = None
     due_date: date | None = None
     created_by: str | None = None
@@ -62,6 +64,7 @@ class TeacherLessonAccessRow(CamelModel):
     title: str
     grade: int
     language: str | None = None
+    course: str | None = None
     lesson_no: int | None = None
     status: str  # available | completed | waiting | locked
     available_at: datetime | None = None
@@ -73,6 +76,7 @@ class TeacherLessonAccessRow(CamelModel):
 class TeacherAccessTrack(CamelModel):
     grade: int
     language: str | None = None
+    year: int | None = None
     lessons: list[TeacherLessonAccessRow] = Field(default_factory=list)
 
 

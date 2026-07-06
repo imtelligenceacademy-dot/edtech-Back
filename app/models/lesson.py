@@ -30,6 +30,13 @@ class Lesson(Base, TimestampMixin):
     )
     # Language of the lesson material: "en" | "fr". Null for legacy lessons.
     language: Mapped[Optional[str]] = mapped_column(String(8), nullable=True, index=True)
+    # Curriculum year this lesson belongs to (1 or 2). Year 1 and Year 2 are
+    # entirely separate curricula; a school only receives its current year's set.
+    year: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    # Course/module within a year, e.g. "python" | "microbit". Null = a single
+    # default course (used for Year-1 content and legacy lessons). Ordering
+    # between courses lives in lesson_access.COURSE_ORDER.
+    course: Mapped[Optional[str]] = mapped_column(String(16), nullable=True, index=True)
     # Parsed lesson number from the source filename (e.g. 4), for dedup.
     lesson_no: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     # Number of slides/pages in the lesson PDF — denominator for progress %.

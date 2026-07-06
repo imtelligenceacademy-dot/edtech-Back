@@ -46,9 +46,16 @@ def list_files(
 async def upload_file(
     file: UploadFile = File(...),
     language: Literal["en", "fr"] = Form("en"),
+    year: int = Form(2),
     db: Session = Depends(get_db),
     current: User = Depends(require_capability("upload-files")),
 ) -> UploadResult:
+    if year not in (1, 2):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Curriculum year must be 1 or 2",
+        )
+
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF files are allowed"
@@ -84,7 +91,9 @@ async def upload_file(
     db.flush()
 
     # Auto-create the lesson (named as the PDF) and assign matching teachers.
-    result = assign_uploaded_file(db, uploaded, language=language, uploader_id=current.id)
+    result = assign_uploaded_file(
+        db, uploaded, language=language, uploader_id=current.id, year=year
+    )
 
     # Record the lesson's slide count (PDF page count) for progress %.
     if result.lesson_id:

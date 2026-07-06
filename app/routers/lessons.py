@@ -28,7 +28,7 @@ from app.schemas.lesson import (
     TeacherAccessTrack,
     TeacherLessonAccessRow,
 )
-from app.services.lesson_access import LessonAccess, compute_access
+from app.services.lesson_access import COURSE_ORDER, LessonAccess, compute_access
 from app.utils import new_id
 
 router = APIRouter(prefix="/api/lessons", tags=["lessons"])
@@ -42,6 +42,8 @@ def _to_out(lesson: Lesson, access: LessonAccess | None = None) -> LessonOut:
         subject=lesson.subject,
         school_id=lesson.school_id,
         language=lesson.language,
+        year=lesson.year,
+        course=lesson.course,
         lesson_no=lesson.lesson_no,
         due_date=lesson.due_date,
         created_by=lesson.created_by,
@@ -235,8 +237,9 @@ def teacher_access(
         )
     }
 
-    # Group lessons into (grade, language) tracks, ordered by lesson number.
-    tracks: dict[tuple[int, str | None], list[TeacherLessonAccessRow]] = {}
+    # Group lessons into (grade, language, year) tracks, ordered by course then
+    # lesson number — matching the sequencing in lesson_access.
+    tracks: dict[tuple[int, str | None, int], list[tuple[int, TeacherLessonAccessRow]]] = {}
     for lid in assigned_ids:
         lesson = lessons.get(lid)
         if lesson is None:
@@ -248,6 +251,7 @@ def teacher_access(
             title=lesson.title,
             grade=lesson.grade,
             language=lesson.language,
+            course=lesson.course,
             lesson_no=lesson.lesson_no,
             status=a.status if a else "locked",
             available_at=a.available_at if a else None,
@@ -255,12 +259,19 @@ def teacher_access(
             completed_at=p.completed_at if p else None,
             unlocked_override=bool(p and p.unlocked_override),
         )
-        tracks.setdefault((lesson.grade, lesson.language), []).append(row)
+        order = COURSE_ORDER.get(lesson.course or "", 0)
+        tracks.setdefault((lesson.grade, lesson.language, lesson.year), []).append((order, row))
 
     track_out = []
-    for (grade, language), rows in sorted(tracks.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
-        rows.sort(key=lambda r: (r.lesson_no if r.lesson_no is not None else 10_000, r.title))
-        track_out.append(TeacherAccessTrack(grade=grade, language=language, lessons=rows))
+    for (grade, language, year), rows in sorted(
+        tracks.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2])
+    ):
+        rows.sort(key=lambda cr: (cr[0], cr[1].lesson_no if cr[1].lesson_no is not None else 10_000, cr[1].title))
+        track_out.append(
+            TeacherAccessTrack(
+                grade=grade, language=language, year=year, lessons=[r for _, r in rows]
+            )
+        )
 
     return TeacherAccessOut(
         teacher_id=teacher.id,

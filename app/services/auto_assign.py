@@ -19,9 +19,13 @@ from app.models import Lesson, LessonAssignment, Progress, UploadedFile, User
 from app.models.enums import LessonStatus, Role, UserStatus, WatchdogStatus
 from app.utils import new_id
 
-# "Grade 7 Lesson 04 Light Sensor.pdf" -> grade=7, lesson_no=4, rest="Light Sensor"
+# "Grade 7 python lesson 04 Variables.pdf"  -> grade=7, course="python",   lesson_no=4
+# "Grade 7 micro:bit lesson 04 Buzzer.pdf"  -> grade=7, course="microbit", lesson_no=4
+# "Grade 7 Lesson 04 Light Sensor.pdf"      -> grade=7, course=None (legacy), lesson_no=4
+# The course keyword (python / micro:bit) is optional and sits between the grade
+# and "lesson"; when absent the lesson belongs to a single default course.
 _FILENAME_RE = re.compile(
-    r"^\s*Grade\s+(\d{1,2})\s+Lesson\s+(\d{1,3})\b\s*(.*)$",
+    r"^\s*Grade\s+(\d{1,2})\s+(?:(python|micro:?bit)\s+)?lesson\s+(\d{1,3})\b\s*(.*)$",
     re.IGNORECASE,
 )
 
@@ -32,6 +36,7 @@ class ParsedName:
     grade_token: str  # e.g. "G7"
     lesson_no: int
     title: str  # full filename without extension
+    course: str | None = None  # "python" | "microbit" | None
 
 
 @dataclass
@@ -53,14 +58,19 @@ def parse_lesson_filename(filename: str) -> ParsedName | None:
     if not m:
         return None
     grade = int(m.group(1))
-    lesson_no = int(m.group(2))
+    course_raw = m.group(2)
+    lesson_no = int(m.group(3))
     if not (1 <= grade <= 12):
         return None
+    course = None
+    if course_raw:
+        course = "microbit" if "micro" in course_raw.lower() else "python"
     return ParsedName(
         grade=grade,
         grade_token=f"G{grade}",
         lesson_no=lesson_no,
         title=base.strip(),
+        course=course,
     )
 
 
@@ -70,10 +80,21 @@ def _language_matches(teacher_lang: str | None, lesson_lang: str | None) -> bool
     return teacher_lang == lesson_lang or teacher_lang == "both"
 
 
+def _year_matches(teacher: User, lesson: Lesson) -> bool:
+    """True if the lesson's curriculum year equals the teacher's school's current
+    year. Teachers with no school match nothing (they receive no curriculum)."""
+    school = teacher.school
+    return school is not None and lesson.year == school.program_year
+
+
 def _lesson_matches_teacher(lesson: Lesson, teacher: User) -> bool:
-    """True if the grade + language rules would assign this lesson to the teacher."""
-    return f"G{lesson.grade}" in set(teacher.grades or []) and _language_matches(
-        teacher.language, lesson.language
+    """True if the grade + language + year rules would assign this lesson to the
+    teacher (grade in their grades, language matches, and the lesson belongs to
+    their school's current curriculum year)."""
+    return (
+        f"G{lesson.grade}" in set(teacher.grades or [])
+        and _language_matches(teacher.language, lesson.language)
+        and _year_matches(teacher, lesson)
     )
 
 
@@ -189,23 +210,29 @@ def assign_uploaded_file(
     uploaded: UploadedFile,
     language: str,
     uploader_id: str,
+    year: int = 2,
 ) -> AssignResult:
     """Create/find the curriculum lesson for an uploaded PDF, link the file, and
     assign it to every matching teacher. Idempotent: re-uploading the same
-    grade/lesson/language reuses the lesson and only adds new assignments.
+    grade/lesson/language/course/year reuses the lesson and only adds new
+    assignments.
     """
     parsed = parse_lesson_filename(uploaded.filename)
     if parsed is None:
         return AssignResult(
-            note="Filename is not in 'Grade N Lesson M …' format — stored but not auto-assigned."
+            note="Filename is not in 'Grade N [python|micro:bit] lesson M …' format — stored but not auto-assigned."
         )
 
-    # Find or create the lesson for (grade, lesson_no, language).
+    # Find or create the lesson for (grade, lesson_no, language, course, year).
+    # Course is part of the key so e.g. "python lesson 04" and "micro:bit lesson
+    # 04" are distinct lessons rather than colliding on grade+lesson_no.
     lesson = db.scalar(
         select(Lesson).where(
             Lesson.grade == parsed.grade,
             Lesson.lesson_no == parsed.lesson_no,
             Lesson.language == language,
+            Lesson.course == parsed.course,
+            Lesson.year == year,
         )
     )
     if lesson is None:
@@ -216,6 +243,8 @@ def assign_uploaded_file(
             subject="STEAM",
             school_id=None,  # curriculum-level, not tied to one school
             language=language,
+            year=year,
+            course=parsed.course,
             lesson_no=parsed.lesson_no,
             created_by=uploader_id,
         )
@@ -227,7 +256,7 @@ def assign_uploaded_file(
 
     uploaded.linked_lesson_id = lesson.id
 
-    # Match active teachers by grade token + language.
+    # Match active teachers by grade token + language + curriculum year.
     teachers = db.scalars(
         select(User).where(User.role == Role.teacher, User.status == UserStatus.active)
     ).all()
@@ -236,6 +265,7 @@ def assign_uploaded_file(
         for t in teachers
         if parsed.grade_token in (t.grades or [])
         and _language_matches(t.language, language)
+        and _year_matches(t, lesson)
     ]
 
     existing_assignment_teachers = {

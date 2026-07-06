@@ -44,18 +44,36 @@ class LessonAccess:
     message: str | None = None
 
 
+# Relative order of courses within a track. Lower = earlier: a teacher works
+# through the whole "python" course before any "microbit" lesson opens. Unknown
+# / null courses (Year-1 and legacy content) share order 0 as a single course.
+COURSE_ORDER: dict[str, int] = {"python": 1, "microbit": 2}
+
+
 def _wait() -> timedelta:
     return timedelta(days=settings.lesson_unlock_wait_days)
 
 
-def _track_key(lesson: Lesson) -> tuple[int, str | None]:
-    """Lessons are sequenced within a (grade, language) track."""
-    return (lesson.grade, lesson.language)
+def _course_order(lesson: Lesson) -> int:
+    return COURSE_ORDER.get(lesson.course or "", 0)
 
 
-def _order_key(lesson: Lesson) -> tuple[int, str]:
-    # Order a track by lesson number, then title as a stable tiebreak.
-    return (lesson.lesson_no if lesson.lesson_no is not None else 10_000, lesson.title)
+def _track_key(lesson: Lesson) -> tuple[int, str | None, int]:
+    """Lessons are sequenced within a (grade, language, year) track — Year 1 and
+    Year 2 are entirely separate curricula, so they never share a sequence."""
+    return (lesson.grade, lesson.language, lesson.year)
+
+
+def _order_key(lesson: Lesson) -> tuple[int, int, str]:
+    # Order a track by course first (python before microbit), then lesson number,
+    # then title. This makes the whole track one linear sequence, so micro:bit
+    # lesson 1 only becomes reachable after the last python lesson is completed
+    # (plus its wait) — the cross-course gate falls out of one-at-a-time unlocking.
+    return (
+        _course_order(lesson),
+        lesson.lesson_no if lesson.lesson_no is not None else 10_000,
+        lesson.title,
+    )
 
 
 def compute_access(db: Session, teacher: User) -> dict[str, LessonAccess]:
@@ -85,7 +103,7 @@ def compute_access(db: Session, teacher: User) -> dict[str, LessonAccess]:
     }
 
     # Group into tracks and order each one.
-    tracks: dict[tuple[int, str | None], list[Lesson]] = {}
+    tracks: dict[tuple[int, str | None, int], list[Lesson]] = {}
     for lesson in lessons:
         tracks.setdefault(_track_key(lesson), []).append(lesson)
 
