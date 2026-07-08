@@ -29,6 +29,13 @@ def _engine_url(url: str) -> str:
 
 _connect_args = {"check_same_thread": False} if IS_SQLITE else {}
 
+# Postgres connection pool. The default (5 + 10 overflow = 15) is exactly our
+# expected peak of ~15 concurrent users, and PDF downloads / AI SSE streams hold
+# a connection for their whole duration — so a simultaneous burst could brush the
+# ceiling. 10 + 20 gives comfortable headroom. SQLite (dev) uses its own pool and
+# ignores these, so only pass them for Postgres.
+_pool_args = {} if IS_SQLITE else {"pool_size": 10, "max_overflow": 20, "pool_timeout": 30}
+
 engine = create_engine(
     _engine_url(settings.database_url),
     connect_args=_connect_args,
@@ -36,6 +43,7 @@ engine = create_engine(
     future=True,
     # Verify connections before use — cloud Postgres drops idle connections.
     pool_pre_ping=not IS_SQLITE,
+    **_pool_args,
 )
 
 
