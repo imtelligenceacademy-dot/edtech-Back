@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import io
+import os
 from pathlib import PurePath
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import EmailStr, Field
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from app.database import get_db
 from app.deps import require_roles
@@ -22,6 +24,8 @@ from app.services.backup import (
     InvalidBackup,
     backup_filename,
     backup_upload_hint,
+    build_files_archive,
+    files_archive_filename,
     restore_database,
     send_backup_email,
     snapshot_bytes,
@@ -50,6 +54,37 @@ def download_db(_: User = Depends(require_roles(Role.super_admin))) -> Streaming
         io.BytesIO(data),
         media_type=DB_MEDIA,
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+
+@router.get("/files-archive")
+def download_files_archive(
+    _: User = Depends(require_roles(Role.super_admin)),
+) -> FileResponse:
+    """Download every stored lesson/fair PDF as a zip.
+
+    The DB backup holds only metadata and paths, so this is the companion piece
+    needed for a full restore. Streamed from a temp file that is deleted once the
+    response has been sent.
+    """
+    try:
+        path, included, missing = build_files_archive()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to build the PDF archive.",
+        ) from exc
+
+    filename = files_archive_filename()
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        background=BackgroundTask(lambda: os.unlink(path)),
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "X-Files-Included": str(included),
+            "X-Files-Missing": str(missing),
+        },
     )
 
 

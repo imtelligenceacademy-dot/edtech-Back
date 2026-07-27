@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 from sqlalchemy import Date, DateTime, Enum as SAEnum, Time, select
+from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import Base, IS_SQLITE, engine
@@ -142,6 +143,101 @@ def backup_filename() -> str:
 
 def backup_upload_hint() -> str:
     return ".db" if IS_SQLITE else ".json"
+
+
+# --------------------------------------------------------------------------- #
+# Uploaded-PDF archive
+#
+# The DB backup above stores only metadata and file *paths* — the PDF bytes live
+# on the server's upload volume and are NOT part of it. Restoring a DB onto an
+# empty volume would leave every lesson pointing at a missing file, so this
+# builds a companion zip of the actual PDFs. Written to a temp file (not memory)
+# because a full curriculum can be hundreds of megabytes.
+# --------------------------------------------------------------------------- #
+def files_archive_filename() -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
+    return f"im-telligence-lesson-pdfs-{stamp}.zip"
+
+
+def build_files_archive() -> tuple[str, int, int]:
+    """Zip every stored PDF plus a manifest.json describing it.
+
+    Returns (temp_zip_path, files_included, files_missing). The caller is
+    responsible for deleting the temp file once it has been streamed.
+    """
+    import zipfile
+
+    from app.models import FairProject, Lesson, UploadedFile
+    from app.services.file_storage import resolve_stored_file
+
+    target = os.path.join(tempfile.gettempdir(), f"imt_pdfs_{uuid.uuid4().hex}.zip")
+    included = 0
+    missing: list[dict[str, Any]] = []
+    manifest: list[dict[str, Any]] = []
+
+    with Session(engine) as db:
+        fair_file_ids = {
+            fid for fid in db.scalars(select(FairProject.file_id)) if fid is not None
+        }
+        lessons = {l.id: l for l in db.scalars(select(Lesson))}
+        uploads = list(db.scalars(select(UploadedFile)))
+
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+            for up in uploads:
+                lesson = lessons.get(up.linked_lesson_id) if up.linked_lesson_id else None
+                # Group into readable folders: fair projects, lessons by year/grade,
+                # and anything unlinked under "unsorted".
+                if up.id in fair_file_ids:
+                    folder = "ict-fair"
+                elif lesson is not None:
+                    folder = f"year-{lesson.year}/grade-{lesson.grade}"
+                else:
+                    folder = "unsorted"
+                arcname = f"{folder}/{up.filename}"
+
+                entry: dict[str, Any] = {
+                    "file_id": up.id,
+                    "filename": up.filename,
+                    "archive_path": arcname,
+                    "storage_path": up.storage_path,
+                    "linked_lesson_id": up.linked_lesson_id,
+                    "lesson_title": lesson.title if lesson else None,
+                    "is_fair_project": up.id in fair_file_ids,
+                }
+
+                path = resolve_stored_file(up.storage_path) if up.storage_path else None
+                if path is None:
+                    entry["status"] = "MISSING_ON_DISK"
+                    missing.append(entry)
+                else:
+                    # Same filename twice in a folder would silently collide.
+                    if arcname in zf.namelist():
+                        arcname = f"{folder}/{up.id}_{up.filename}"
+                        entry["archive_path"] = arcname
+                    zf.write(path, arcname)
+                    entry["status"] = "ok"
+                    included += 1
+                manifest.append(entry)
+
+            zf.writestr(
+                "manifest.json",
+                json.dumps(
+                    {
+                        "format": "im-telligence-pdf-archive",
+                        "version": 1,
+                        "created_at": utcnow().isoformat(),
+                        "files_included": included,
+                        "files_missing": len(missing),
+                        "files": manifest,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+
+    if missing:
+        logger.warning("PDF archive: %s file(s) missing on disk", len(missing))
+    return target, included, len(missing)
 
 
 def wipe_database(keep: dict) -> None:
