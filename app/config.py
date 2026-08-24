@@ -64,10 +64,23 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     grok_model: str = "grok-2-latest"
-    openai_model: str = "gpt-4o"
+    openai_model: str = "gpt-5.4-mini"
     anthropic_model: str = "claude-sonnet-4-6"
     ai_max_context_chars: int = 24000
     ai_timeout_seconds: int = 30
+
+    # --- Teacher assistant: visual slide inspection ------------------------ #
+    # When enabled AND the active provider supports images, each teacher
+    # question also sends a rendered image of the slide they are looking at, so
+    # the assistant can read diagrams, wiring and block code. Disable to fall
+    # back to text-only answers without any other behaviour change (rollback
+    # switch). Only the single visible slide is ever sent, never the whole PDF.
+    ai_teacher_vision_enabled: bool = True
+    # Hard ceiling on the encoded slide image. The renderer steps the quality
+    # and scale down until it fits, and gives up (text-only) if it cannot.
+    ai_max_image_bytes: int = 1_500_000
+    # OpenAI image fidelity: "high" keeps small pin labels and block text legible.
+    ai_image_detail: Literal["low", "high", "auto"] = "high"
     ai_teacher_daily_limit: int = 40
     ai_teacher_hourly_limit: int = 15
     ai_admin_daily_limit: int = 15

@@ -25,3 +25,9 @@ pypdf==5.1.0                 # extracting lesson PDF text for grounding
 
 # Reports
 python-docx==1.1.2           # generating Word (.docx) reports
+
+# Slide rendering for the vision-capable teacher assistant
+pymupdf==1.25.1              # renders one PDF page to an image (no system deps)
+
+# Tests
+pytest==8.3.4

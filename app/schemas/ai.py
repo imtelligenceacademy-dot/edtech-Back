@@ -16,6 +16,9 @@ class AIChatRequest(CamelModel):
     message: str = Field(min_length=1, max_length=4000)
     lesson_id: str | None = None
     fair_project_id: str | None = None
+    # 1-based page the teacher is currently viewing, so the assistant can look at
+    # that exact slide. Desktop viewers report it; null means "no visual context".
+    current_slide: int | None = Field(default=None, ge=1, le=2000)
     history: list[ChatTurn] = Field(default_factory=list, max_length=20)
 
 
