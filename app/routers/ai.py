@@ -405,6 +405,19 @@ ADMIN_REFUSAL = (
     "I'm sorry, but I can only assist with information about your school."
 )
 
+# Response formatting shared by the chat assistants. Both chat UIs render the
+# reply as raw text, so Markdown is shown literally to the user ("**Un
+# micro:bit**") and tables collapse into unreadable pipes. The Word report
+# prompt deliberately keeps Markdown headings - report_docx parses them.
+_PLAIN_TEXT_RULES = (
+    "FORMATTING - the chat shows your reply as plain text, so Markdown is not "
+    "rendered and any markers you type are displayed literally. "
+    "Never use Markdown tables, Markdown headings, or ** or __ around words. "
+    "Use short plain-text paragraphs, or a simple numbered list when you need "
+    "structure. To compare several teachers or figures, write one short line "
+    "per item instead of a table. Keep it concise and easy to read at a glance."
+)
+
 _ADMIN_GUARDRAILS = (
     "You are IM-Telligence, a professional operations assistant for a school "
     "principal or administrator. Maintain a courteous, respectful, and formal "
@@ -418,7 +431,8 @@ _ADMIN_GUARDRAILS = (
     "operations (general knowledge, weather, other schools, lesson content, etc.), "
     "politely decline by replying with EXACTLY this sentence and nothing else:\n"
     f'"{ADMIN_REFUSAL}"\n'
-    "Use only the SCHOOL DATA below; never invent figures."
+    "Use only the SCHOOL DATA below; never invent figures.\n\n"
+    f"{_PLAIN_TEXT_RULES}"
 )
 
 
