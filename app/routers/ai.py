@@ -28,6 +28,7 @@ from app.schemas.ai import (
     AIUsageStats,
 )
 from app.services.ai_usage import AILimitExceeded, enforce_ai_limit, record_ai_usage, usage_stats
+from app.services.chat_history import save_exchange
 from app.services.lesson_access import is_lesson_available
 from app.services.file_storage import resolve_stored_file
 from app.services.llm import ChatMessage, LLMError, get_provider
@@ -380,16 +381,34 @@ def chat_stream(
         )
     record_ai_usage(db, current, "teacher")
 
+    # Held for the generator, which runs after this request's session is closed.
+    teacher_id = current.id
+    lesson_id = payload.lesson_id if bundle.grounded else None
+    question = payload.message
+
     def event_stream():
-        if bundle.source_ref:
-            yield f"data: {json.dumps({'sourceRef': bundle.source_ref})}\n\n"
+        answer: list[str] = []
         try:
-            for delta in _stream_answer(bundle):
-                yield f"data: {json.dumps({'delta': delta})}\n\n"
-        except Exception as exc:
-            logger.warning("teacher chat stream failed: %s", type(exc).__name__)
-            yield f"data: {json.dumps({'error': _error_text(exc)})}\n\n"
-        yield f"data: {json.dumps({'done': True})}\n\n"
+            if bundle.source_ref:
+                yield f"data: {json.dumps({'sourceRef': bundle.source_ref})}\n\n"
+            try:
+                for delta in _stream_answer(bundle):
+                    answer.append(delta)
+                    yield f"data: {json.dumps({'delta': delta})}\n\n"
+            except Exception as exc:
+                logger.warning("teacher chat stream failed: %s", type(exc).__name__)
+                yield f"data: {json.dumps({'error': _error_text(exc)})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        finally:
+            # Saved even when the teacher closes the tab mid-answer: a partial
+            # reply is still what they read, and worth keeping.
+            save_exchange(
+                teacher_id=teacher_id,
+                lesson_id=lesson_id,
+                question=question,
+                answer="".join(answer),
+                source_ref=bundle.source_ref,
+            )
 
     return StreamingResponse(
         event_stream(),

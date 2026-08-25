@@ -21,6 +21,7 @@ _MATRIX: dict[Role, set[Capability]] = {
         "export-reports",
         "view-global-security",
         "view-school-security",
+        "view-teacher-chats",
     },
     Role.school_admin: {
         # Monitoring-only.

@@ -100,6 +100,13 @@ def _deserialize_value(column, value: Any) -> Any:
     return value
 
 
+# Tables left out of the database backup. A year of teacher conversations would
+# push the emailed dump past the provider's attachment limit and hold all of it
+# in memory while building — and none of it is needed to bring the platform back
+# after a failure. The super-admin chat export covers keeping a copy.
+BACKUP_EXCLUDED_TABLES = {"chat_messages"}
+
+
 def _json_snapshot_bytes() -> bytes:
     payload: dict[str, Any] = {
         "format": BACKUP_FORMAT,
@@ -110,6 +117,8 @@ def _json_snapshot_bytes() -> bytes:
     }
     with engine.connect() as conn:
         for table in Base.metadata.sorted_tables:
+            if table.name in BACKUP_EXCLUDED_TABLES:
+                continue
             stmt = select(table)
             order_by = list(table.primary_key.columns)
             if order_by:

@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     login_ip_window_minutes: int = 15
     login_ip_ban_cycles: int = 2
 
+    # --- Teacher chat history ---------------------------------------------- #
+    # How long a teacher's conversations are kept. Raising it is free; lowering
+    # it deletes everything newly outside the window on the next daily purge,
+    # and that is not recoverable. 0 disables the purge entirely.
+    chat_retention_days: int = 365
+
     # --- Lesson sequencing ------------------------------------------------- #
     # After a teacher completes a lesson, the next lesson in the same
     # grade+language track unlocks this many days later. A super-admin can

@@ -19,6 +19,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.config import settings
 from app.database import Base, SessionLocal, engine, ensure_added_columns
 from app.services.backup import email_backup_now
+from app.services.chat_history import purge_expired
 from app.services.bootstrap import ensure_bootstrap_admin
 from app.routers import (
     access_requests,
@@ -27,6 +28,7 @@ from app.routers import (
     backup,
     dashboard,
     fair,
+    chat,
     files,
     lessons,
     progress,
@@ -58,6 +60,31 @@ async def _daily_backup_loop() -> None:
             logger.exception("Daily backup email failed")
 
 
+async def _chat_retention_loop() -> None:
+    """Drop teacher conversations past the retention window, once a day.
+
+    The delete runs in a worker thread for the same reason the backup does: it
+    is a blocking DB call and the API should not wait on it.
+    """
+    while True:
+        await asyncio.sleep(24 * 3600)
+        try:
+            deleted = await asyncio.to_thread(_purge_chat_history)
+            if deleted:
+                logger.info(
+                    "Chat retention: deleted %s messages older than %s days",
+                    deleted,
+                    settings.chat_retention_days,
+                )
+        except Exception:
+            logger.exception("Chat retention purge failed")
+
+
+def _purge_chat_history() -> int:
+    with SessionLocal() as db:
+        return purge_expired(db)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_runtime()
@@ -68,6 +95,8 @@ async def lifespan(app: FastAPI):
     # Seed the first super-admin on a fresh DB (no-op once one exists).
     with SessionLocal() as db:
         ensure_bootstrap_admin(db)
+
+    retention_task = asyncio.create_task(_chat_retention_loop())
 
     backup_task: asyncio.Task | None = None
     if settings.backup_email_enabled and settings.backup_email_to:
@@ -81,6 +110,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        retention_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await retention_task
         if backup_task is not None:
             backup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -135,7 +167,7 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
 )
 
-for r in (auth, users, schools, lessons, progress, reports, security, files, dashboard, ai, backup, access_requests, fair):
+for r in (auth, users, schools, lessons, progress, reports, security, files, dashboard, ai, backup, access_requests, fair, chat):
     app.include_router(r.router)
 
 
