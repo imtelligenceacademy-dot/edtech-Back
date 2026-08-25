@@ -83,6 +83,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "progress": {
         "completed_at": "DATETIME",
         "unlocked_override": "BOOLEAN NOT NULL DEFAULT 0",
+        "last_slide": "INTEGER",
+        "slide_total": "INTEGER",
     },
     "schools": {
         "program_year": "INTEGER NOT NULL DEFAULT 2",

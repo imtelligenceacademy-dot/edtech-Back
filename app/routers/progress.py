@@ -128,6 +128,13 @@ def update_progress(
 
     progress.percent_complete = percent
     progress.last_opened_at = now
+    # Keep the real position alongside the percentage.
+    if total > 0:
+        progress.slide_total = total
+    if payload.complete:
+        progress.last_slide = total or progress.last_slide
+    elif payload.slide is not None:
+        progress.last_slide = payload.slide
     progress.status = (
         LessonStatus.completed
         if percent >= 100

@@ -12,6 +12,10 @@ class ProgressOut(CamelModel):
     lesson_id: str
     status: LessonStatus
     percent_complete: int
+    # Where the teacher actually stopped. Null for lessons last saved before
+    # slide positions were recorded.
+    last_slide: int | None = None
+    slide_total: int | None = None
     last_opened_at: datetime | None = None
     watchdog: WatchdogStatus
     watchdog_message: str | None = None

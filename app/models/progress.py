@@ -29,6 +29,12 @@ class Progress(Base, TimestampMixin):
     percent_complete: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # The exact slide the teacher stopped on, and how many the lesson has.
+    # Percent is a derived, lossy view of these two — teachers think in slides
+    # ("I stopped on slide 8"), so the real numbers are stored, not inferred.
+    last_slide: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    slide_total: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # When the teacher marked the lesson complete. Drives the per-track
     # "wait a week before the next lesson unlocks" gate.
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
