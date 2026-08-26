@@ -307,3 +307,82 @@ def assign_uploaded_file(
         assigned_count=len(matched),
         teacher_names=[t.name for t in matched],
     )
+
+
+@dataclass
+class UploadPreview:
+    """What uploading one file would do, worked out from its name alone."""
+
+    filename: str
+    ok: bool  # the name parses; it will become a lesson
+    note: str | None = None  # why not, when it doesn't
+    lesson_title: str | None = None
+    grade: int | None = None
+    course: str | None = None
+    lesson_no: int | None = None
+    existing_lesson: bool = False  # adds to a lesson that already exists
+    teacher_names: list[str] = field(default_factory=list)
+
+
+def preview_uploads(
+    db: Session, filenames: list[str], language: str, year: int
+) -> list[UploadPreview]:
+    """Answer "what happens if I upload these?" without uploading anything.
+
+    Everything here comes from the filename plus the database, and it reuses the
+    same parser and matching rules as the real upload — so what the admin is
+    shown cannot drift from what they get.
+    """
+    teachers = db.scalars(
+        select(User).where(User.role == Role.teacher, User.status == UserStatus.active)
+    ).all()
+
+    previews: list[UploadPreview] = []
+    for filename in filenames:
+        parsed = parse_lesson_filename(filename)
+        if parsed is None:
+            previews.append(
+                UploadPreview(
+                    filename=filename,
+                    ok=False,
+                    note="Name doesn't match 'Grade N [python|micro:bit] lesson M Title' — it would be stored but not assigned to anyone.",
+                )
+            )
+            continue
+
+        existing = db.scalar(
+            select(Lesson).where(
+                Lesson.grade == parsed.grade,
+                Lesson.lesson_no == parsed.lesson_no,
+                Lesson.language == language,
+                Lesson.course == parsed.course,
+                Lesson.year == year,
+            )
+        )
+        # A stand-in for the lesson that would exist, so the matching rules are
+        # the ones in _lesson_matches_teacher rather than a second copy of them.
+        candidate = existing or Lesson(
+            id="preview",
+            title=parsed.title,
+            grade=parsed.grade,
+            subject="STEAM",
+            language=language,
+            year=year,
+            course=parsed.course,
+            lesson_no=parsed.lesson_no,
+        )
+        matched = [t for t in teachers if _lesson_matches_teacher(candidate, t)]
+
+        previews.append(
+            UploadPreview(
+                filename=filename,
+                ok=True,
+                lesson_title=parsed.title,
+                grade=parsed.grade,
+                course=parsed.course,
+                lesson_no=parsed.lesson_no,
+                existing_lesson=existing is not None,
+                teacher_names=[t.name for t in matched],
+            )
+        )
+    return previews

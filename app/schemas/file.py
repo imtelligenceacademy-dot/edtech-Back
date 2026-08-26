@@ -26,3 +26,23 @@ class UploadResult(CamelModel):
     assigned_count: int = 0
     teacher_names: list[str] = []
     note: str | None = None
+
+
+class UploadPreviewRequest(CamelModel):
+    """Filenames only — the preview never uploads anything."""
+
+    filenames: list[str] = []
+    language: str = "en"
+    year: int = 2
+
+
+class UploadPreviewRow(CamelModel):
+    filename: str
+    ok: bool
+    note: str | None = None
+    lesson_title: str | None = None
+    grade: int | None = None
+    course: str | None = None
+    lesson_no: int | None = None
+    existing_lesson: bool = False
+    teacher_names: list[str] = []

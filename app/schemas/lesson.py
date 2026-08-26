@@ -56,6 +56,17 @@ class AssignmentRequest(CamelModel):
     teacher_id: str
 
 
+class AssignmentSet(CamelModel):
+    """Who, within one school, is assigned to a lesson — the whole set at once.
+
+    Scoped to a school because the Access Control page only ever edits one
+    school's teachers, and must not disturb another school's assignments.
+    """
+
+    school_id: str
+    teacher_ids: list[str] = Field(default_factory=list)
+
+
 # --- Super-admin lesson-access management --------------------------------- #
 class TeacherLessonAccessRow(CamelModel):
     """One lesson in a teacher's track, with its gating state + override flag."""

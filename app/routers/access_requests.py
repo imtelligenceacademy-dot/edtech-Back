@@ -21,6 +21,7 @@ from app.deps import require_capability, require_roles
 from app.models import AccessRequest, Lesson, LessonAssignment, Progress, User
 from app.models.enums import Role
 from app.schemas.access_request import AccessRequestCreate, AccessRequestOut
+from app.services.access_requests import list_pending, to_out
 from app.services.backup import send_email
 from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
@@ -62,20 +63,7 @@ def _notify_access_request(recipients: list[str], teacher: User, lesson: Lesson,
         logger.warning("Could not email the access-request notification.", exc_info=True)
 
 
-def _to_out(req: AccessRequest, lesson: Lesson | None, teacher: User | None) -> AccessRequestOut:
-    return AccessRequestOut(
-        id=req.id,
-        teacher_id=req.teacher_id,
-        teacher_name=teacher.name if teacher else req.teacher_id,
-        lesson_id=req.lesson_id,
-        lesson_title=lesson.title if lesson else req.lesson_id,
-        grade=lesson.grade if lesson else 0,
-        language=lesson.language if lesson else None,
-        lesson_no=lesson.lesson_no if lesson else None,
-        status=req.status,
-        note=req.note,
-        created_at=req.created_at,
-    )
+_to_out = to_out
 
 
 @router.post("", response_model=AccessRequestOut, status_code=status.HTTP_201_CREATED)
@@ -164,10 +152,10 @@ def list_requests(
     _: User = Depends(require_roles(Role.super_admin)),
 ) -> list[AccessRequestOut]:
     """Super-admin inbox of access requests (pending by default)."""
-    stmt = select(AccessRequest).order_by(AccessRequest.created_at.desc())
     if pending_only:
-        stmt = stmt.where(AccessRequest.status == PENDING)
-    reqs = list(db.scalars(stmt))
+        return list_pending(db)
+
+    reqs = list(db.scalars(select(AccessRequest).order_by(AccessRequest.created_at.desc())))
     if not reqs:
         return []
     lessons = {l.id: l for l in db.scalars(select(Lesson).where(Lesson.id.in_([r.lesson_id for r in reqs])))}

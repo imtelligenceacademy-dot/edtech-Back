@@ -18,8 +18,13 @@ from app.database import get_db
 from app.deps import get_current_user, require_capability
 from app.models import FairProject, Lesson, LessonAssignment, UploadedFile, User
 from app.models.enums import Role
-from app.schemas.file import UploadedFileOut, UploadResult
-from app.services.auto_assign import assign_uploaded_file
+from app.schemas.file import (
+    UploadedFileOut,
+    UploadPreviewRequest,
+    UploadPreviewRow,
+    UploadResult,
+)
+from app.services.auto_assign import assign_uploaded_file, preview_uploads
 from app.services.file_storage import resolve_stored_file, upload_root
 from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
@@ -48,6 +53,32 @@ def list_files(
             .order_by(UploadedFile.created_at.desc())
         )
     )
+
+
+@router.post("/preview", response_model=list[UploadPreviewRow])
+def preview_upload(
+    payload: UploadPreviewRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_capability("upload-files")),
+) -> list[UploadPreviewRow]:
+    """What would happen if these files were uploaded — nothing is stored.
+
+    The filename is the whole contract for the curriculum pipeline, and its only
+    feedback used to arrive after the upload, as a count. This answers the same
+    question first, per file, and by name.
+    """
+    if payload.year not in (1, 2):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Curriculum year must be 1 or 2",
+        )
+    if payload.language not in ("en", "fr"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Language must be en or fr"
+        )
+
+    rows = preview_uploads(db, payload.filenames[:200], payload.language, payload.year)
+    return [UploadPreviewRow.model_validate(row, from_attributes=True) for row in rows]
 
 
 @router.post("", response_model=UploadResult, status_code=status.HTTP_201_CREATED)

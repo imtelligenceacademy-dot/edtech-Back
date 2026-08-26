@@ -21,6 +21,7 @@ from app.models.enums import Role, UserStatus
 from app.services.file_storage import resolve_stored_file
 from app.schemas.lesson import (
     AssignmentRequest,
+    AssignmentSet,
     LessonCreate,
     LessonOut,
     OverrideRequest,
@@ -216,6 +217,96 @@ def assign_teacher(
                 )
             )
         db.commit()
+
+    lesson = db.scalar(
+        _base_query().where(Lesson.id == lesson_id).execution_options(populate_existing=True)
+    )
+    return _to_out(lesson)
+
+
+@router.put("/{lesson_id}/assignments", response_model=LessonOut)
+def replace_assignments(
+    lesson_id: str,
+    payload: AssignmentSet,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_capability("assign-files")),
+) -> LessonOut:
+    """Set, in one transaction, exactly which of a school's teachers have this
+    lesson.
+
+    The Access Control page edits one school at a time, so this replaces only
+    that school's assignments and leaves every other school's alone. Doing it as
+    a set rather than a call per teacher means a failure halfway can no longer
+    leave a lesson assigned to some of the teachers the admin chose and not
+    others.
+    """
+    lesson = db.scalar(_base_query().where(Lesson.id == lesson_id))
+    if lesson is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found")
+
+    wanted = set(payload.teacher_ids)
+    school_teachers = {
+        t.id: t
+        for t in db.scalars(
+            select(User).where(
+                User.role == Role.teacher,
+                User.school_id == payload.school_id,
+                User.status == UserStatus.active,
+            )
+        )
+    }
+    unknown = wanted - school_teachers.keys()
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Every teacher must be an active teacher in the chosen school",
+        )
+
+    current_in_school = {
+        a.teacher_id for a in lesson.assignments if a.teacher_id in school_teachers
+    }
+    to_add = wanted - current_in_school
+    to_remove = current_in_school - wanted
+
+    for teacher_id in to_add:
+        db.add(
+            LessonAssignment(
+                id=new_id("la"),
+                lesson_id=lesson.id,
+                teacher_id=teacher_id,
+                source="manual",
+            )
+        )
+        if not db.scalar(
+            select(Progress).where(
+                Progress.lesson_id == lesson.id, Progress.teacher_id == teacher_id
+            )
+        ):
+            db.add(
+                Progress(
+                    id=new_id("p"),
+                    teacher_id=teacher_id,
+                    lesson_id=lesson.id,
+                    watchdog_message="Manually assigned — not opened yet",
+                )
+            )
+
+    if to_remove:
+        for assignment in db.scalars(
+            select(LessonAssignment).where(
+                LessonAssignment.lesson_id == lesson.id,
+                LessonAssignment.teacher_id.in_(to_remove),
+            )
+        ):
+            db.delete(assignment)
+        for progress in db.scalars(
+            select(Progress).where(
+                Progress.lesson_id == lesson.id, Progress.teacher_id.in_(to_remove)
+            )
+        ):
+            db.delete(progress)
+
+    db.commit()
 
     lesson = db.scalar(
         _base_query().where(Lesson.id == lesson_id).execution_options(populate_existing=True)
