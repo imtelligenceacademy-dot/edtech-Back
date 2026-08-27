@@ -18,10 +18,10 @@ import tempfile
 import uuid
 from datetime import date, datetime, time, timezone
 from email.message import EmailMessage
-from typing import Any
+from typing import Any, Collection
 
 import httpx
-from sqlalchemy import Date, DateTime, Enum as SAEnum, Time, select
+from sqlalchemy import Date, DateTime, Enum as SAEnum, Time, false as sa_false, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -163,13 +163,26 @@ def backup_upload_hint() -> str:
 # builds a companion zip of the actual PDFs. Written to a temp file (not memory)
 # because a full curriculum can be hundreds of megabytes.
 # --------------------------------------------------------------------------- #
-def files_archive_filename() -> str:
+def files_archive_filename(label: str | None = None) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M")
-    return f"im-telligence-lesson-pdfs-{stamp}.zip"
+    slug = _slugify(label) if label else ""
+    return f"im-telligence-{slug or 'lesson-pdfs'}-{stamp}.zip"
 
 
-def build_files_archive() -> tuple[str, int, int]:
-    """Zip every stored PDF plus a manifest.json describing it.
+def _slugify(label: str) -> str:
+    """Filename-safe lowercase slug. The label reaches us from the client, so
+    everything outside [a-z0-9-] is dropped rather than escaped."""
+    out = "".join(c if c.isalnum() else "-" for c in label.lower())
+    return "-".join(part for part in out.split("-") if part)[:60]
+
+
+def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, int, int]:
+    """Zip stored PDFs plus a manifest.json describing them.
+
+    With ``file_ids`` only those uploads are included — that is how the Files
+    page hands the admin one grade, one language, or one hand-picked selection
+    without them saving 20 PDFs one click at a time. Without it, every stored
+    PDF goes in (the companion piece to a database backup).
 
     Returns (temp_zip_path, files_included, files_missing). The caller is
     responsible for deleting the temp file once it has been streamed.
@@ -189,7 +202,14 @@ def build_files_archive() -> tuple[str, int, int]:
             fid for fid in db.scalars(select(FairProject.file_id)) if fid is not None
         }
         lessons = {l.id: l for l in db.scalars(select(Lesson))}
-        uploads = list(db.scalars(select(UploadedFile)))
+        query = select(UploadedFile)
+        if file_ids is not None:
+            wanted = list(dict.fromkeys(file_ids))
+            if not wanted:
+                query = query.where(sa_false())
+            else:
+                query = query.where(UploadedFile.id.in_(wanted))
+        uploads = list(db.scalars(query))
 
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
             for up in uploads:

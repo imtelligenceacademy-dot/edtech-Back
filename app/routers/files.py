@@ -6,25 +6,41 @@ their scope).
 
 from __future__ import annotations
 
+import os
 from typing import Literal
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_capability
-from app.models import FairProject, Lesson, LessonAssignment, UploadedFile, User
-from app.models.enums import Role
+from app.models import (
+    AccessRequest,
+    ChatMessage,
+    FairProject,
+    Lesson,
+    LessonAssignment,
+    Progress,
+    UploadedFile,
+    User,
+)
+from app.models.enums import LessonStatus, Role
 from app.schemas.file import (
+    BulkDeleteResult,
+    DeletionImpact,
+    FileSelection,
     UploadedFileOut,
     UploadPreviewRequest,
     UploadPreviewRow,
     UploadResult,
 )
 from app.services.auto_assign import assign_uploaded_file, preview_uploads
+from app.services.backup import build_files_archive, files_archive_filename
 from app.services.file_storage import resolve_stored_file, upload_root
 from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
@@ -159,6 +175,169 @@ async def upload_file(
         assigned_count=result.assigned_count,
         teacher_names=result.teacher_names,
         note=result.note,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Working on a selection: zip it, weigh it, delete it.
+#
+# The Files page holds ~400 PDFs. Acting on them one row at a time is the whole
+# complaint; these three endpoints take the selection the admin already made and
+# do the work in one request.
+# --------------------------------------------------------------------------- #
+MAX_SELECTION = 2000
+
+
+def _selected_ids(payload: FileSelection) -> list[str]:
+    ids = list(dict.fromkeys(payload.file_ids))
+    if not ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No files selected"
+        )
+    if len(ids) > MAX_SELECTION:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Select at most {MAX_SELECTION} files at once",
+        )
+    return ids
+
+
+def _expand_selection(
+    db: Session, file_ids: list[str]
+) -> tuple[list[UploadedFile], set[str], int]:
+    """Resolve a selection into everything it really touches.
+
+    Selecting one PDF of a lesson takes the lesson — and therefore every other
+    PDF filed under it. Returns (files_to_delete, lesson_ids, missing_ids).
+    """
+    found = list(db.scalars(select(UploadedFile).where(UploadedFile.id.in_(file_ids))))
+    missing = len(set(file_ids)) - len(found)
+
+    lesson_ids = {f.linked_lesson_id for f in found if f.linked_lesson_id}
+    by_id = {f.id: f for f in found}
+    if lesson_ids:
+        for sibling in db.scalars(
+            select(UploadedFile).where(UploadedFile.linked_lesson_id.in_(lesson_ids))
+        ):
+            by_id.setdefault(sibling.id, sibling)
+    return list(by_id.values()), lesson_ids, missing
+
+
+@router.post("/deletion-impact", response_model=DeletionImpact)
+def deletion_impact(
+    payload: FileSelection,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_capability("upload-files")),
+) -> DeletionImpact:
+    """What this selection would destroy, counted before it is confirmed."""
+    ids = _selected_ids(payload)
+    files, lesson_ids, missing = _expand_selection(db, ids)
+    if not lesson_ids:
+        return DeletionImpact(files=len(files), missing=missing)
+
+    def _count(model, column) -> int:
+        return int(db.scalar(select(func.count()).select_from(model).where(column.in_(lesson_ids))) or 0)
+
+    started = set(
+        db.scalars(
+            select(Progress.lesson_id).where(
+                Progress.lesson_id.in_(lesson_ids),
+                Progress.status != LessonStatus.not_started,
+            )
+        )
+    )
+    teachers = set(
+        db.scalars(
+            select(LessonAssignment.teacher_id).where(
+                LessonAssignment.lesson_id.in_(lesson_ids)
+            )
+        )
+    )
+    titles = list(
+        db.scalars(select(Lesson.title).where(Lesson.id.in_(lesson_ids)).order_by(Lesson.title))
+    )
+
+    return DeletionImpact(
+        files=len(files),
+        lessons=len(lesson_ids),
+        teachers=len(teachers),
+        assignments=_count(LessonAssignment, LessonAssignment.lesson_id),
+        progress=_count(Progress, Progress.lesson_id),
+        chat_messages=_count(ChatMessage, ChatMessage.lesson_id),
+        access_requests=_count(AccessRequest, AccessRequest.lesson_id),
+        lessons_in_progress=len(started),
+        lesson_titles=titles[:40],
+        missing=missing,
+    )
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResult)
+def bulk_delete(
+    payload: FileSelection,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_capability("upload-files")),
+) -> BulkDeleteResult:
+    """Delete a whole selection in one transaction.
+
+    The page used to fire one DELETE per file and swallow the 404s that came
+    back for siblings already removed by an earlier one. Doing it here means a
+    grade either goes entirely or not at all.
+    """
+    ids = _selected_ids(payload)
+    files, lesson_ids, _missing = _expand_selection(db, ids)
+
+    for uploaded in files:
+        _delete_file_bytes(uploaded)
+        db.delete(uploaded)
+    # Deleting the Lesson cascades its assignments, progress, chat, access
+    # requests and slides.
+    deleted_lessons = 0
+    for lesson_id in lesson_ids:
+        lesson = db.get(Lesson, lesson_id)
+        if lesson is not None:
+            db.delete(lesson)
+            deleted_lessons += 1
+
+    db.commit()
+    return BulkDeleteResult(deleted_files=len(files), deleted_lessons=deleted_lessons)
+
+
+@router.post("/archive")
+def download_selection(
+    payload: FileSelection,
+    _: User = Depends(require_capability("upload-files")),
+) -> FileResponse:
+    """Zip the selected PDFs, foldered by year and grade.
+
+    Saving a grade's worth of lessons used to mean opening each PDF in a tab and
+    saving it by hand.
+    """
+    ids = _selected_ids(payload)
+    try:
+        path, included, missing = build_files_archive(ids)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to build the PDF archive.",
+        ) from exc
+
+    if included == 0:
+        os.unlink(path)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="None of the selected PDFs are on disk.",
+        )
+
+    filename = files_archive_filename(payload.label)
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        background=BackgroundTask(lambda: os.unlink(path)),
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "X-Files-Included": str(included),
+            "X-Files-Missing": str(missing),
+        },
     )
 
 
