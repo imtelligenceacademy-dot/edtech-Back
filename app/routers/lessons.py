@@ -17,11 +17,14 @@ from datetime import datetime, timezone
 from app.database import get_db
 from app.deps import assert_school_scope, get_current_user, require_capability, require_roles
 from app.models import AccessRequest, Lesson, LessonAssignment, Progress, Slide, UploadedFile, User
-from app.models.enums import Role, UserStatus
+from app.models.enums import LessonStatus, Role, UserStatus
 from app.services.file_storage import resolve_stored_file
 from app.schemas.lesson import (
     AssignmentRequest,
     AssignmentSet,
+    BulkAssignment,
+    BulkAssignmentPreview,
+    BulkAssignmentResult,
     LessonCreate,
     LessonOut,
     OverrideRequest,
@@ -173,6 +176,202 @@ def delete_lesson(
     db.delete(lesson)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --------------------------------------------------------------------------- #
+# Bulk assignment — the same teachers added to or removed from many lessons in
+# one transaction. Registered before the "/{lesson_id}/..." routes so the paths
+# stay unambiguous at a glance.
+# --------------------------------------------------------------------------- #
+MAX_BULK_LESSONS = 500
+
+
+def _resolve_bulk(db: Session, payload: BulkAssignment) -> tuple[list[Lesson], set[str], set[str]]:
+    """Validate a bulk edit and return (lessons, add_ids, remove_ids).
+
+    A teacher named on both sides would make the result depend on the order the
+    two halves ran in, so that is rejected rather than silently resolved.
+    """
+    lesson_ids = list(dict.fromkeys(payload.lesson_ids))
+    if not lesson_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No lessons selected"
+        )
+    if len(lesson_ids) > MAX_BULK_LESSONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Select at most {MAX_BULK_LESSONS} lessons at once",
+        )
+
+    add = set(payload.add_teacher_ids)
+    remove = set(payload.remove_teacher_ids)
+    if add & remove:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A teacher cannot be added and removed in the same request",
+        )
+    if not add and not remove:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="No teachers to add or remove"
+        )
+
+    school_teacher_ids = {
+        t
+        for t in db.scalars(
+            select(User.id).where(
+                User.role == Role.teacher,
+                User.school_id == payload.school_id,
+                User.status == UserStatus.active,
+            )
+        )
+    }
+    unknown = (add | remove) - school_teacher_ids
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Every teacher must be an active teacher in the chosen school",
+        )
+
+    lessons = list(db.scalars(_base_query().where(Lesson.id.in_(lesson_ids))))
+    if not lessons:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such lessons")
+    return lessons, add, remove
+
+
+@router.post("/assignments/bulk-preview", response_model=BulkAssignmentPreview)
+def preview_bulk_assignments(
+    payload: BulkAssignment,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_capability("assign-files")),
+) -> BulkAssignmentPreview:
+    """Count what a bulk edit would change — and what it would throw away.
+
+    Adding is harmless, so the page applies that straight away. Removing is not:
+    it deletes the teacher's progress on the lesson, which is the only record
+    that they taught it.
+    """
+    lessons, add, remove = _resolve_bulk(db, payload)
+
+    adds = 0
+    removes = 0
+    touched: set[str] = set()
+    remove_pairs: list[tuple[str, str]] = []
+    for lesson in lessons:
+        assigned = {a.teacher_id for a in lesson.assignments}
+        new_for_lesson = add - assigned
+        gone_for_lesson = remove & assigned
+        adds += len(new_for_lesson)
+        removes += len(gone_for_lesson)
+        if new_for_lesson or gone_for_lesson:
+            touched.add(lesson.id)
+        remove_pairs.extend((lesson.id, teacher_id) for teacher_id in gone_for_lesson)
+
+    progress_lost = 0
+    losing: set[str] = set()
+    if remove_pairs:
+        lesson_ids = {lesson_id for lesson_id, _ in remove_pairs}
+        teacher_ids = {teacher_id for _, teacher_id in remove_pairs}
+        pairs = set(remove_pairs)
+        started = [
+            row
+            for row in db.scalars(
+                select(Progress).where(
+                    Progress.lesson_id.in_(lesson_ids),
+                    Progress.teacher_id.in_(teacher_ids),
+                    Progress.status != LessonStatus.not_started,
+                )
+            )
+            if (row.lesson_id, row.teacher_id) in pairs
+        ]
+        progress_lost = len(started)
+        if started:
+            names = db.scalars(
+                select(User.name).where(User.id.in_({row.teacher_id for row in started}))
+            )
+            losing = set(names)
+
+    return BulkAssignmentPreview(
+        lessons=len(touched),
+        adds=adds,
+        removes=removes,
+        progress_lost=progress_lost,
+        teachers_losing_progress=sorted(losing),
+    )
+
+
+@router.post("/assignments/bulk", response_model=BulkAssignmentResult)
+def bulk_assignments(
+    payload: BulkAssignment,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_capability("assign-files")),
+) -> BulkAssignmentResult:
+    """Apply one assignment edit across many lessons, in one transaction."""
+    lessons, add, remove = _resolve_bulk(db, payload)
+
+    added = 0
+    removed = 0
+    touched: set[str] = set()
+
+    for lesson in lessons:
+        assigned = {a.teacher_id for a in lesson.assignments}
+        for teacher_id in add - assigned:
+            db.add(
+                LessonAssignment(
+                    id=new_id("la"),
+                    lesson_id=lesson.id,
+                    teacher_id=teacher_id,
+                    source="manual",
+                )
+            )
+            if not db.scalar(
+                select(Progress).where(
+                    Progress.lesson_id == lesson.id, Progress.teacher_id == teacher_id
+                )
+            ):
+                db.add(
+                    Progress(
+                        id=new_id("p"),
+                        teacher_id=teacher_id,
+                        lesson_id=lesson.id,
+                        watchdog_message="Manually assigned — not opened yet",
+                    )
+                )
+            added += 1
+            touched.add(lesson.id)
+
+        gone = remove & assigned
+        if gone:
+            for assignment in db.scalars(
+                select(LessonAssignment).where(
+                    LessonAssignment.lesson_id == lesson.id,
+                    LessonAssignment.teacher_id.in_(gone),
+                )
+            ):
+                db.delete(assignment)
+            for progress in db.scalars(
+                select(Progress).where(
+                    Progress.lesson_id == lesson.id, Progress.teacher_id.in_(gone)
+                )
+            ):
+                db.delete(progress)
+            removed += len(gone)
+            touched.add(lesson.id)
+
+    db.commit()
+
+    refreshed = list(
+        db.scalars(
+            _base_query()
+            .where(Lesson.id.in_({lesson.id for lesson in lessons}))
+            .execution_options(populate_existing=True)
+        )
+    )
+    return BulkAssignmentResult(
+        lessons_touched=len(touched),
+        assignments_added=added,
+        assignments_removed=removed,
+        lessons=[_to_out(lesson) for lesson in refreshed],
+    )
 
 
 @router.post("/{lesson_id}/assign", response_model=LessonOut)
