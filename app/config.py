@@ -146,6 +146,13 @@ class Settings(BaseSettings):
     # still stored; this only decides how much of it is shown.
     geoip_precision: Literal["country", "city"] = "country"
 
+    # --- Curriculum shape -------------------------------------------------- #
+    # Year 1 is block coding at every grade. Year 2 starts the same way and
+    # turns to Python from this grade up. One constant because it is one change:
+    # it decides both which hardware kit the teacher has and whether a slide's
+    # code is a picture that needs reading or text the PDF layer already yields.
+    year2_advanced_from_grade: int = 7
+
     # --- Reading the slide image (Gemini) --------------------------------- #
     # A separate model that READS a slide and writes down what is on it; the
     # answering model then works from that text. This exists because the two
@@ -159,10 +166,7 @@ class Settings(BaseSettings):
     gemini_vision_enabled: bool = False
     # Google's OpenAI-compatible surface, so the existing client shape is reused.
     gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
-    # Year 1 is block coding throughout; Year 2 turns to Python from this grade
-    # up, where the PDF text layer already extracts the code as real text and a
-    # vision pass would be spend for nothing.
-    vision_year2_max_grade: int = 6
+
 
     # --- Sign-in that doesn't add up -------------------------------------- #
     # One account signing in from two different networks inside this window.

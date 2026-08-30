@@ -59,17 +59,18 @@ Output plain text only. No markdown headings, no bold, no code fences."""
 def applies_to(lesson: Lesson | None) -> bool:
     """Whether this lesson's slides are worth reading.
 
-    Year 1 is block coding across every grade. Year 2 turns to Python above the
-    configured grade, and Python in a PDF is real selectable text that the
+    Year 1 is block coding across every grade. Year 2 turns to Python from the
+    configured grade up, and Python in a PDF is real selectable text that the
     existing extraction already delivers — reading those slides as pictures
-    would be spend with nothing to show for it.
+    would be spend with nothing to show for it. Same boundary as the kit split,
+    because it is the same change in the curriculum.
     """
     if lesson is None:
         return False
     year = lesson.year or 2
     if year == 1:
         return True
-    return (lesson.grade or 0) <= settings.vision_year2_max_grade
+    return (lesson.grade or 0) < settings.year2_advanced_from_grade
 
 
 def enabled() -> bool:

@@ -35,7 +35,7 @@ from app.services.file_storage import resolve_stored_file
 from app.services.llm import ChatMessage, LLMError, get_provider
 from app.services.pdf_render import SlideRenderError, render_page_data_url
 from app.services.pdf_text import lesson_context, uploaded_file_context
-from app.services import slide_vision
+from app.services import kits, slide_vision
 from app.services.platform_context import build_platform_context
 from app.services.report_docx import build_school_ai_report, build_super_ai_report
 from app.services.school_context import build_school_context
@@ -117,19 +117,24 @@ def _language_name(user: User) -> str:
     return "French" if (user.language or "").lower() == "fr" else "English"
 
 
-def _policy(user: User, *, vision_note: str) -> str:
-    """Assemble the full teacher-assistant policy for this request."""
-    return "\n\n".join(
-        [
-            _ROLE,
-            _SCOPE,
-            _SOURCES,
-            _WIRING,
-            _FORMAT,
-            _LANGUAGE.format(lang=_language_name(user)),
-            vision_note,
-        ]
-    )
+def _policy(user: User, *, vision_note: str, kit_note: str = "") -> str:
+    """Assemble the full teacher-assistant policy for this request.
+
+    The kit sits next to the wiring rules because that is what it constrains:
+    without it the assistant answers from general micro:bit knowledge and names
+    components the school has never owned.
+    """
+    parts = [
+        _ROLE,
+        _SCOPE,
+        _SOURCES,
+        _WIRING,
+        kit_note,
+        _FORMAT,
+        _LANGUAGE.format(lang=_language_name(user)),
+        vision_note,
+    ]
+    return "\n\n".join(part for part in parts if part)
 
 
 _NO_LESSON = """You are IM-Telligence, a classroom robotics teaching assistant. No lesson or ICT Fair project is open right now, so you cannot help yet. Reply with exactly this sentence and nothing else:
@@ -280,7 +285,7 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
         if reading
         else _vision_note(image_data_url, attempted, payload.current_slide)
     )
-    policy = _policy(current, vision_note=vision_note)
+    policy = _policy(current, vision_note=vision_note, kit_note=kits.kit_note(lesson))
 
     if project is not None:
         uploaded = db.get(UploadedFile, project.file_id) if project.file_id else None
