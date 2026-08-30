@@ -146,6 +146,24 @@ class Settings(BaseSettings):
     # still stored; this only decides how much of it is shown.
     geoip_precision: Literal["country", "city"] = "country"
 
+    # --- Reading the slide image (Gemini) --------------------------------- #
+    # A separate model that READS a slide and writes down what is on it; the
+    # answering model then works from that text. This exists because the two
+    # jobs have different requirements: llama-3.3 reasons about robotics well
+    # and cannot see, and the grades that need seeing are the block-coding ones,
+    # where the code IS a picture and the PDF text layer extracts nothing.
+    # Everything here fails soft — a bad key, a wrong model name or a timeout
+    # costs the teacher nothing but the visual detail.
+    gemini_api_key: str = ""
+    gemini_vision_model: str = "gemini-3.1-flash-lite"
+    gemini_vision_enabled: bool = False
+    # Google's OpenAI-compatible surface, so the existing client shape is reused.
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    # Year 1 is block coding throughout; Year 2 turns to Python from this grade
+    # up, where the PDF text layer already extracts the code as real text and a
+    # vision pass would be spend for nothing.
+    vision_year2_max_grade: int = 6
+
     # --- Sign-in that doesn't add up -------------------------------------- #
     # One account signing in from two different networks inside this window.
     # Nobody is on two networks at once, so it is either a shared password or a

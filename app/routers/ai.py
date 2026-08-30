@@ -26,6 +26,7 @@ from app.schemas.ai import (
     AIChatResponse,
     AIHealth,
     AIUsageStats,
+    VisionProbe,
 )
 from app.services.ai_usage import AILimitExceeded, enforce_ai_limit, record_ai_usage, usage_stats
 from app.services.chat_history import save_exchange
@@ -34,6 +35,7 @@ from app.services.file_storage import resolve_stored_file
 from app.services.llm import ChatMessage, LLMError, get_provider
 from app.services.pdf_render import SlideRenderError, render_page_data_url
 from app.services.pdf_text import lesson_context, uploaded_file_context
+from app.services import slide_vision
 from app.services.platform_context import build_platform_context
 from app.services.report_docx import build_school_ai_report, build_super_ai_report
 from app.services.school_context import build_school_context
@@ -101,6 +103,15 @@ _VISION_FAILED = """SLIDE IMAGE - the teacher is viewing slide {slide}, but its 
 
 _VISION_OFF = """You cannot see the slides as images - you only have the extracted text. Never describe the visual appearance of a slide."""
 
+# When a vision model has read the slide for you. It is a transcription, not
+# sight: the assistant must use it as what the slide shows, without claiming to
+# have looked at it, and must not paper over the gaps the reader marked.
+_VISION_READING = """SLIDE {slide} HAS BEEN READ FOR YOU. A separate vision model looked at the image of slide {slide} - the slide the teacher is on right now - and wrote down what is on it. That writing appears below under SLIDE READING, and for anything visual on this slide it is your source: block code and its nesting, wiring, diagrams, and text the PDF layer missed.
+- Treat it as what the slide shows, and answer from it as confidently as from the lesson text.
+- You did not see the slide yourself. Say "the slide shows", never "I can see".
+- Anything marked [unreadable] was genuinely not legible. Say so; never fill it in.
+- It covers ONLY slide {slide}. You know nothing visual about any other slide."""
+
 
 def _language_name(user: User) -> str:
     return "French" if (user.language or "").lower() == "fr" else "English"
@@ -163,17 +174,27 @@ class PromptBundle:
     grounded: bool = False
 
 
+def _uploaded_for(
+    db: Session, *, lesson: Lesson | None, project: FairProject | None
+) -> UploadedFile | None:
+    """The stored PDF row backing the open lesson/project, or None.
+
+    Only ever called after the access checks above have passed.
+    """
+    if lesson is not None:
+        files = getattr(lesson, "uploaded_files", []) or []
+        return files[0] if files else None
+    if project is not None and project.file_id:
+        return db.get(UploadedFile, project.file_id)
+    return None
+
+
 def _pdf_path_for(db: Session, *, lesson: Lesson | None, project: FairProject | None):
     """Resolve the stored PDF backing the open lesson/project, or None.
 
     Only ever called after the access checks above have passed.
     """
-    uploaded = None
-    if lesson is not None:
-        files = getattr(lesson, "uploaded_files", []) or []
-        uploaded = files[0] if files else None
-    elif project is not None and project.file_id:
-        uploaded = db.get(UploadedFile, project.file_id)
+    uploaded = _uploaded_for(db, lesson=lesson, project=project)
     if uploaded is None or not uploaded.storage_path:
         return None
     return resolve_stored_file(uploaded.storage_path)
@@ -242,9 +263,24 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
     image_data_url, attempted = _slide_image(
         db, lesson=lesson, project=project, current_slide=payload.current_slide
     )
-    policy = _policy(
-        current, vision_note=_vision_note(image_data_url, attempted, payload.current_slide)
+
+    # When the answering model cannot see, a vision model reads the slide and
+    # the answering model works from that text instead. Only for the tracks
+    # where the code is a picture; elsewhere the PDF text layer already has it.
+    reading = None
+    if image_data_url is None and slide_vision.applies_to(lesson):
+        reading = slide_vision.read_slide(
+            db,
+            uploaded=_uploaded_for(db, lesson=lesson, project=project),
+            page=payload.current_slide,
+        )
+
+    vision_note = (
+        _VISION_READING.format(slide=payload.current_slide)
+        if reading
+        else _vision_note(image_data_url, attempted, payload.current_slide)
     )
+    policy = _policy(current, vision_note=vision_note)
 
     if project is not None:
         uploaded = db.get(UploadedFile, project.file_id) if project.file_id else None
@@ -268,9 +304,15 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
             "your robotics knowledge - and say when you are doing so."
         )
 
+    if reading:
+        system += (
+            f"\n\nSLIDE READING (slide {payload.current_slide}):"
+            f"\n<slide_reading>\n{reading}\n</slide_reading>"
+        )
+
     # Report what was actually consulted, so the teacher sees an honest source.
     source_ref = title
-    if image_data_url is not None and payload.current_slide is not None:
+    if (image_data_url is not None or reading) and payload.current_slide is not None:
         source_ref = f"{title} - slide {payload.current_slide}"
 
     return PromptBundle(
@@ -289,6 +331,27 @@ def health(_: User = Depends(get_current_user)) -> AIHealth:
         provider=provider.name,
         model=getattr(provider, "model", None),
         ready=provider.name != "mock",
+        vision_enabled=slide_vision.enabled(),
+        vision_model=settings.gemini_vision_model if slide_vision.enabled() else None,
+    )
+
+
+@router.post("/vision/probe", response_model=VisionProbe)
+def vision_probe(_: User = Depends(require_roles(Role.super_admin))) -> VisionProbe:
+    """Call the configured vision model once and report exactly what came back.
+
+    A model name that does not resolve is the quietest possible failure - every
+    slide reading just returns nothing and teachers get slightly worse answers
+    forever. This turns that into a sentence.
+    """
+    ok, message = slide_vision.probe()
+    listed, names, list_message = slide_vision.list_models()
+    return VisionProbe(
+        enabled=slide_vision.enabled(),
+        model=settings.gemini_vision_model,
+        ok=ok,
+        message=message if ok else f"{message} | models: {list_message}",
+        available=names if listed else [],
     )
 
 

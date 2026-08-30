@@ -37,6 +37,25 @@ class AIHealth(CamelModel):
     provider: str
     model: str | None = None
     ready: bool  # False when falling back to the no-key mock
+    # The separate model that reads slide images for the answering model.
+    vision_enabled: bool = False
+    vision_model: str | None = None
+
+
+class VisionProbe(CamelModel):
+    """Whether the configured vision model actually answers.
+
+    Exists so "does this model name exist?" is a button rather than a guess: a
+    name that does not resolve fails silently at the first slide otherwise, and
+    the only symptom is slightly worse answers.
+    """
+
+    enabled: bool
+    model: str
+    ok: bool
+    message: str
+    # Every model this key can use, so a wrong name shows its neighbours.
+    available: list[str] = []
 
 
 class AIUsageStats(CamelModel):

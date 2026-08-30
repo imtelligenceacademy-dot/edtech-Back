@@ -18,6 +18,7 @@ from app.models.fair_project import FairProject
 from app.models.lesson import Lesson, LessonAssignment, Slide
 from app.models.login_throttle import LoginThrottle
 from app.models.progress import Progress
+from app.models.slide_reading import SlideReading
 from app.models.report import Report
 from app.models.school import School
 from app.models.security_log import SecurityLog
@@ -43,6 +44,7 @@ __all__ = [
     "LoginThrottle",
     "AccessRequest",
     "Progress",
+    "SlideReading",
     "Report",
     "AiUsage",
     "ChatMessage",
