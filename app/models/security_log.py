@@ -30,6 +30,10 @@ class SecurityLog(Base):
     location_lat: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     location_lng: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
+    # What happened, in words, for the row that the event name alone can't
+    # carry: "Wrong password (attempt 3 of 5)", "Reset by IMtelligence Admin".
+    detail: Mapped[str] = mapped_column(String(300), nullable=False, default="")
+
     event: Mapped[SecurityEvent] = mapped_column(
         Enum(SecurityEvent, native_enum=False), nullable=False
     )

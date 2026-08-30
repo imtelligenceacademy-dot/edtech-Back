@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.audit import record_event
+from app.audit import note_unfamiliar_signin, record_event
 from app.config import settings
 from app.cookies import (
     REFRESH_COOKIE_NAME,
@@ -183,9 +183,13 @@ def login(
     now = datetime.now(timezone.utc)
     _enforce_ip_throttle(db, ip, now)
     if user and user.locked_until and _aware(user.locked_until) > now:
+        # Was logged as "blocked second device", which it never was — there is
+        # no second-device rule; this is the failed-login lockout.
+        minutes = max(1, round((_aware(user.locked_until) - now).total_seconds() / 60))
         record_event(
-            db, event=SecurityEvent.blocked_second_device, status=SecurityStatus.blocked,
+            db, event=SecurityEvent.account_locked, status=SecurityStatus.blocked,
             ip=ip, device=device, user=user,
+            detail=f"Sign-in attempted while locked out; {minutes} min remaining",
         )
         db.commit()
         raise HTTPException(
@@ -205,14 +209,29 @@ def login(
         _record_ip_failure(db, ip, now)
         if user:
             user.failed_login_count += 1
+            locked_for = 0
             if user.failed_login_count >= settings.max_failed_logins:
-                user.locked_until = now + timedelta(
-                    minutes=_account_lock_minutes(user.failed_login_count)
-                )
+                locked_for = _account_lock_minutes(user.failed_login_count)
+                user.locked_until = now + timedelta(minutes=locked_for)
+            # A wrong password was logged as "new-ip", so the screen reported an
+            # address change that had not happened. It says what it is now.
             record_event(
-                db, event=SecurityEvent.new_ip, status=SecurityStatus.warning,
+                db, event=SecurityEvent.failed_login, status=SecurityStatus.warning,
                 ip=ip, device=device, user=user,
+                detail=(
+                    f"Wrong password (attempt {user.failed_login_count} of "
+                    f"{settings.max_failed_logins})"
+                ),
             )
+            if locked_for:
+                record_event(
+                    db, event=SecurityEvent.account_locked, status=SecurityStatus.blocked,
+                    ip=ip, device=device, user=user,
+                    detail=(
+                        f"Locked for {locked_for} min after "
+                        f"{user.failed_login_count} failed attempts"
+                    ),
+                )
         db.commit()
         raise _INVALID_CREDENTIALS
 
@@ -229,6 +248,9 @@ def login(
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)
 
+    # Order matters: the "have they used this address/browser before?" check
+    # reads past successful sign-ins, so it must run before this one is written.
+    note_unfamiliar_signin(db, user=user, ip=ip, device=device)
     access = _issue_session(db, response, user, request)
     record_event(
         db, event=SecurityEvent.normal_login, status=SecurityStatus.ok,
@@ -284,12 +306,19 @@ def logout(request: Request, response: Response, db: Session = Depends(get_db)) 
 
 @router.post("/logout-all", response_model=MessageResponse)
 def logout_all(
+    request: Request,
     response: Response,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> MessageResponse:
+    live = sum(1 for token in user.refresh_tokens if not token.revoked)
     for token in user.refresh_tokens:
         token.revoked = True
+    record_event(
+        db, event=SecurityEvent.signed_out_all, status=SecurityStatus.ok,
+        ip=client_ip(request), device=user_agent(request), user=user,
+        detail=f"Ended {live} session(s) on every device",
+    )
     db.commit()
     clear_auth_cookies(response)
     return MessageResponse(message="Signed out from all devices")

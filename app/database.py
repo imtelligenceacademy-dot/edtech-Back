@@ -96,6 +96,9 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
     "users": {
         "ict_fair_access": "BOOLEAN NOT NULL DEFAULT 0",
     },
+    "security_logs": {
+        "detail": "VARCHAR(300) NOT NULL DEFAULT ''",
+    },
 }
 
 

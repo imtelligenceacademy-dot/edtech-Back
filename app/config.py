@@ -129,6 +129,16 @@ class Settings(BaseSettings):
     bootstrap_admin_password: str = ""
     bootstrap_admin_name: str = "Super Admin"
 
+    # --- Sign-in location lookup ------------------------------------------ #
+    # Off by default. "maxmind" reads a local GeoLite2 .mmdb (set geoip_db_path,
+    # pip install geoip2) and sends nothing anywhere. "http" calls a third-party
+    # service, which hands that service your users' IP addresses — an explicit
+    # choice, never a default. An IP gives a city at best, never a person.
+    geoip_provider: Literal["none", "maxmind", "http"] = "none"
+    geoip_db_path: str = ""
+    # {ip} is substituted, e.g. "https://ipapi.co/{ip}/json/".
+    geoip_api_url: str = ""
+
     @property
     def is_production(self) -> bool:
         return self.environment == "production"

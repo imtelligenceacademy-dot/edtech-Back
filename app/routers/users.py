@@ -6,14 +6,15 @@ Super-admins manage everyone; school-admins are monitoring-only and may only
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.audit import record_event
 from app.database import get_db
 from app.deps import get_current_user, require_capability
 from app.models import School, User
-from app.models.enums import Role, UserStatus
+from app.models.enums import Role, SecurityEvent, SecurityStatus, UserStatus
 from app.schemas.auth import MessageResponse
 from app.schemas.user import (
     PasswordReset,
@@ -24,7 +25,7 @@ from app.schemas.user import (
 )
 from app.security import hash_password
 from app.services.auto_assign import prune_teacher_assignments, sync_teacher_assignments
-from app.utils import new_id
+from app.utils import client_ip, new_id, user_agent
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -182,20 +183,36 @@ def update_user(
 def reset_password(
     user_id: str,
     payload: PasswordReset,
+    request: Request,
     db: Session = Depends(get_db),
-    _: User = Depends(require_capability("create-users")),
+    current: User = Depends(require_capability("create-users")),
 ) -> MessageResponse:
     """Set a new password for a user. The previous password is irrecoverable by
     design (stored only as an Argon2id hash). Resetting revokes the user's
     refresh tokens so existing sessions must re-authenticate.
+
+    Teachers cannot change their own password, so this is the only way one ever
+    changes — and it silently signs the teacher out everywhere. That belongs in
+    the security log: it used to leave no trace at all, which meant a teacher
+    asking "why was I logged out?" had no answer anywhere in the system.
     """
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     user.password_hash = hash_password(payload.password)
+    ended = sum(1 for token in user.refresh_tokens if not token.revoked)
     for token in user.refresh_tokens:
         token.revoked = True
+    record_event(
+        db,
+        event=SecurityEvent.password_reset,
+        status=SecurityStatus.warning,
+        ip=client_ip(request),
+        device=user_agent(request),
+        user=user,
+        detail=f"Password reset by {current.name}; {ended} session(s) ended",
+    )
     db.commit()
     return MessageResponse(message="Password updated")
 
