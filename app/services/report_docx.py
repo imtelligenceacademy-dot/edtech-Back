@@ -10,12 +10,19 @@ from docx.shared import Pt, RGBColor
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models import AiUsage, Lesson, Progress, School, SecurityLog, User
-from app.models.enums import Role, SecurityStatus, UserStatus
+from app.models import AiUsage, Lesson, Progress, School, User
+from app.models.enums import LessonStatus, Role, UserStatus
 from app.services.ai_usage import (
     usage_breakdown_for_school,
     usage_by_user,
     usage_total_for_school,
+)
+from app.services.report_metrics import (
+    QUIET_AFTER_DAYS,
+    movement,
+    progress_stats,
+    quiet_teachers,
+    security_anomalies,
 )
 
 BRAND = RGBColor(0x0F, 0x76, 0x6E)  # teal-700
@@ -83,8 +90,18 @@ def _finish(doc: Document) -> io.BytesIO:
 
 # --------------------------------------------------------------------------- #
 def _school_sections(
-    db: Session, doc: Document, school: School, include_security: bool = False
+    db: Session,
+    doc: Document,
+    school: School,
+    include_security: bool = False,
+    include_detail: bool = True,
 ) -> None:
+    """One school's numbers.
+
+    ``include_detail`` carries the per-assignment progress table. The platform
+    report turns it off: one row per assignment per school is a document nobody
+    opens, and the per-school report already exists for that.
+    """
     teachers = list(
         db.scalars(
             select(User).where(User.school_id == school.id, User.role == Role.teacher)
@@ -101,38 +118,66 @@ def _school_sections(
         if lesson_ids
         else {}
     )
-    logs = (
-        list(
-            db.scalars(
-                select(SecurityLog)
-                .where(SecurityLog.school_id == school.id)
-                .order_by(SecurityLog.timestamp.desc())
-                .limit(50)
-            )
-        )
-        if include_security
-        else []
-    )
 
     usage = usage_by_user(db, tids)
     ai = usage_breakdown_for_school(db, school.id)
 
+    stats = progress_stats(progress)
+    moved = movement(db, tids, school_id=school.id)
+    quiet = quiet_teachers(db, teachers)
+    anomalies = security_anomalies(db, school_id=school.id) if include_security else []
     active = sum(1 for t in teachers if t.status == UserStatus.active)
-    avg = round(sum(p.percent_complete for p in progress) / len(progress)) if progress else 0
-    late = sum(1 for p in progress if p.watchdog.value == "late" or p.status.value == "late")
-    alerts = sum(1 for l in logs if l.status != SecurityStatus.ok)
 
+    # Assigned / started / completed are three separate facts. The old single
+    # "avg completion" averaged never-opened assignments in with the rest, so a
+    # fresh upload made every school look like it had gone backwards.
     _heading(doc, "Summary")
-    headers = ["Active teachers", "Assignments", "Avg completion", "Late", "AI (teachers)", "AI (admin)"]
-    row = [str(active), str(len(progress)), f"{avg}%", str(late), str(ai["teacher"]), str(ai["admin"])]
-    if include_security:
-        headers.insert(4, "Security alerts")
-        row.insert(4, str(alerts))
     _table(
         doc,
-        headers,
-        [row],
+        ["Active teachers", "Assigned", "Started", "Completed", "Not opened", "Late"],
+        [
+            [
+                str(active),
+                str(stats.assigned),
+                str(stats.started),
+                str(stats.completed),
+                str(stats.not_started),
+                str(stats.late),
+            ]
+        ],
     )
+    _meta_line(
+        doc,
+        f"{stats.headline}."
+        + (
+            f" Among lessons actually begun, average progress is {stats.avg_of_started}%."
+            if stats.avg_of_started is not None
+            else ""
+        ),
+    )
+
+    _heading(doc, "This week")
+    for line in moved.lines():
+        doc.add_paragraph(line, style="List Bullet")
+
+    if quiet:
+        _heading(doc, "Needs attention")
+        _meta_line(
+            doc, f"Active teachers with no lesson opened in {QUIET_AFTER_DAYS}+ days."
+        )
+        _table(
+            doc,
+            ["Teacher", "Email", "Last opened", "Completed to date"],
+            [
+                [
+                    q.name,
+                    q.email,
+                    "never" if q.days_quiet is None else f"{q.days_quiet} days ago",
+                    str(q.completed),
+                ]
+                for q in quiet
+            ],
+        )
 
     _heading(doc, "Teachers")
     _table(
@@ -174,38 +219,56 @@ def _school_sections(
         ],
     )
 
-    _heading(doc, "Teacher progress")
-    _table(
-        doc,
-        ["Teacher", "Lesson", "Status", "%", "Watchdog"],
-        [
-            [
-                name_by_id.get(p.teacher_id, p.teacher_id),
-                lessons.get(p.lesson_id, p.lesson_id),
-                p.status.value,
-                str(p.percent_complete),
-                p.watchdog.value,
-            ]
-            for p in progress
-        ],
-    )
+    if include_detail:
+        # Late and unfinished work first — the top of the table is the part
+        # anybody reads.
+        def _urgency(p: Progress) -> tuple[int, str]:
+            rank = {
+                LessonStatus.late: 0,
+                LessonStatus.in_progress: 1,
+                LessonStatus.not_started: 2,
+                LessonStatus.completed: 3,
+            }
+            return (rank.get(p.status, 4), name_by_id.get(p.teacher_id, ""))
 
-    if include_security:
-        _heading(doc, "Security log")
+        _heading(doc, "Teacher progress")
+        _meta_line(doc, "Late and in-progress lessons first.")
         _table(
             doc,
-            ["User", "Event", "Status", "Device", "Time"],
+            ["Teacher", "Lesson", "Status", "%", "Watchdog"],
             [
                 [
-                    l.user_name,
-                    l.event.value,
-                    l.status.value,
-                    (l.device or "")[:40],
-                    l.timestamp.strftime("%Y-%m-%d %H:%M"),
+                    name_by_id.get(p.teacher_id, p.teacher_id),
+                    lessons.get(p.lesson_id, p.lesson_id),
+                    p.status.value,
+                    str(p.percent_complete),
+                    p.watchdog.value,
                 ]
-                for l in logs
+                for p in sorted(progress, key=_urgency)
             ],
         )
+
+    if include_security:
+        # Only what went wrong, grouped. Fifty lines of ordinary logins used to
+        # bury the three events worth reading.
+        _heading(doc, "Security alerts")
+        if anomalies:
+            _table(
+                doc,
+                ["User", "Event", "Status", "Times", "Last seen"],
+                [
+                    [
+                        a.user_name,
+                        a.event,
+                        a.status,
+                        str(a.count),
+                        a.last_seen.strftime("%Y-%m-%d %H:%M") if a.last_seen else "—",
+                    ]
+                    for a in anomalies
+                ],
+            )
+        else:
+            _meta_line(doc, "No warnings or blocks in the last 30 days.")
 
 
 def _clean_inline(text: str) -> str:
@@ -241,8 +304,9 @@ def build_school_ai_report(
     doc = Document()
     _title_block(doc, "School Report", school_name, generated_by)
 
-    _heading(doc, "Executive summary")
-    _meta_line(doc, "AI-generated narrative based on your school's live data.")
+    # No wrapper heading: the narrative brings its own "## " headings, and a
+    # section title above them only repeats the first one.
+    _meta_line(doc, "Written from the live figures in the tables below.")
     _render_narrative(doc, narrative)
     doc.add_paragraph()
 
@@ -263,12 +327,145 @@ def build_school_report(db: Session, school_id: str, generated_by: str) -> tuple
     return _finish(doc), f"IM-Telligence Report - {school_name} - {date}.docx"
 
 
+def _platform_body(db: Session, doc: Document) -> None:
+    """Rollups and exceptions.
+
+    This used to page-break into a full per-school dump, one row per assignment,
+    which at curriculum scale produced a document nobody opened. Per-school
+    detail lives in the per-school report; what belongs here is the comparison
+    between schools and the handful of things that need somebody's attention.
+    """
+    schools = list(db.scalars(select(School).order_by(School.name)))
+    teachers = list(db.scalars(select(User).where(User.role == Role.teacher)))
+    lesson_count = db.scalar(select(func.count(Lesson.id))) or 0
+    all_ids = [t.id for t in teachers]
+
+    all_progress = (
+        list(db.scalars(select(Progress).where(Progress.teacher_id.in_(all_ids))))
+        if all_ids
+        else []
+    )
+    stats = progress_stats(all_progress)
+    moved = movement(db, all_ids)
+    anomalies = security_anomalies(db)
+    # Counted over the same 30 days the alerts table lists, so the summary and
+    # the table can't tell the reader two different numbers.
+    alerts_recent = sum(a.count for a in anomalies)
+    ai_total = db.scalar(select(func.count(AiUsage.id))) or 0
+
+    _heading(doc, "Platform summary")
+    _table(
+        doc,
+        ["Schools", "Teachers", "Lessons", "Assigned"],
+        [[str(len(schools)), str(len(teachers)), str(lesson_count), str(stats.assigned)]],
+    )
+    _table(
+        doc,
+        [
+            "Started",
+            "Completed",
+            "Not opened",
+            "Late",
+            "Alerts (30d)",
+            "AI questions (all time)",
+        ],
+        [
+            [
+                str(stats.started),
+                str(stats.completed),
+                str(stats.not_started),
+                str(stats.late),
+                str(alerts_recent),
+                str(ai_total),
+            ]
+        ],
+    )
+    _meta_line(doc, f"{stats.headline}.")
+
+    _heading(doc, "This week")
+    for line in moved.lines():
+        doc.add_paragraph(line, style="List Bullet")
+
+    progress_by_school: dict[str, list[Progress]] = {s.id: [] for s in schools}
+    school_of_teacher = {t.id: t.school_id for t in teachers}
+    for p in all_progress:
+        sid = school_of_teacher.get(p.teacher_id)
+        if sid in progress_by_school:
+            progress_by_school[sid].append(p)
+
+    _heading(doc, "Schools overview")
+    _meta_line(doc, "Completed out of assigned — a school with new uploads is not behind.")
+    rows = []
+    for s in schools:
+        s_stats = progress_stats(progress_by_school.get(s.id, []))
+        s_teachers = [t for t in teachers if t.school_id == s.id]
+        rows.append(
+            [
+                s.name,
+                s.city or "—",
+                str(len(s_teachers)),
+                str(s_stats.assigned),
+                str(s_stats.completed),
+                f"{s_stats.completion_rate}%",
+                str(s_stats.late),
+                str(usage_total_for_school(db, s.id)),
+            ]
+        )
+    _table(
+        doc,
+        ["School", "City", "Teachers", "Assigned", "Done", "Rate", "Late", "AI"],
+        rows,
+    )
+
+    # The exceptions, across every school, in one place.
+    quiet = quiet_teachers(db, teachers)
+    school_name_by_id = {s.id: s.name for s in schools}
+    teacher_school = {t.email: school_name_by_id.get(t.school_id, "—") for t in teachers}
+    _heading(doc, "Teachers needing a nudge")
+    if quiet:
+        _meta_line(doc, f"No lesson opened in {QUIET_AFTER_DAYS}+ days, quietest first.")
+        _table(
+            doc,
+            ["Teacher", "School", "Last opened", "Completed to date"],
+            [
+                [
+                    q.name,
+                    teacher_school.get(q.email, "—"),
+                    "never" if q.days_quiet is None else f"{q.days_quiet} days ago",
+                    str(q.completed),
+                ]
+                for q in quiet
+            ],
+        )
+    else:
+        _meta_line(doc, "Every active teacher has opened a lesson recently.")
+
+    _heading(doc, "Security alerts")
+    if anomalies:
+        _table(
+            doc,
+            ["User", "Event", "Status", "Times", "Last seen"],
+            [
+                [
+                    a.user_name,
+                    a.event,
+                    a.status,
+                    str(a.count),
+                    a.last_seen.strftime("%Y-%m-%d %H:%M") if a.last_seen else "—",
+                ]
+                for a in anomalies
+            ],
+        )
+    else:
+        _meta_line(doc, "No warnings or blocks in the last 30 days.")
+
+
 def build_super_report(
     db: Session, generated_by: str, school_id: str | None = None
 ) -> tuple[io.BytesIO, str]:
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    # Scoped to one school -> same as the school report.
+    # Scoped to one school -> same as the school report, with security.
     if school_id:
         school = db.get(School, school_id)
         school_name = school.name if school else "School"
@@ -278,69 +475,29 @@ def build_super_report(
             _school_sections(db, doc, school, include_security=True)
         return _finish(doc), f"IM-Telligence Report - {school_name} - {date}.docx"
 
-    # Platform-wide overview.
+    doc = Document()
+    _title_block(doc, "Platform Report", "All schools", generated_by)
+    _platform_body(db, doc)
+    return _finish(doc), f"IM-Telligence Platform Report - {date}.docx"
+
+
+def build_super_ai_report(
+    db: Session, generated_by: str, narrative: str
+) -> tuple[io.BytesIO, str]:
+    """Platform report that leads with the assistant's read of what needs
+    attention, then the same rollups underneath it.
+
+    The school admin has had this since the assistant shipped; the super-admin,
+    who is the one deciding where to spend attention across every school, was
+    getting tables alone.
+    """
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     doc = Document()
     _title_block(doc, "Platform Report", "All schools", generated_by)
 
-    schools = list(db.scalars(select(School).order_by(School.name)))
-    teachers = list(db.scalars(select(User).where(User.role == Role.teacher)))
-    teacher_count = len(teachers)
-    lesson_count = db.scalar(select(func.count(Lesson.id))) or 0
+    _meta_line(doc, "Written from the live figures in the tables below.")
+    _render_narrative(doc, narrative)
+    doc.add_paragraph()
 
-    all_progress = (
-        list(db.scalars(select(Progress).where(Progress.teacher_id.in_([t.id for t in teachers]))))
-        if teachers
-        else []
-    )
-    assignments = len(all_progress)
-    avg_completion = (
-        round(sum(p.percent_complete for p in all_progress) / assignments) if assignments else 0
-    )
-    late_total = sum(
-        1 for p in all_progress if p.watchdog.value == "late" or p.status.value == "late"
-    )
-    alerts_total = db.scalar(
-        select(func.count(SecurityLog.id)).where(SecurityLog.status != SecurityStatus.ok)
-    ) or 0
-    ai_total = db.scalar(select(func.count(AiUsage.id))) or 0
-
-    _heading(doc, "Platform summary")
-    _table(
-        doc,
-        ["Schools", "Teachers", "Lessons", "Assignments"],
-        [[str(len(schools)), str(teacher_count), str(lesson_count), str(assignments)]],
-    )
-    _table(
-        doc,
-        ["Avg completion", "Late lessons", "Security alerts", "AI interactions"],
-        [[f"{avg_completion}%", str(late_total), str(alerts_total), str(ai_total)]],
-    )
-
-    # Per-school rollups for the overview table.
-    progress_by_school: dict[str, list[Progress]] = {s.id: [] for s in schools}
-    school_of_teacher = {t.id: t.school_id for t in teachers}
-    for p in all_progress:
-        sid = school_of_teacher.get(p.teacher_id)
-        if sid in progress_by_school:
-            progress_by_school[sid].append(p)
-
-    _heading(doc, "Schools overview")
-    rows = []
-    for s in schools:
-        sp = progress_by_school.get(s.id, [])
-        s_teachers = sum(1 for t in teachers if t.school_id == s.id)
-        s_avg = round(sum(p.percent_complete for p in sp) / len(sp)) if sp else 0
-        s_ai = usage_total_for_school(db, s.id)
-        rows.append(
-            [s.name, s.city or "—", s.country or "—", str(s_teachers), f"{s_avg}%", str(s_ai)]
-        )
-    _table(doc, ["School", "City", "Country", "Teachers", "Avg %", "AI"], rows)
-
-    # Per-school detail sections (each includes per-teacher AI usage).
-    for s in schools:
-        doc.add_page_break()
-        _heading(doc, s.name, size=16)
-        _meta_line(doc, f"{s.city or '—'}, {s.country or '—'}")
-        _school_sections(db, doc, s, include_security=True)
-
-    return _finish(doc), f"IM-Telligence Platform Report - {date}.docx"
+    _platform_body(db, doc)
+    return _finish(doc), f"IM-Telligence AI Platform Report - {date}.docx"

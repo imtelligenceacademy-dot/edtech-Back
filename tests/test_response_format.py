@@ -64,11 +64,21 @@ def test_admin_prompt_keeps_its_original_rules():
     assert "THIS SCHOOL's data only" in ai._ADMIN_GUARDRAILS
 
 
-def test_word_report_prompt_still_requests_markdown_headings():
+def test_word_report_prompts_still_request_markdown_headings():
     """Regression guard: report_docx turns '## ' lines into Word headings, so
-    stripping Markdown here would flatten the generated report."""
-    assert "## Overview" in ai._REPORT_SYSTEM
-    assert "## Recommendations" in ai._REPORT_SYSTEM
+    stripping Markdown here would flatten the generated report. The headings
+    themselves may be renamed; the '## ' must survive."""
+    for prompt in (ai._REPORT_SYSTEM, ai._PLATFORM_REPORT_SYSTEM):
+        assert "## " in prompt
+        assert "## What needs attention" in prompt
+
+
+def test_report_prompts_forbid_restating_the_tables():
+    """The narrative earns its page by deciding what matters, not by repeating
+    the numbers printed underneath it."""
+    for prompt in (ai._REPORT_SYSTEM, ai._PLATFORM_REPORT_SYSTEM):
+        assert "Do NOT restate the tables" in prompt
+        assert "Never invent or estimate a figure" in prompt
 
 
 def test_report_builder_strips_bold_markers_itself():

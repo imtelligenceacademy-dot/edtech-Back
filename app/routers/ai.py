@@ -34,7 +34,8 @@ from app.services.file_storage import resolve_stored_file
 from app.services.llm import ChatMessage, LLMError, get_provider
 from app.services.pdf_render import SlideRenderError, render_page_data_url
 from app.services.pdf_text import lesson_context, uploaded_file_context
-from app.services.report_docx import build_school_ai_report
+from app.services.platform_context import build_platform_context
+from app.services.report_docx import build_school_ai_report, build_super_ai_report
 from app.services.school_context import build_school_context
 
 logger = logging.getLogger("app.ai")
@@ -509,19 +510,51 @@ def admin_chat_stream(
 # School-admin report — the assistant writes a narrative from the school's live
 # data, rendered into a downloadable Word (.docx) alongside the data tables.
 # --------------------------------------------------------------------------- #
+# The reader already has the tables; asking for six fixed headings only ever
+# produced a competent restatement of them. What a report is for is deciding
+# what to do next, so that is what is asked for: the few things that need
+# attention, each with the figure behind it and the person it belongs to.
+_REPORT_RULES = (
+    "Rules:\n"
+    "- Lead with what needs attention, most urgent first. At most three items.\n"
+    "- Every claim carries the number it came from. Never invent or estimate a "
+    "figure; if the data does not say, do not say it.\n"
+    "- Name the person or the school an item belongs to. An action nobody owns "
+    "gets read once and forgotten.\n"
+    "- Say what changed since last week wherever the data offers a comparison, "
+    "and say plainly when it is the first week of data rather than implying "
+    "growth.\n"
+    "- Do NOT restate the tables. The reader has them underneath you. Summarise "
+    "only to make a point.\n"
+    "- If nothing needs attention, say so in one line rather than manufacturing "
+    "a concern.\n"
+    "- Short paragraphs and '- ' bullets. Under 400 words."
+)
+
 _REPORT_SYSTEM = (
-    "You are IM-Telligence, writing a concise, professional report on a school for "
-    "its principal. Using ONLY the SCHOOL DATA provided, write a clear narrative "
-    "report. Structure it with these markdown headings, in this order:\n"
-    "## Overview\n## Teacher Engagement\n## Lesson Progress\n"
-    "## Risks & Late Lessons\n## Security\n## Recommendations\n"
-    "Use short paragraphs and '- ' bullet points. Cite concrete numbers from the "
-    "data. Never invent figures. Keep the whole report under 500 words."
+    "You are IM-Telligence, writing the opening page of a school's report for its "
+    "principal. Use ONLY the SCHOOL DATA provided.\n"
+    "Structure it with these markdown headings, in this order:\n"
+    "## What needs attention\n## What moved this week\n## Recommended next steps\n"
+    f"{_REPORT_RULES}"
+)
+
+_PLATFORM_REPORT_SYSTEM = (
+    "You are IM-Telligence, writing the opening page of the platform report for "
+    "the person who runs every school on it. Use ONLY the PLATFORM DATA provided.\n"
+    "Their question is comparative: which schools are moving, which have stalled, "
+    "and where their attention is worth spending this week.\n"
+    "Structure it with these markdown headings, in this order:\n"
+    "## What needs attention\n## How the schools compare\n## What moved this week\n"
+    "## Recommended next steps\n"
+    f"{_REPORT_RULES}\n"
+    "- Name schools explicitly when they differ from the rest, and say what is "
+    "different about them rather than only that they are behind."
 )
 
 _REPORT_FALLBACK = (
-    "## Overview\nThe automated narrative is unavailable right now, but the data "
-    "tables below reflect your school's current status."
+    "## What needs attention\nThe automated narrative is unavailable right now, "
+    "but the tables below reflect the current status."
 )
 
 
@@ -551,6 +584,40 @@ def admin_report(
 
     record_ai_usage(db, current, "admin")
     buf, filename = build_school_ai_report(db, current.school_id, current.name, narrative)
+    disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
+    return StreamingResponse(
+        buf, media_type=DOCX_MEDIA, headers={"Content-Disposition": disposition}
+    )
+
+
+@router.post("/super/report")
+def super_report(
+    db: Session = Depends(get_db),
+    current: User = Depends(require_roles(Role.super_admin)),
+) -> StreamingResponse:
+    """The platform report, with the narrative the school admin has always had.
+
+    The super-admin was the only reader getting tables alone — and they are the
+    one deciding which school to spend the week on.
+    """
+    context = build_platform_context(db)
+    system = f"{_PLATFORM_REPORT_SYSTEM}\n\n<PLATFORM DATA>\n{context}\n</PLATFORM DATA>"
+    provider = get_provider()
+    try:
+        enforce_ai_limit(db, current, "admin")
+    except AILimitExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message
+        ) from exc
+    try:
+        narrative = provider.chat(
+            system, [{"role": "user", "content": "Write the platform report now."}]
+        )
+    except Exception:
+        narrative = _REPORT_FALLBACK
+
+    record_ai_usage(db, current, "admin")
+    buf, filename = build_super_ai_report(db, current.name, narrative)
     disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
         buf, media_type=DOCX_MEDIA, headers={"Content-Disposition": disposition}

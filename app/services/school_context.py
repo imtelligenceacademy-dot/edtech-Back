@@ -13,10 +13,16 @@ from app.models import (
     Progress,
     Report,
     School,
-    SecurityLog,
     User,
 )
-from app.models.enums import Role, SecurityStatus, UserStatus
+from app.models.enums import Role, UserStatus
+from app.services.report_metrics import (
+    QUIET_AFTER_DAYS,
+    movement,
+    progress_stats,
+    quiet_teachers,
+    security_anomalies,
+)
 
 
 def build_school_context(db: Session, admin: User) -> tuple[str, str]:
@@ -45,14 +51,6 @@ def build_school_context(db: Session, admin: User) -> tuple[str, str]:
         if lesson_ids
         else {}
     )
-    alerts = list(
-        db.scalars(
-            select(SecurityLog)
-            .where(SecurityLog.school_id == admin.school_id)
-            .order_by(SecurityLog.timestamp.desc())
-            .limit(15)
-        )
-    )
     reports = list(
         db.scalars(
             select(Report)
@@ -64,23 +62,35 @@ def build_school_context(db: Session, admin: User) -> tuple[str, str]:
 
     active = [t for t in teachers if t.status == UserStatus.active]
     pending = [t for t in teachers if t.status == UserStatus.pending]
-    late = [p for p in progress if p.watchdog.value == "late" or p.status.value == "late"]
-    completed = [p for p in progress if p.status.value == "completed"]
-    avg = (
-        round(sum(p.percent_complete for p in progress) / len(progress))
-        if progress
-        else 0
-    )
+
+    stats = progress_stats(progress)
+    moved = movement(db, tids, school_id=admin.school_id)
+    quiet = quiet_teachers(db, teachers)
 
     lines: list[str] = [
         f"SCHOOL: {school_name}",
         "",
         f"SUMMARY: {len(active)} active teachers, {len(pending)} pending. "
-        f"{len(progress)} lesson assignments tracked, average completion {avg}%, "
-        f"{len(late)} late, {len(completed)} completed.",
+        f"{stats.assigned} lessons assigned, {stats.started} started, "
+        f"{stats.completed} completed ({stats.completion_rate}%), "
+        f"{stats.not_started} never opened, {stats.late} late."
+        + (
+            f" Average progress across the lessons actually begun: "
+            f"{stats.avg_of_started}%."
+            if stats.avg_of_started is not None
+            else ""
+        ),
         "",
-        "TEACHERS:",
+        # The comparison is the point of a report: a figure with nothing beside
+        # it cannot say whether things are getting better.
+        "THIS WEEK vs LAST WEEK:",
     ]
+    lines += [f"- {line}" for line in moved.lines()]
+
+    lines += ["", f"QUIET TEACHERS (nothing opened in {QUIET_AFTER_DAYS}+ days):"]
+    lines += [f"- {q.describe()}" for q in quiet] or ["- (none — everyone is active)"]
+
+    lines += ["", "TEACHERS:"]
     for t in teachers:
         lines.append(
             f"- {t.name} ({t.status.value}) | grades {t.grades or []} | "
@@ -99,15 +109,11 @@ def build_school_context(db: Session, admin: User) -> tuple[str, str]:
     else:
         lines.append("- (no progress records yet)")
 
-    lines += ["", "SECURITY ALERTS (most recent):"]
-    non_ok = [a for a in alerts if a.status != SecurityStatus.ok]
-    if non_ok:
-        for a in non_ok:
-            lines.append(
-                f"- {a.user_name} | {a.event.value} | {a.status.value} | {a.device} | {a.ip}"
-            )
-    else:
-        lines.append("- (no warnings or blocks recently)")
+    lines += ["", "SECURITY ALERTS (grouped, last 30 days):"]
+    anomalies = security_anomalies(db, school_id=admin.school_id)
+    lines += [f"- {a.describe()}" for a in anomalies] or [
+        "- (no warnings or blocks recently)"
+    ]
 
     lines += ["", "REPORTS:"]
     if reports:
