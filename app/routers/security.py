@@ -83,7 +83,8 @@ def _out(log: SecurityLog) -> SecurityLogOut:
         ip=log.ip,
         device=log.device,
         device_label=useragent.label(log.device),
-        location_label=log.location_label,
+        # Stored full, shown at the configured precision.
+        location_label=geoip.display(log.location_label),
         location_lat=log.location_lat,
         location_lng=log.location_lng,
         detail=log.detail or "",

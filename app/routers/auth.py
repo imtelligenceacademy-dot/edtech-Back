@@ -34,6 +34,7 @@ from app.schemas.auth import (
     MessageResponse,
     SessionUser,
 )
+from app.services.signin_watch import check_sign_in
 from app.security import (
     create_access_token,
     generate_refresh_token,
@@ -248,9 +249,10 @@ def login(
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)
 
-    # Order matters: the "have they used this address/browser before?" check
-    # reads past successful sign-ins, so it must run before this one is written.
+    # Order matters: both checks read past successful sign-ins, so they must run
+    # before this one is written.
     note_unfamiliar_signin(db, user=user, ip=ip, device=device)
+    check_sign_in(db, user=user, ip=ip, device=device)
     access = _issue_session(db, response, user, request)
     record_event(
         db, event=SecurityEvent.normal_login, status=SecurityStatus.ok,

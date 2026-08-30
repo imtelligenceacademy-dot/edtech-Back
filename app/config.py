@@ -138,6 +138,20 @@ class Settings(BaseSettings):
     geoip_db_path: str = ""
     # {ip} is substituted, e.g. "https://ipapi.co/{ip}/json/".
     geoip_api_url: str = ""
+    # How much of a resolved place to believe. Databases map an address to where
+    # the ISP routes it, so in countries with one incumbent and a central
+    # gateway every subscriber resolves to the capital — measured on Lebanese
+    # ranges, where correct addresses all reported "Beirut". Country is right
+    # even when the city is not, so country is the default. The full place is
+    # still stored; this only decides how much of it is shown.
+    geoip_precision: Literal["country", "city"] = "country"
+
+    # --- Sign-in that doesn't add up -------------------------------------- #
+    # One account signing in from two different networks inside this window.
+    # Nobody is on two networks at once, so it is either a shared password or a
+    # stolen one. Warning-only: geolocation and carrier NAT are wrong often
+    # enough that locking teachers out on this would be worse than the problem.
+    signin_window_minutes: int = 10
 
     @property
     def is_production(self) -> bool:

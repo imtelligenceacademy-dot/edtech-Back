@@ -135,8 +135,46 @@ def _http(ip: str) -> Place | None:
         return None
 
 
+def country_of(label: str | None) -> str:
+    """The country out of a stored place. Providers return "City, Country" (some
+    "City, Region, Country"), so the last segment is the country either way."""
+    if not label:
+        return ""
+    return label.split(",")[-1].strip()
+
+
+def display(label: str | None) -> str:
+    """How much of a stored place to show.
+
+    The full answer is kept on the row; this decides how much of it is asserted.
+    At the default precision a Lebanese address reads "Lebanon" rather than
+    "Beirut, Lebanon" — the country is right, the city is the ISP's gateway, and
+    a confident wrong city is exactly the fabricated precision this screen was
+    fixed to stop showing.
+    """
+    if not label:
+        return ""
+    if settings.geoip_precision == "city" or label == LOCAL.label:
+        return label
+    return country_of(label)
+
+
 def enabled() -> bool:
     return settings.geoip_provider in ("maxmind", "http")
+
+
+def locate_cached(ip: str) -> Place | None:
+    """Whatever is already known for this address, without any lookup.
+
+    Used on the sign-in path, which must never wait on a network call. The same
+    handful of school addresses recur constantly, so the cache usually has the
+    answer; when it doesn't, the caller simply goes without.
+    """
+    if not ip:
+        return None
+    if _private(ip):
+        return LOCAL
+    return _from_cache(ip)[1]
 
 
 def locate(ip: str) -> Place | None:
