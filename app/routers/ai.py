@@ -35,7 +35,7 @@ from app.services.file_storage import resolve_stored_file
 from app.services.llm import ChatMessage, LLMError, get_provider
 from app.services.pdf_render import SlideRenderError, render_page_data_url
 from app.services.pdf_text import lesson_context, uploaded_file_context
-from app.services import kits, slide_vision
+from app.services import hardware, kits, slide_vision
 from app.services.platform_context import build_platform_context
 from app.services.report_docx import build_school_ai_report, build_super_ai_report
 from app.services.school_context import build_school_context
@@ -76,7 +76,8 @@ _SOURCES = """USING THE LESSON:
 - The lesson material below is your primary source for anything specific to this lesson. Its text is split into slides labelled "--- Slide N ---"; when asked about slide N, use the text under that exact label.
 - Beyond those specifics you may and should use your own robotics knowledge to explain, expand, give examples and troubleshoot.
 - Make clear which is which: say when something comes from the lesson, versus when it is your own additional recommendation.
-- Never contradict the lesson material, and never invent what a slide shows.
+- Never invent what a slide shows.
+- On teaching, sequencing and what the class is meant to do, the lesson is the last word. On ELECTRICAL FACTS it is not: a slide can describe a different revision of a module, or simply be wrong. Where a verified hardware profile below disagrees with the lesson, follow the profile and tell the teacher the slide looks incorrect.
 - If the board, component version, voltage or pin numbers are not stated, say what you are assuming before you answer."""
 
 _WIRING = """WIRING AND HARDWARE ANSWERS must include:
@@ -117,12 +118,24 @@ def _language_name(user: User) -> str:
     return "French" if (user.language or "").lower() == "fr" else "English"
 
 
-def _policy(user: User, *, vision_note: str, kit_note: str = "") -> str:
+def _policy(
+    user: User,
+    *,
+    vision_note: str,
+    kit_note: str = "",
+    hardware_note: str = "",
+) -> str:
     """Assemble the full teacher-assistant policy for this request.
 
     The kit sits next to the wiring rules because that is what it constrains:
     without it the assistant answers from general micro:bit knowledge and names
     components the school has never owned.
+
+    The hardware block follows immediately, and answers the next question down:
+    given that the teacher has THIS module, what does a level or a value
+    actually do on it. Without it the assistant knows which parts exist and
+    still explains them from a general rule about 0 and 1 - which is how a
+    common-anode RGB LED came to be described as turning on with 1.
     """
     parts = [
         _ROLE,
@@ -130,6 +143,7 @@ def _policy(user: User, *, vision_note: str, kit_note: str = "") -> str:
         _SOURCES,
         _WIRING,
         kit_note,
+        hardware_note,
         _FORMAT,
         _LANGUAGE.format(lang=_language_name(user)),
         vision_note,
@@ -285,7 +299,6 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
         if reading
         else _vision_note(image_data_url, attempted, payload.current_slide)
     )
-    policy = _policy(current, vision_note=vision_note, kit_note=kits.kit_note(lesson))
 
     if project is not None:
         uploaded = db.get(UploadedFile, project.file_id) if project.file_id else None
@@ -296,6 +309,21 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
         context = lesson_context(lesson)
         title = lesson.title
         label = "LESSON"
+
+    # Resolved after the lesson text and the slide reading, because both are
+    # evidence of which component the question is about - the teacher rarely
+    # names it, but the slide they are looking at does.
+    policy = _policy(
+        current,
+        vision_note=vision_note,
+        kit_note=kits.kit_note(lesson),
+        hardware_note=hardware.hardware_note(
+            lesson,
+            question=payload.message,
+            lesson_text=context,
+            slide_reading=reading or "",
+        ),
+    )
 
     if context:
         system = (

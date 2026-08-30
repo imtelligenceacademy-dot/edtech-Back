@@ -61,9 +61,23 @@ def test_mains_voltage_and_bypassing_protection_are_refused():
 def test_lesson_material_takes_priority_over_general_knowledge():
     text = _policy_text().lower()
     assert "primary source" in text
-    assert "never contradict the lesson material" in text
     # ...while still allowing the model to expand beyond it.
     assert "your own robotics knowledge" in text
+    assert "never invent what a slide shows" in text
+
+
+def test_the_lesson_is_not_the_last_word_on_electrical_facts():
+    """The policy used to say "never contradict the lesson material", full stop.
+
+    That is right about teaching and wrong about electricity, and it is how a
+    slide reading "1 turns the RGB LED on" got repeated to a teacher when the
+    module is common-anode. The lesson still wins on what to teach and in what
+    order; the verified hardware profile wins on what a pin does.
+    """
+    text = _policy_text().lower()
+    assert "on electrical facts it is not" in text
+    assert "follow the profile" in text
+    assert "the slide looks incorrect" in text
 
 
 def test_plain_text_formatting_is_required():
