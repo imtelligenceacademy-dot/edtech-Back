@@ -17,7 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
-from app.database import Base, SessionLocal, engine, ensure_added_columns
+from app.database import SessionLocal
+from app.migrate import run_migrations
 from app.services.backup import email_backup_now
 from app.services.chat_history import purge_expired
 from app.services.bootstrap import ensure_bootstrap_admin
@@ -38,7 +39,8 @@ from app.routers import (
     users,
 )
 
-# Import models so they register on Base.metadata before create_all.
+# Import models so they register on Base.metadata (migrations autogenerate
+# against it, and the ORM needs every mapper configured before first use).
 import app.models  # noqa: F401
 
 logger = logging.getLogger("app")
@@ -88,9 +90,9 @@ def _purge_chat_history() -> int:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings.validate_runtime()
-    # Dev convenience: ensure tables exist. Production should use Alembic migrations.
-    Base.metadata.create_all(bind=engine)
-    ensure_added_columns()
+    # Alembic owns the schema. Handles a fresh database, one built by the old
+    # create_all path, and the normal incremental case — see app/migrate.py.
+    run_migrations()
 
     # Seed the first super-admin on a fresh DB (no-op once one exists).
     with SessionLocal() as db:

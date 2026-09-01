@@ -110,16 +110,21 @@ def _dialect_ddl(ddl: str) -> str:
     return ddl
 
 
-def ensure_added_columns() -> None:
+def ensure_added_columns(target_engine: Engine | None = None) -> None:
     """Add post-v1 columns to existing tables without touching their data.
 
-    Runs on both SQLite (dev) and Postgres (prod) since Alembic isn't set up
-    yet. On a fresh DB `create_all` already includes every column, so the
-    inspector check below makes this a no-op there; on an existing DB it adds
-    only the genuinely missing columns."""
-    inspector = inspect(engine)
+    Runs on both SQLite (dev) and Postgres (prod). Alembic now owns the schema,
+    but this stays for one job: levelling a database built by the old
+    `create_all` path up to the initial migration before it is stamped. See
+    app/migrate.py. New schema changes belong in a migration, not in
+    `_ADDED_COLUMNS`.
+
+    `target_engine` exists so the bootstrap can be exercised against a
+    throwaway database in tests; it defaults to the application engine."""
+    target_engine = target_engine or engine
+    inspector = inspect(target_engine)
     existing_tables = set(inspector.get_table_names())
-    with engine.begin() as conn:
+    with target_engine.begin() as conn:
         for table, columns in _ADDED_COLUMNS.items():
             if table not in existing_tables:
                 continue  # create_all will build it fresh with all columns
