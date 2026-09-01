@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A newer push to the same branch makes the in-flight run irrelevant.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what .python-version pins and what production runs; 3.13 is
+        # what the current dev machines have. A break on either one blocks
+        # somebody, so both are covered.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  postgres:
+    name: Tests on Postgres
+    runs-on: ubuntu-latest
+    # Development runs on SQLite and production runs on Postgres. Everything
+    # that differs between the two — boolean DDL defaults, date handling, how
+    # strictly a query is parsed — is invisible until deploy unless something
+    # runs the suite against the real thing. This is that something.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: imt
+          POSTGRES_PASSWORD: imt
+          POSTGRES_DB: imt_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://imt:imt@localhost:5432/imt_test
+      SECRET_KEY: ci-secret-not-used-outside-ci
+      ENVIRONMENT: development
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Migrations apply and roll back on Postgres
+        # The migration tests run on SQLite, which cannot catch DDL that is
+        # only invalid on Postgres. Applying and reversing the whole chain here
+        # is what proves a deploy will not fail on the schema step.
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Run tests against Postgres
+        env:
+          TEST_DATABASE_URL: postgresql://imt:imt@localhost:5432/imt_test
+        run: pytest -q
