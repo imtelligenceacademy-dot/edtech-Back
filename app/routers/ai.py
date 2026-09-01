@@ -25,10 +25,17 @@ from app.schemas.ai import (
     AIChatRequest,
     AIChatResponse,
     AIHealth,
+    AITeacherUsageReport,
     AIUsageStats,
     VisionProbe,
 )
-from app.services.ai_usage import AILimitExceeded, enforce_ai_limit, record_ai_usage, usage_stats
+from app.services.ai_usage import (
+    AILimitExceeded,
+    enforce_ai_limit,
+    record_ai_usage,
+    teacher_usage_report,
+    usage_stats,
+)
 from app.services.chat_history import save_exchange
 from app.services.lesson_access import is_lesson_available
 from app.services.file_storage import resolve_stored_file
@@ -395,6 +402,20 @@ def usage(
 ) -> AIUsageStats:
     # Super-admins see every school; school-admins only their own (scoped in the service).
     return AIUsageStats(**usage_stats(db, current))
+
+
+@router.get("/usage/teachers", response_model=AITeacherUsageReport)
+def usage_by_teacher(
+    db: Session = Depends(get_db),
+    current: User = Depends(require_roles(Role.super_admin)),
+) -> AITeacherUsageReport:
+    """Every teacher's assistant usage, for the platform owner's usage screen.
+
+    Super-admin only. `/usage` above is the school-scoped rollup a school admin
+    is allowed to see; this one names individual teachers across every school,
+    which is the platform owner's view alone.
+    """
+    return AITeacherUsageReport(**teacher_usage_report(db))
 
 
 # What the teacher is told for each failure kind. Deliberately free of provider

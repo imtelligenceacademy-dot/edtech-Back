@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import Field
@@ -62,3 +63,71 @@ class AIUsageStats(CamelModel):
     last7: int  # interactions in the last 7 days
     prev7: int  # interactions in the 7 days before that
     delta_pct: int | None = None  # week-over-week change, None with no baseline
+
+
+class AIUsageDay(CamelModel):
+    """One calendar day in the report timezone, and what was asked that day."""
+
+    date: str  # YYYY-MM-DD
+    count: int
+
+
+class AITeacherUsage(CamelModel):
+    """One teacher's AI-assistant usage.
+
+    Every field is a count or a timestamp. There is no score and no band: the
+    screen showing this is meant to report what happened, and a teacher who
+    asked three questions is three questions, not "light use".
+    """
+
+    teacher_id: str
+    name: str
+    email: str
+    status: str
+    school_id: str | None = None
+    school_name: str | None = None
+    grades: list[str] = []
+
+    total: int  # all time
+    today: int  # since midnight in the report timezone
+    last_hour: int  # rolling 60 minutes — the hourly quota's own window
+    # Pinned alias: the camelCase generator reads the "h" as a new word after a
+    # digit and emits "last24H", which the frontend does not ask for.
+    last24h: int = Field(alias="last24h")  # rolling 24h — the daily quota's window
+    last7: int
+    prev7: int  # the 7 days before that, for a like-for-like comparison
+    last30: int
+    active_days30: int  # days with at least one question, of the last 30
+
+    first_used_at: datetime | None = None
+    last_used_at: datetime | None = None
+
+    hourly_used: int
+    daily_used: int
+
+    daily: list[AIUsageDay] = []
+
+
+class AITeacherUsageReport(CamelModel):
+    """Per-teacher usage plus the exact boundaries every count was taken from.
+
+    The boundaries are part of the payload so the screen can say "since 2:00 PM"
+    rather than "recently". A window the reader cannot see the edges of is a
+    number they cannot check.
+    """
+
+    generated_at: datetime
+    timezone: str  # IANA name the day buckets were cut in
+
+    today_start: datetime
+    hour_start: datetime
+    day_start: datetime
+    week_start: datetime
+    prev_week_start: datetime
+    window_start: datetime
+    daily_days: int
+
+    hourly_limit: int  # 0 means no limit is enforced
+    daily_limit: int
+
+    teachers: list[AITeacherUsage] = []
