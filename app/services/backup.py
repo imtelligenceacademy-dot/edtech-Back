@@ -482,3 +482,49 @@ def email_backup_now(recipients: list[str], note: str | None = None) -> str:
     filename = backup_filename()
     send_backup_email(recipients, data, filename, note)
     return filename
+
+
+# --- Off-box backups -------------------------------------------------------- #
+# The email covers the database. This covers the part the email cannot: the PDFs
+# themselves, which are too large to attach and are the half that cannot be
+# reconstructed from anything else.
+
+
+def backup_database_to_storage() -> str:
+    """Upload a database snapshot. Returns the key it was written to."""
+    from app.services import object_storage
+
+    data = snapshot_bytes()
+    name = backup_filename()
+    content_type = "application/octet-stream" if IS_SQLITE else "application/json"
+    key = object_storage.upload_bytes("database", name, data, content_type)
+    object_storage.prune("database", settings.backup_storage_keep)
+    return key
+
+
+def backup_files_to_storage() -> tuple[str, int, int]:
+    """Upload the PDF archive. Returns (key, files_included, files_missing).
+
+    The temp zip is removed whether or not the upload worked; a failed backup
+    that fills the disk turns one problem into two.
+    """
+    from app.services import object_storage
+
+    path, included, missing = build_files_archive()
+    try:
+        name = files_archive_filename()
+        key = object_storage.upload_file("files", name, path, "application/zip")
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(path)
+
+    object_storage.prune("files", settings.backup_storage_keep)
+    if missing:
+        # Worth saying out loud: these rows survive a restore and their content
+        # does not, which is the exact failure this backup exists to prevent.
+        logger.warning(
+            "%s file(s) are recorded in the database but missing from disk, so "
+            "they are not in this archive.",
+            len(missing),
+        )
+    return key, included, len(missing)

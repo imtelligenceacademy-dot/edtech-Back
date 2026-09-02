@@ -123,6 +123,30 @@ class Settings(BaseSettings):
     backup_email_to: str = ""
     backup_interval_hours: int = 24
 
+    # --- Off-box backup storage (S3-compatible) --------------------------- #
+    # The emailed snapshot is the database only. The lesson and ICT Fair PDFs
+    # live on the server's disk, and nothing copied them anywhere unless a
+    # super-admin remembered to. Losing that disk would leave a restored
+    # database full of rows pointing at files that no longer exist.
+    #
+    # Written against the S3 API, not a vendor: Cloudflare R2, Backblaze B2, AWS
+    # S3 and MinIO all work, and only the endpoint URL differs. R2 and B2 charge
+    # nothing for egress, which matters on the day you actually restore.
+    backup_storage_enabled: bool = False
+    backup_storage_bucket: str = ""
+    # Leave empty for AWS S3; set it for R2 / B2 / MinIO.
+    backup_storage_endpoint_url: str = ""
+    backup_storage_access_key_id: str = ""
+    backup_storage_secret_access_key: str = ""
+    backup_storage_region: str = "auto"
+    backup_storage_prefix: str = "im-telligence"
+    # The PDFs change rarely and the archive is large, so it is uploaded on its
+    # own slower schedule rather than with every database snapshot.
+    backup_files_interval_hours: int = 168
+    # How many of each kind to keep. 0 keeps everything, which is the safe way
+    # for a misconfiguration to fail when the alternative is deleting backups.
+    backup_storage_keep: int = 14
+
     # --- Admin notifications ---------------------------------------------- #
     # Where teacher lesson-access requests are emailed. If empty, the app falls
     # back to the email addresses of all super-admin accounts.
