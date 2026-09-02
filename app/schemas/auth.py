@@ -27,6 +27,11 @@ class SessionUser(CamelModel):
     role: Role
     school_id: str | None = None
     ict_fair_access: bool = False
+    # The grades this teacher takes. Empty for admins. Carried on the session so
+    # a screen can narrow itself to the teacher's own grades without a second
+    # round trip — and because "the grades I teach" is this field, not whichever
+    # grades happen to have lessons assigned right now.
+    grades: list[str] = []
     access_token: str | None = Field(default=None, serialization_alias="accessToken")
 
 
