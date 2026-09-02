@@ -121,14 +121,25 @@ async def lifespan(app: FastAPI):
                 await backup_task
 
 
+def doc_urls(is_production: bool) -> dict[str, str | None]:
+    """Where the interactive docs and the schema live, or nothing in production.
+
+    All three have to be turned off together. Disabling `docs_url` alone hides
+    the Swagger page while `openapi.json` keeps serving the schema behind it —
+    every route, parameter and field, readable by anyone. That is what was
+    happening: the docs looked hidden and the map was public.
+    """
+    if is_production:
+        return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    return {"docs_url": "/docs", "redoc_url": None, "openapi_url": "/openapi.json"}
+
+
 app = FastAPI(
     title="IM-Telligence API",
     version="0.1.0",
     description="Backend for the IM-Telligence teacher platform.",
     lifespan=lifespan,
-    # Hide schema docs in production.
-    docs_url=None if settings.is_production else "/docs",
-    redoc_url=None,
+    **doc_urls(settings.is_production),
 )
 
 
