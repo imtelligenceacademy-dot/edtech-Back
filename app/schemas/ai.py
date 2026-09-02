@@ -38,6 +38,10 @@ class AIHealth(CamelModel):
     provider: str
     model: str | None = None
     ready: bool  # False when falling back to the no-key mock
+    # The whole chain, primary first, as actually assembled — providers whose
+    # key is missing are already dropped. This is how a deployment is checked:
+    # a fallback you meant to configure and did not simply is not in the list.
+    fallback_chain: list[str] = []
     # The separate model that reads slide images for the answering model.
     vision_enabled: bool = False
     vision_model: str | None = None
@@ -131,3 +135,25 @@ class AITeacherUsageReport(CamelModel):
     daily_limit: int
 
     teachers: list[AITeacherUsage] = []
+
+
+class AIQuota(CamelModel):
+    """What the signed-in user has left, and when the next slot frees up.
+
+    `remaining` is null when no limit is configured (a limit of 0 disables it),
+    which the screen says outright rather than rendering as "0 left".
+    `resetsAt` is null until the window is actually full — below the limit there
+    is nothing to wait for.
+    """
+
+    kind: str  # "teacher" or "admin"
+
+    hourly_limit: int
+    hourly_used: int
+    hourly_remaining: int | None = None
+    hourly_resets_at: datetime | None = None
+
+    daily_limit: int
+    daily_used: int
+    daily_remaining: int | None = None
+    daily_resets_at: datetime | None = None

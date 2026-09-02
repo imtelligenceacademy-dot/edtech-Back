@@ -62,15 +62,22 @@ class Settings(BaseSettings):
     lesson_unlock_wait_days: int = 7
 
     # --- Teacher AI assistant ---------------------------------------------- #
-    # Active provider. Falls back to "mock" automatically if its key is unset.
-    ai_provider: Literal["mock", "groq", "grok", "openai", "anthropic"] = "groq"
+    # The primary provider, and the ones tried in order when it fails. A free or
+    # low tier runs out partway through a school day, and a teacher in front of a
+    # class should get a slightly different answer rather than none.
+    #
+    # Any provider whose key is unset is skipped rather than attempted, so an
+    # unconfigured fallback costs nothing. With no usable key at all the mock
+    # answers, which is what keeps local development working.
+    ai_provider: Literal["mock", "groq", "grok", "openai", "anthropic"] = "openai"
+    ai_fallback_providers: str = "groq,grok,anthropic"
     groq_api_key: str = ""
     xai_api_key: str = ""
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     grok_model: str = "grok-2-latest"
-    openai_model: str = "gpt-5.4-mini"
+    openai_model: str = "gpt-5.6-luna"
     anthropic_model: str = "claude-sonnet-4-6"
     ai_max_context_chars: int = 24000
     ai_timeout_seconds: int = 30

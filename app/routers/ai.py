@@ -25,6 +25,7 @@ from app.schemas.ai import (
     AIChatRequest,
     AIChatResponse,
     AIHealth,
+    AIQuota,
     AITeacherUsageReport,
     AIUsageStats,
     VisionProbe,
@@ -32,6 +33,7 @@ from app.schemas.ai import (
 from app.services.ai_usage import (
     AILimitExceeded,
     enforce_ai_limit,
+    quota_for,
     record_ai_usage,
     teacher_usage_report,
     usage_stats,
@@ -367,10 +369,15 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
 @router.get("/health", response_model=AIHealth)
 def health(_: User = Depends(get_current_user)) -> AIHealth:
     provider = get_provider()
+    chain = getattr(provider, "_providers", None)
     return AIHealth(
         provider=provider.name,
         model=getattr(provider, "model", None),
         ready=provider.name != "mock",
+        fallback_chain=[
+            f"{p.name} ({p.model})" if p.model else p.name
+            for p in (chain if chain else [provider])
+        ],
         vision_enabled=slide_vision.enabled(),
         vision_model=settings.gemini_vision_model if slide_vision.enabled() else None,
     )
@@ -393,6 +400,21 @@ def vision_probe(_: User = Depends(require_roles(Role.super_admin))) -> VisionPr
         message=message if ok else f"{message} | models: {list_message}",
         available=names if listed else [],
     )
+
+
+@router.get("/quota", response_model=AIQuota)
+def my_quota(
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> AIQuota:
+    """The caller's own remaining allowance.
+
+    Deliberately unrestricted by role and scoped to `current` alone: this is
+    somebody asking how much of their own quota is left, which is not a
+    privileged question, and there is no way to ask it about anyone else.
+    """
+    kind = "teacher" if current.role == Role.teacher else "admin"
+    return AIQuota(**quota_for(db, current, kind))
 
 
 @router.get("/usage", response_model=AIUsageStats)

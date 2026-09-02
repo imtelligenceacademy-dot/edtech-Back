@@ -9,12 +9,15 @@ the server — never in the frontend.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from typing import Protocol, TypedDict
 
 import httpx
 
 from app.config import settings
+
+logger = logging.getLogger("app.llm")
 
 
 class ChatMessage(TypedDict):
@@ -283,24 +286,127 @@ class AnthropicProvider:
                         yield text
 
 
-def get_provider() -> LLMProvider:
-    """Resolve the active provider, falling back to mock if its key is missing."""
-    provider = settings.ai_provider
-    if provider == "groq" and settings.groq_api_key:
+# Failures the next provider might survive. A 400 is excluded deliberately: a
+# malformed request fails identically everywhere, so retrying it just spends
+# another provider's quota to get the same answer. `auth` is included because a
+# dead or revoked key must not take the assistant down mid-lesson — it is logged
+# loudly instead, since it is a misconfiguration rather than weather.
+RETRYABLE_KINDS = {"rate_limit", "quota", "timeout", "unavailable", "auth"}
+
+
+class ProviderChain:
+    """Providers in order, each tried when the one before it fails.
+
+    The point is the rate limit. A free or low tier runs out partway through a
+    school day, and a teacher standing in front of a class should get a slightly
+    different answer rather than no answer.
+
+    Streaming commits late: a provider owns the reply only once it has produced
+    its first chunk. Failing before that is invisible and falls through; failing
+    after it cannot be undone, because the teacher is already reading the words.
+    """
+
+    def __init__(self, providers: list[LLMProvider]) -> None:
+        if not providers:
+            raise ValueError("a chain needs at least one provider")
+        self._providers = providers
+        # Reported to the teacher as the source of the answer, so it tracks who
+        # actually replied rather than who was asked first.
+        self.last_used: LLMProvider = providers[0]
+
+    @property
+    def name(self) -> str:
+        return self.last_used.name
+
+    @property
+    def model(self) -> str | None:
+        return self.last_used.model
+
+    @property
+    def supports_vision(self) -> bool:
+        # The primary decides, because the image is attached while the prompt is
+        # built — before anyone knows a fallback will be needed.
+        return getattr(self._providers[0], "supports_vision", False)
+
+    def chat(self, system: str, messages: list[ChatMessage]) -> str:
+        last: LLMError | None = None
+        for provider in self._providers:
+            try:
+                answer = provider.chat(system, messages)
+                self.last_used = provider
+                return answer
+            except LLMError as exc:
+                if exc.kind not in RETRYABLE_KINDS:
+                    raise
+                last = exc
+                _log_fallthrough(provider, exc)
+        raise last if last else LLMError("unavailable", "no provider answered")
+
+    def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+        last: LLMError | None = None
+        for provider in self._providers:
+            try:
+                stream = provider.chat_stream(system, messages)
+                first = next(stream, None)
+            except LLMError as exc:
+                if exc.kind not in RETRYABLE_KINDS:
+                    raise
+                last = exc
+                _log_fallthrough(provider, exc)
+                continue
+
+            # Past this point the teacher is reading it, so it is ours.
+            self.last_used = provider
+            if first is not None:
+                yield first
+            yield from stream
+            return
+        raise last if last else LLMError("unavailable", "no provider answered")
+
+    def chat_stream_vision(
+        self, system: str, messages: list[ChatMessage], image_data_url: str
+    ) -> Iterator[str]:
+        """Only the primary sees images; nothing else in the chain can. When it
+        fails the caller retries through `chat_stream`, which loses the picture
+        but keeps the answer."""
+        primary = self._providers[0]
+        stream = primary.chat_stream_vision(system, messages, image_data_url)
+        first = next(stream, None)
+        self.last_used = primary
+        if first is not None:
+            yield first
+        yield from stream
+
+
+def _log_fallthrough(provider: LLMProvider, exc: LLMError) -> None:
+    logger.warning(
+        "AI provider %s failed (%s) - trying the next in the chain", provider.name, exc.kind
+    )
+    if exc.kind == "auth":
+        logger.error(
+            "AI provider %s rejected its API key. The chain carried on, but this "
+            "is a configuration problem and will not fix itself.",
+            provider.name,
+        )
+
+
+def _build(name: str) -> LLMProvider | None:
+    """One provider by name, or None when its key is not configured."""
+    if name == "groq" and settings.groq_api_key:
         return OpenAICompatProvider(
             name="groq",
             base_url="https://api.groq.com/openai/v1",
             api_key=settings.groq_api_key,
             model=settings.groq_model,
         )
-    if provider == "grok" and settings.xai_api_key:
+    if name == "grok" and settings.xai_api_key:
         return OpenAICompatProvider(
             name="grok",
             base_url="https://api.x.ai/v1",
             api_key=settings.xai_api_key,
             model=settings.grok_model,
         )
-    if provider == "openai" and settings.openai_api_key:
+    if name == "openai" and settings.openai_api_key:
         return OpenAICompatProvider(
             name="openai",
             base_url="https://api.openai.com/v1",
@@ -308,6 +414,37 @@ def get_provider() -> LLMProvider:
             model=settings.openai_model,
             supports_vision=True,
         )
-    if provider == "anthropic" and settings.anthropic_api_key:
+    if name == "anthropic" and settings.anthropic_api_key:
         return AnthropicProvider(api_key=settings.anthropic_api_key, model=settings.anthropic_model)
-    return MockProvider()
+    if name == "mock":
+        return MockProvider()
+    return None
+
+
+def provider_chain_names() -> list[str]:
+    """The primary followed by its fallbacks, de-duplicated, order preserved."""
+    names = [settings.ai_provider]
+    names += [n.strip() for n in settings.ai_fallback_providers.split(",") if n.strip()]
+    seen: set[str] = set()
+    ordered = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            ordered.append(n)
+    return ordered
+
+
+def get_provider() -> LLMProvider:
+    """The active provider chain: the configured primary, then its fallbacks.
+
+    Providers without a key are skipped rather than allowed to fail at request
+    time — an unconfigured fallback is not a fallback. If none of them is usable
+    the mock answers, which is what keeps local development working with no keys
+    at all.
+    """
+    providers = [p for p in (_build(n) for n in provider_chain_names()) if p is not None]
+    if not providers:
+        return MockProvider()
+    if len(providers) == 1:
+        return providers[0]
+    return ProviderChain(providers)

@@ -317,3 +317,62 @@ def _as_utc(value: datetime) -> datetime:
     """SQLite hands back naive datetimes; treat those as the UTC they were
     stored as, so comparisons against timezone-aware bounds don't explode."""
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+# --- What the teacher has left ---------------------------------------------- #
+# The limits were invisible until they bit: a teacher got "you've reached the
+# hourly limit" as their first and only notice, mid-lesson, with a class
+# watching. The numbers were always knowable — this just reports them before
+# they matter rather than after.
+
+
+def quota_for(db: Session, user: User, kind: str = "teacher") -> dict:
+    """One user's own remaining allowance, with the moment each window frees up.
+
+    Both windows are rolling, so nothing "resets at midnight": the next slot
+    opens when the oldest request still inside the window ages out of it. That
+    timestamp is what a teacher can actually plan around, so it is computed
+    here rather than left as "try again later".
+    """
+    if kind == "teacher":
+        hourly_limit = settings.ai_teacher_hourly_limit
+        daily_limit = settings.ai_teacher_daily_limit
+    else:
+        hourly_limit = settings.ai_admin_hourly_limit
+        daily_limit = settings.ai_admin_daily_limit
+
+    now = datetime.now(timezone.utc)
+    hour_start = now - timedelta(hours=1)
+    day_start = now - timedelta(days=1)
+
+    # One pass over the last 24 hours covers both windows.
+    stamps = sorted(
+        _as_utc(s)
+        for s in db.scalars(
+            select(AiUsage.created_at).where(
+                AiUsage.user_id == user.id,
+                AiUsage.kind == kind,
+                AiUsage.created_at >= day_start,
+            )
+        )
+    )
+    in_hour = [s for s in stamps if s >= hour_start]
+
+    def frees_at(window: list[datetime], limit: int, span: timedelta) -> datetime | None:
+        # Only meaningful once the window is actually full; below the limit
+        # there is nothing to wait for.
+        if limit <= 0 or len(window) < limit or not window:
+            return None
+        return window[0] + span
+
+    return {
+        "kind": kind,
+        "hourly_limit": hourly_limit,
+        "hourly_used": len(in_hour),
+        "hourly_remaining": max(0, hourly_limit - len(in_hour)) if hourly_limit > 0 else None,
+        "hourly_resets_at": frees_at(in_hour, hourly_limit, timedelta(hours=1)),
+        "daily_limit": daily_limit,
+        "daily_used": len(stamps),
+        "daily_remaining": max(0, daily_limit - len(stamps)) if daily_limit > 0 else None,
+        "daily_resets_at": frees_at(stamps, daily_limit, timedelta(days=1)),
+    }
