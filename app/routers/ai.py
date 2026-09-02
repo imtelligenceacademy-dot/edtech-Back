@@ -5,6 +5,9 @@ ground on lessons actually assigned to them.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from functools import partial
+
 import json
 import logging
 from dataclasses import dataclass
@@ -16,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import settings
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.deps import get_current_user, require_capability, require_roles
 from app.models import FairProject, Lesson, LessonAssignment, UploadedFile, User
 from app.models.enums import Role
@@ -99,11 +102,24 @@ _WIRING = """WIRING AND HARDWARE ANSWERS must include:
 
 SAFETY - never give instructions involving mains or wall voltage, high-current batteries, rewiring household power, or bypassing or disabling any protection such as a fuse, resistor or driver board. Refuse those and redirect to safe low-voltage classroom equipment."""
 
-_FORMAT = """FORMAT - reply in plain text a teacher can read at a glance:
+# Length is a teaching constraint before it is a cost one. The teacher is at the
+# front of a room with a class waiting; they read the first line and act. An
+# answer that buries the useful sentence under a preamble has failed even when
+# every word in it is correct.
+#
+# The exemption matters as much as the limit. Wiring steps, safety warnings and
+# code ARE the answer - trimming those to hit a word count would make the
+# assistant shorter and worse, and in the wiring case unsafe. The prose around
+# them is what gets cut.
+_FORMAT = """FORMAT - plain text a teacher can read at a glance, mid-lesson, with a class waiting:
+- ANSWER FIRST. The opening sentence answers the question. Background, context and caveats come after it, if at all.
+- LENGTH - aim for under 120 words. Most questions need two or three short sentences. Stop when the question is answered.
+- Cut throat-clearing: no "Great question", no restating the question back, no closing offer of further help.
+- NEVER shorten these to hit the limit, because they are the answer rather than padding: the numbered steps of a wiring procedure, any safety warning, the "check before powering on" step, and code the teacher has to type. Cut the prose around them instead.
+- When a full answer genuinely needs more room, give the short answer first, then one line offering the rest - for example "Want the full step-by-step?"
 - No Markdown tables, no Markdown headings, and never put ** or __ around words. Those markers are shown literally to the teacher and look broken.
 - Use short paragraphs, or simple numbered steps for procedures.
-- Use a fenced code block ONLY when actually showing code.
-- Be concise and classroom-friendly."""
+- Use a fenced code block ONLY when actually showing code."""
 
 _LANGUAGE = """LANGUAGE - always reply in the same language the teacher wrote their question in. If that is unclear, use {lang}. Keep technical component names (micro:bit, GPIO, servo) in their usual form."""
 
@@ -200,6 +216,10 @@ class PromptBundle:
     source_ref: str | None
     image_data_url: str | None = None
     grounded: bool = False
+    # Rebuilds the prompt for a model that cannot see, routing the slide through
+    # the Gemini reader instead of attaching it. Set only when an image was
+    # attached; called only if that provider drops out.
+    text_fallback: Callable[[], str] | None = None
 
 
 def _uploaded_for(
@@ -292,6 +312,46 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
         db, lesson=lesson, project=project, current_slide=payload.current_slide
     )
 
+    system, source_ref = _assemble_system(
+        db, current, payload, lesson, project, image_data_url, attempted
+    )
+
+    return PromptBundle(
+        system=system,
+        messages=messages,
+        source_ref=source_ref,
+        image_data_url=image_data_url,
+        grounded=True,
+        # Only meaningful when an image was attached: the same prompt rebuilt for
+        # a model that cannot see, which routes the slide through the Gemini
+        # reader instead. Deferred because it costs a reading, and most questions
+        # never need it.
+        text_fallback=(
+            partial(_rebuild_without_image, current.id, payload)
+            if image_data_url is not None
+            else None
+        ),
+    )
+
+
+def _assemble_system(
+    db: Session,
+    current: User,
+    payload: AIChatRequest,
+    lesson: Lesson | None,
+    project: FairProject | None,
+    image_data_url: str | None,
+    attempted: bool,
+) -> tuple[str, str | None]:
+    """Build the system prompt for one question, and the source line shown with
+    the answer.
+
+    Called twice when the primary can see: once with the image, and again
+    without it if that provider drops out. The second pass is not a degraded
+    copy of the first — with no image, the Gemini reader transcribes the slide
+    and the hardware retrieval runs again over that text, so the answering model
+    still knows what is on the slide even though it cannot look at it.
+    """
     # When the answering model cannot see, a vision model reads the slide and
     # the answering model works from that text instead. Only for the tracks
     # where the code is a picture; elsewhere the PDF text layer already has it.
@@ -357,13 +417,32 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
     if (image_data_url is not None or reading) and payload.current_slide is not None:
         source_ref = f"{title} - slide {payload.current_slide}"
 
-    return PromptBundle(
-        system=system,
-        messages=messages,
-        source_ref=source_ref,
-        image_data_url=image_data_url,
-        grounded=True,
-    )
+    return system, source_ref
+
+
+def _rebuild_without_image(user_id: str, payload: AIChatRequest) -> str:
+    """The system prompt for a model that cannot see the slide.
+
+    Runs on its own session: the original one closed when the request returned,
+    and this is only reached from inside the streaming generator.
+    """
+    with SessionLocal() as db:
+        current = db.get(User, user_id)
+        if current is None:
+            raise LookupError("user vanished mid-stream")
+        lesson = (
+            _accessible_lesson(db, current, payload.lesson_id) if payload.lesson_id else None
+        )
+        project = (
+            _accessible_fair_project(db, current, payload.fair_project_id)
+            if payload.fair_project_id
+            else None
+        )
+        # `attempted=True`: an image really was rendered and really was not
+        # usable, so if the reader also comes back empty the model is told the
+        # visual check failed rather than that there was never one to do.
+        system, _ = _assemble_system(db, current, payload, lesson, project, None, True)
+        return system
 
 
 @router.get("/health", response_model=AIHealth)
@@ -458,19 +537,50 @@ def _error_text(exc: Exception) -> str:
 
 def _stream_answer(bundle: PromptBundle):
     """Yield deltas from the provider, using the vision path when a slide image
-    was rendered and the provider supports it."""
+    was rendered and the provider supports it.
+
+    When the seeing provider drops out — a rate limit, usually — the slide does
+    not stop mattering. The prompt is rebuilt without the image, which routes
+    the slide through the Gemini reader instead, and a provider that cannot see
+    answers from that transcription. The teacher loses the model's own eyes, not
+    the contents of the slide.
+    """
     provider = get_provider()
     if bundle.image_data_url is not None and getattr(provider, "supports_vision", False):
+        emitted = False
         try:
-            yield from provider.chat_stream_vision(
+            for chunk in provider.chat_stream_vision(
                 bundle.system, bundle.messages, bundle.image_data_url
-            )
+            ):
+                emitted = True
+                yield chunk
             return
         except LLMError as exc:
-            # Vision failed after the prompt was built - fall back to text so the
-            # teacher still gets an answer.
-            logger.warning("vision stream failed (%s), falling back to text", exc.kind)
+            if emitted:
+                # Half an answer is already on the teacher's screen. Starting a
+                # second one would splice two different replies together.
+                raise
+            logger.warning(
+                "vision stream failed (%s) - rebuilding without the image", exc.kind
+            )
+
+        yield from provider.chat_stream(_without_image(bundle), bundle.messages)
+        return
+
     yield from provider.chat_stream(bundle.system, bundle.messages)
+
+
+def _without_image(bundle: PromptBundle) -> str:
+    """The prompt again, for a model that cannot see. Falls back to the original
+    if the rebuild fails — a prompt that overstates what the model can see is
+    still better than no answer at all."""
+    if bundle.text_fallback is None:
+        return bundle.system
+    try:
+        return bundle.text_fallback()
+    except Exception:
+        logger.exception("could not rebuild the prompt without the slide image")
+        return bundle.system
 
 
 @router.post("/chat", response_model=AIChatResponse)
@@ -487,7 +597,12 @@ def chat(
     record_ai_usage(db, current, "teacher")
     provider = get_provider()
     try:
-        content = provider.chat(bundle.system, bundle.messages)
+        # This endpoint never attaches the image — `chat()` has no vision path —
+        # so it must not use a prompt that says one is attached. Rebuilding
+        # routes the slide through the Gemini reader instead, which is the same
+        # thing the streaming path does when its seeing provider drops out.
+        system = _without_image(bundle) if bundle.image_data_url else bundle.system
+        content = provider.chat(system, bundle.messages)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
