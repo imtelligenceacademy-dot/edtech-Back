@@ -510,7 +510,8 @@ def backup_files_to_storage() -> tuple[str, int, int]:
     """
     from app.services import object_storage
 
-    path, included, missing = build_files_archive()
+    # `build_files_archive` returns the missing files as a COUNT, not a list.
+    path, included, missing_count = build_files_archive()
     try:
         name = files_archive_filename()
         key = object_storage.upload_file("files", name, path, "application/zip")
@@ -519,12 +520,12 @@ def backup_files_to_storage() -> tuple[str, int, int]:
             os.remove(path)
 
     object_storage.prune("files", settings.backup_storage_keep)
-    if missing:
+    if missing_count:
         # Worth saying out loud: these rows survive a restore and their content
         # does not, which is the exact failure this backup exists to prevent.
         logger.warning(
             "%s file(s) are recorded in the database but missing from disk, so "
             "they are not in this archive.",
-            len(missing),
+            missing_count,
         )
-    return key, included, len(missing)
+    return key, included, missing_count
