@@ -207,7 +207,9 @@ def test_archive_includes_only_the_selected_files(db):
         assert (included, missing) == (1, 0)
         with zipfile.ZipFile(path) as zf:
             names = [n for n in zf.namelist() if n != "manifest.json"]
-        assert names == [f"year-2/grade-8/{wanted[0].filename}"]
+        # Language is part of the path, and the grade is zero-padded so a file
+        # browser sorts grade-08 before grade-10.
+        assert names == [f"year-2/english/grade-08/{wanted[0].filename}"]
         assert all(unwanted[0].filename not in n for n in names)
     finally:
         import os

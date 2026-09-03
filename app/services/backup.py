@@ -176,6 +176,25 @@ def _slugify(label: str) -> str:
     return "-".join(part for part in out.split("-") if part)[:60]
 
 
+LANGUAGE_FOLDERS = {"en": "english", "fr": "french"}
+
+
+def _lesson_folder(lesson) -> str:
+    """Where a lesson's PDF sits inside the archive.
+
+    Language is part of the path because the same lesson exists twice in a
+    bilingual curriculum, under the same filename. Without it the two collided
+    and one was renamed to `file_<id>_<name>`, which reads as a corrupted
+    duplicate rather than as the French copy of the English one next to it.
+
+    The grade is zero-padded so a file browser sorts grade-02 before grade-10
+    rather than after it.
+    """
+    language = LANGUAGE_FOLDERS.get((lesson.language or "").lower(), "language-not-set")
+    grade = f"{lesson.grade:02d}" if isinstance(lesson.grade, int) else str(lesson.grade)
+    return f"year-{lesson.year}/{language}/grade-{grade}"
+
+
 def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, int, int]:
     """Zip stored PDFs plus a manifest.json describing them.
 
@@ -219,7 +238,7 @@ def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, i
                 if up.id in fair_file_ids:
                     folder = "ict-fair"
                 elif lesson is not None:
-                    folder = f"year-{lesson.year}/grade-{lesson.grade}"
+                    folder = _lesson_folder(lesson)
                 else:
                     folder = "unsorted"
                 arcname = f"{folder}/{up.filename}"
@@ -231,6 +250,15 @@ def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, i
                     "storage_path": up.storage_path,
                     "linked_lesson_id": up.linked_lesson_id,
                     "lesson_title": lesson.title if lesson else None,
+                    # Year and language come from the toggles set at upload
+                    # time, not from the filename, so a mis-set toggle files a
+                    # lesson under the wrong year with nothing to show for it.
+                    # Recording them here makes the manifest the place to audit
+                    # that, rather than clicking through the Files page.
+                    "year": lesson.year if lesson else None,
+                    "grade": lesson.grade if lesson else None,
+                    "language": lesson.language if lesson else None,
+                    "course": lesson.course if lesson else None,
                     "is_fair_project": up.id in fair_file_ids,
                 }
 
@@ -239,7 +267,10 @@ def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, i
                     entry["status"] = "MISSING_ON_DISK"
                     missing.append(entry)
                 else:
-                    # Same filename twice in a folder would silently collide.
+                    # A last resort. Language used to be missing from the path,
+                    # so every bilingual pair collided here and one of the two
+                    # ended up prefixed with its file id — unreadable, and it
+                    # looked like a duplicate rather than the French copy.
                     if arcname in zf.namelist():
                         arcname = f"{folder}/{up.id}_{up.filename}"
                         entry["archive_path"] = arcname
