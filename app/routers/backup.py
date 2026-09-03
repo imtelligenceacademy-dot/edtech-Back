@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import io
 import os
-from datetime import datetime
 from pathlib import PurePath
 from urllib.parse import quote
 
@@ -14,16 +13,12 @@ from pydantic import EmailStr, Field
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
-from app.config import settings
 from app.database import get_db
 from app.deps import require_roles
 from app.models import User
 from app.models.enums import Role
 from app.schemas.base import CamelModel
-from app.services import object_storage
 from app.services.backup import (
-    backup_database_to_storage,
-    backup_files_to_storage,
     EmailNotConfigured,
     EmailDeliveryFailed,
     InvalidBackup,
@@ -172,115 +167,5 @@ async def restore_db(
         message=(
             f"Database restored from backup ({len(restored)} tables). "
             "You may need to sign in again with an account from the restored backup."
-        )
-    )
-
-
-# --- Off-box backups -------------------------------------------------------- #
-
-
-class StoredBackup(CamelModel):
-    key: str
-    size_bytes: int
-    stored_at: datetime
-
-
-class StorageStatus(CamelModel):
-    """Whether off-box backups are configured, and what is actually up there.
-
-    The listing is the point. "Backups are enabled" is a claim about config; a
-    list of objects with sizes and dates is evidence, and it is the only way to
-    notice that the scheduler has been silently failing for a month.
-    """
-
-    enabled: bool
-    bucket: str | None = None
-    endpoint: str | None = None
-    prefix: str | None = None
-    database_interval_hours: int
-    files_interval_hours: int
-    keep: int
-    database_backups: list[StoredBackup] = []
-    file_backups: list[StoredBackup] = []
-    error: str | None = None
-
-
-@router.get("/storage", response_model=StorageStatus)
-def storage_status(
-    _: User = Depends(require_roles(Role.super_admin)),
-) -> StorageStatus:
-    base = StorageStatus(
-        enabled=object_storage.enabled(),
-        bucket=settings.backup_storage_bucket or None,
-        endpoint=settings.backup_storage_endpoint_url or None,
-        prefix=settings.backup_storage_prefix or None,
-        database_interval_hours=settings.backup_interval_hours,
-        files_interval_hours=settings.backup_files_interval_hours,
-        keep=settings.backup_storage_keep,
-    )
-    if not base.enabled:
-        return base
-
-    def rows(kind: str) -> list[StoredBackup]:
-        return [
-            StoredBackup(key=o.key, size_bytes=o.size, stored_at=o.modified)
-            for o in object_storage.list_backups(kind)
-        ]
-
-    try:
-        base.database_backups = rows("database")
-        base.file_backups = rows("files")
-    except Exception as exc:
-        # Reported rather than raised: a screen that says why it cannot reach
-        # the bucket is more useful than a 500 with the reason in a log.
-        base.error = str(exc)
-    return base
-
-
-@router.post("/storage/run", response_model=MessageResponse)
-def run_storage_backup(
-    include_files: bool = True,
-    _: User = Depends(require_roles(Role.super_admin)),
-) -> MessageResponse:
-    """Back up now, rather than waiting for the schedule.
-
-    Exists so the configuration can be proved rather than assumed. A backup you
-    have never seen succeed is not a backup, and the alternative is finding out
-    on the day you need it.
-    """
-    if not object_storage.enabled():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Off-box backup storage is not configured. Set BACKUP_STORAGE_ENABLED, "
-                "BACKUP_STORAGE_BUCKET, BACKUP_STORAGE_ACCESS_KEY_ID and "
-                "BACKUP_STORAGE_SECRET_ACCESS_KEY."
-            ),
-        )
-
-    try:
-        db_key = backup_database_to_storage()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Database backup failed: {exc}",
-        ) from exc
-
-    if not include_files:
-        return MessageResponse(message=f"Database backed up to {db_key}.")
-
-    try:
-        files_key, included, missing = backup_files_to_storage()
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Database backed up to {db_key}, but the file archive failed: {exc}",
-        ) from exc
-
-    tail = f" {missing} file(s) are recorded but missing on disk." if missing else ""
-    return MessageResponse(
-        message=(
-            f"Database backed up to {db_key}. "
-            f"{included} PDF(s) archived to {files_key}.{tail}"
         )
     )

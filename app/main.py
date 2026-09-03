@@ -19,12 +19,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.config import settings
 from app.database import SessionLocal
 from app.migrate import run_migrations
-from app.services.backup import (
-    backup_database_to_storage,
-    backup_files_to_storage,
-    email_backup_now,
-)
-from app.services import object_storage
+from app.services.backup import email_backup_now
 from app.services.chat_history import purge_expired
 from app.services.bootstrap import ensure_bootstrap_admin
 from app.routers import (
@@ -67,45 +62,6 @@ async def _daily_backup_loop() -> None:
             logger.exception("Daily backup email failed")
 
 
-async def _storage_backup_loop() -> None:
-    """Copy the database, and separately the PDFs, off the box.
-
-    Two intervals rather than one. The database changes every lesson a teacher
-    finishes; the PDFs change when somebody uploads a curriculum, which is rare
-    and produces a large archive. Uploading the whole content library nightly
-    would be spend with nothing to show for it.
-
-    A failure here is logged and the loop continues: a storage outage must not
-    stop the scheduler, and certainly must not take the API with it.
-    """
-    db_interval = max(1, settings.backup_interval_hours) * 3600
-    files_interval = max(1, settings.backup_files_interval_hours) * 3600
-    since_files = 0.0
-
-    while True:
-        await asyncio.sleep(db_interval)
-        since_files += db_interval
-
-        try:
-            key = await asyncio.to_thread(backup_database_to_storage)
-            logger.info("Database backup stored: %s", key)
-        except Exception:
-            logger.exception("Database backup to object storage failed")
-
-        if since_files >= files_interval:
-            since_files = 0.0
-            try:
-                key, included, missing = await asyncio.to_thread(backup_files_to_storage)
-                logger.info(
-                    "File archive stored: %s (%s files, %s missing on disk)",
-                    key,
-                    included,
-                    missing,
-                )
-            except Exception:
-                logger.exception("File archive backup to object storage failed")
-
-
 async def _chat_retention_loop() -> None:
     """Drop teacher conversations past the retention window, once a day.
 
@@ -144,17 +100,6 @@ async def lifespan(app: FastAPI):
 
     retention_task = asyncio.create_task(_chat_retention_loop())
 
-    storage_task: asyncio.Task | None = None
-    if object_storage.enabled():
-        storage_task = asyncio.create_task(_storage_backup_loop())
-        logger.info(
-            "Off-box backup scheduler started: database every %sh, PDFs every %sh, "
-            "keeping %s of each",
-            settings.backup_interval_hours,
-            settings.backup_files_interval_hours,
-            settings.backup_storage_keep or "all",
-        )
-
     backup_task: asyncio.Task | None = None
     if settings.backup_email_enabled and settings.backup_email_to:
         backup_task = asyncio.create_task(_daily_backup_loop())
@@ -170,11 +115,10 @@ async def lifespan(app: FastAPI):
         retention_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await retention_task
-        for task in (backup_task, storage_task):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        if backup_task is not None:
+            backup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await backup_task
 
 
 def doc_urls(is_production: bool) -> dict[str, str | None]:

@@ -23,9 +23,6 @@ python-multipart==0.0.20     # form parsing (login)
 httpx==0.28.1                # calling LLM provider HTTP APIs
 pypdf==5.1.0                 # extracting lesson PDF text for grounding
 
-# Off-box backup storage (S3-compatible: R2, B2, S3, MinIO)
-boto3==1.35.92
-
 # Reports
 python-docx==1.1.2           # generating Word (.docx) reports
 
@@ -34,4 +31,3 @@ pymupdf==1.25.1              # renders one PDF page to an image (no system deps)
 
 # Tests
 pytest==8.3.4
-moto[s3]==5.0.28          # a real S3 implementation, so backup tests are not just fakes
