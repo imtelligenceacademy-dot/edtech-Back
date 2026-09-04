@@ -19,7 +19,15 @@ import pytest
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import select
 
-from app.models import AccessRequest, Lesson, LessonAssignment, Progress, School, User
+from app.models import (
+    AccessRequest,
+    ChatMessage,
+    Lesson,
+    LessonAssignment,
+    Progress,
+    School,
+    User,
+)
 from app.models.enums import LessonStatus, Role, UserStatus
 from app.routers import access_requests as ar_router
 from app.routers import lessons as lessons_router
@@ -27,11 +35,13 @@ from app.routers import progress as progress_router
 from app.routers import users as users_router
 from app.schemas.access_request import AccessRequestCreate
 from app.schemas.progress import ProgressUpdate
-from app.schemas.user import UserUpdate
+from app.schemas.user import SectionRename, UserUpdate
 from app.services.lesson_access import compute_access, is_lesson_available
 from app.services.sections import (
+    find_progress,
     ensure_progress_for_lessons,
     normalize_sections,
+    rename_section,
     sections_for,
     sync_progress_sections,
 )
@@ -92,6 +102,11 @@ def world(db):
     ensure_progress_for_lessons(db, teacher, lessons)
     db.commit()
     return {"school": school, "teacher": teacher, "lessons": lessons}
+
+
+def _all(db, model, teacher):
+    """Every row of one model belonging to this teacher."""
+    return list(db.scalars(select(model).where(model.teacher_id == teacher.id)))
 
 
 def _rows(db, teacher):
@@ -467,3 +482,172 @@ def test_asking_for_a_class_that_is_not_theirs_falls_back_to_their_first(db, wor
 
     rows = {l.id: l for l in lessons_router.list_lessons("Z", db, teacher)}
     assert rows[l1.id].access_status == "completed"  # 6A, their first class
+
+
+# --------------------------------------------------------------------------- #
+# Renaming a class
+# --------------------------------------------------------------------------- #
+# A class is identified by the label an admin typed, so correcting that label
+# has to carry everything recorded under it. Otherwise the history is not
+# deleted but is unreachable, which is worse: it looks like data loss and
+# cannot be explained.
+def _chat(db, teacher, lesson, section, text):
+    db.add(
+        ChatMessage(
+            id=new_id("msg"),
+            teacher_id=teacher.id,
+            lesson_id=lesson.id,
+            section=section,
+            role="user",
+            content=text,
+        )
+    )
+    db.flush()
+
+
+def _request(db, teacher, lesson, section):
+    req = AccessRequest(
+        id=new_id("req"),
+        teacher_id=teacher.id,
+        lesson_id=lesson.id,
+        section=section,
+        status="pending",
+    )
+    db.add(req)
+    db.flush()
+    return req
+
+
+def test_renaming_a_class_carries_all_of_its_history(db, world):
+    teacher, (l1, l2, _) = world["teacher"], world["lessons"]
+    _complete(db, teacher, l1, "A")
+    _chat(db, teacher, l1, "A", "asked in 6A")
+    _request(db, teacher, l2, "A")
+
+    before = [p.section for p in _rows(db, teacher)].count("A")
+
+    moved = rename_section(db, teacher, 6, "A", "Red")
+    db.commit()
+
+    # Progress, conversation and the pending request all move together: every
+    # row the class had, and nothing left behind under the old name.
+    assert moved == before + 2  # + the message and the access request
+    assert [p.section for p in _rows(db, teacher)].count("A") == 0
+    assert [p.section for p in _rows(db, teacher)].count("Red") == before
+    assert find_progress(db, teacher.id, l1.id, "Red").status == LessonStatus.completed
+    assert find_progress(db, teacher.id, l1.id, "A") is None
+    assert [m.section for m in _all(db, ChatMessage, teacher)] == ["Red"]
+    assert [r.section for r in _all(db, AccessRequest, teacher)] == ["Red"]
+
+
+def test_renaming_one_class_leaves_the_others_untouched(db, world):
+    teacher, (l1, _, _) = world["teacher"], world["lessons"]
+    _complete(db, teacher, l1, "A")
+    _chat(db, teacher, l1, "A", "asked in 6A")
+    _chat(db, teacher, l1, "B", "asked in 6B")
+
+    rename_section(db, teacher, 6, "A", "Red")
+    db.commit()
+
+    by_section = {m.section: m.content for m in _all(db, ChatMessage, teacher)}
+    assert by_section == {"Red": "asked in 6A", "B": "asked in 6B"}
+    assert find_progress(db, teacher.id, l1.id, "B") is not None
+
+
+def test_renaming_is_scoped_to_one_grade(db):
+    """Two grades can both have a class called "A". They are different rooms."""
+    school = School(id=new_id("sch"), name="S10", program_year=2)
+    db.add(school)
+    db.flush()
+    teacher = _teacher(db, school, ["G5", "G6"], {"G5": ["A", "B"], "G6": ["A", "B"]})
+    five = _lessons(db, teacher, 5, 1)
+    six = _lessons(db, teacher, 6, 1)
+    ensure_progress_for_lessons(db, teacher, five + six)
+    _complete(db, teacher, five[0], "A")
+    _complete(db, teacher, six[0], "A")
+
+    rename_section(db, teacher, 6, "A", "Red")
+    db.commit()
+
+    # Grade 6's A became Red; Grade 5's A is a different class and stayed.
+    assert find_progress(db, teacher.id, six[0].id, "Red") is not None
+    assert find_progress(db, teacher.id, five[0].id, "A") is not None
+    assert find_progress(db, teacher.id, five[0].id, "Red") is None
+
+
+def test_a_rename_never_merges_two_classes(db, world):
+    """If the new label already has this lesson, the old row stays put rather
+    than colliding with it or folding two rooms' histories into one."""
+    teacher, (l1, _, _) = world["teacher"], world["lessons"]
+    _complete(db, teacher, l1, "A")
+
+    rename_section(db, teacher, 6, "A", "B")
+    db.commit()
+
+    # B already had a row for this lesson, so A's is left where it is.
+    assert find_progress(db, teacher.id, l1.id, "A") is not None
+    assert find_progress(db, teacher.id, l1.id, "B").status != LessonStatus.completed
+
+
+def test_editing_an_account_applies_a_rename(db):
+    school = School(id=new_id("sch"), name="S11", program_year=2)
+    db.add(school)
+    db.flush()
+    admin = User(
+        id=new_id("u"), name="A", email=f"{new_id('a')}@x.com", password_hash="x",
+        role=Role.super_admin, status=UserStatus.active,
+    )
+    db.add(admin)
+    teacher = _teacher(db, school, ["G6"], {"G6": ["A", "B"]})
+    lessons = _lessons(db, teacher, 6, 1)
+    ensure_progress_for_lessons(db, teacher, lessons)
+    _complete(db, teacher, lessons[0], "A")
+
+    users_router.update_user(
+        teacher.id,
+        UserUpdate(
+            sections={"G6": ["Red", "B"]},
+            section_renames=[
+                SectionRename(grade="G6", from_section="A", to_section="Red")
+            ],
+        ),
+        db,
+        admin,
+    )
+    db.refresh(teacher)
+
+    assert teacher.sections == {"G6": ["Red", "B"]}
+    # The completed lesson followed the new name rather than being adopted into
+    # it by the "first class" rule, which would have been luck rather than intent.
+    assert find_progress(db, teacher.id, lessons[0].id, "Red").status == (
+        LessonStatus.completed
+    )
+
+
+def test_a_rename_that_does_not_match_the_edit_is_refused(db):
+    """The form and the server disagreeing means guessing where a class's
+    history should go, and guessing wrong is unrecoverable."""
+    school = School(id=new_id("sch"), name="S12", program_year=2)
+    db.add(school)
+    db.flush()
+    admin = User(
+        id=new_id("u"), name="A", email=f"{new_id('a')}@x.com", password_hash="x",
+        role=Role.super_admin, status=UserStatus.active,
+    )
+    db.add(admin)
+    teacher = _teacher(db, school, ["G6"], {"G6": ["A", "B"]})
+    db.commit()
+
+    with pytest.raises(HTTPException) as raised:
+        users_router.update_user(
+            teacher.id,
+            UserUpdate(
+                sections={"G6": ["A", "B"]},  # nothing actually renamed
+                section_renames=[
+                    SectionRename(grade="G6", from_section="A", to_section="Red")
+                ],
+            ),
+            db,
+            admin,
+        )
+    assert raised.value.status_code == 400

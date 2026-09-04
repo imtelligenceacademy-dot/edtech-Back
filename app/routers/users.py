@@ -25,7 +25,11 @@ from app.schemas.user import (
 )
 from app.security import hash_password
 from app.services.auto_assign import prune_teacher_assignments, sync_teacher_assignments
-from app.services.sections import normalize_sections, sync_progress_sections
+from app.services.sections import (
+    normalize_sections,
+    rename_section,
+    sync_progress_sections,
+)
 from app.utils import client_ip, new_id, user_agent
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -162,6 +166,54 @@ def _apply_teacher_fields(
     user.sections = normalize_sections(incoming, user.grades)
 
 
+def _apply_section_renames(
+    db: Session, user: User, payload: UserUpdate, before: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Move each renamed class's history onto its new label.
+
+    Returns the "before" picture rewritten as though the classes had always been
+    called their new names. That is what the adopt step below is then comparing
+    against: without it, renaming the first class of a grade would look like the
+    old one vanishing and a new one appearing, and a term of work would be
+    adopted somewhere it does not belong.
+    """
+    if not payload.section_renames:
+        return before
+
+    after = user.sections or {}
+    rewritten = {token: list(labels) for token, labels in before.items()}
+
+    for rename in payload.section_renames:
+        final = after.get(rename.grade, [])
+        # The rename has to describe the edit that was actually made: the old
+        # name gone, the new one present. Anything else means the form and the
+        # server disagree about what happened, and guessing would move a class's
+        # history somewhere nobody asked for.
+        if rename.from_section == rename.to_section:
+            continue
+        if rename.to_section not in final or rename.from_section in final:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"Can't rename class {rename.from_section} to "
+                    f"{rename.to_section}: that isn't how the classes ended up."
+                ),
+            )
+        if rename.from_section not in rewritten.get(rename.grade, []):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"This teacher has no class {rename.from_section} to rename.",
+            )
+
+        rename_section(db, user, rename.grade, rename.from_section, rename.to_section)
+        rewritten[rename.grade] = [
+            rename.to_section if label == rename.from_section else label
+            for label in rewritten[rename.grade]
+        ]
+
+    return rewritten
+
+
 @router.patch("/{user_id}", response_model=UserOut)
 def update_user(
     user_id: str,
@@ -189,6 +241,9 @@ def update_user(
     # add newly-matching lessons, and strip untouched ones that no longer match.
     if user.role == Role.teacher:
         db.flush()
+        # A renamed class keeps everything recorded under its old name, and the
+        # comparison below is then made against the new names.
+        sections_before = _apply_section_renames(db, user, payload, sections_before)
         # Re-key existing progress onto the new class names first, so the rows
         # created below fill in only the classes that genuinely have none.
         sync_progress_sections(db, user, sections_before, user.sections or {})

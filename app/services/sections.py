@@ -22,7 +22,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Lesson, Progress, User
+from app.models import AccessRequest, ChatMessage, Lesson, Progress, User
 from app.models.enums import LessonStatus, Role, WatchdogStatus
 from app.utils import new_id
 
@@ -180,6 +180,67 @@ def ensure_progress_rows(
 ) -> int:
     """Create the missing progress rows for one teacher and one lesson."""
     return ensure_progress_for_lessons(db, teacher, [lesson], message)
+
+
+# Everything a class's history lives in. A class is a label, so renaming one
+# means re-keying every table that records what happened in that room. Listing
+# them here rather than at the call site is what stops the next table being
+# added and quietly forgotten.
+SECTION_KEYED_MODELS = (Progress, ChatMessage, AccessRequest)
+
+
+def rename_section(
+    db: Session, teacher: User, grade: int | str, old: str, new: str
+) -> int:
+    """Move one class's history from one label onto another.
+
+    A class is identified by the label a super-admin typed, so correcting that
+    label would otherwise strand everything recorded under it — the class's
+    progress, its conversations with the assistant, and any access request it
+    was waiting on. None of it is deleted, but none of it is reachable either,
+    because nothing is keyed to the old name any more.
+
+    Scoped to one grade: two grades may both have a class called "A", and they
+    are different rooms.
+
+    Returns the number of rows moved.
+    """
+    if old == new or not old and not new:
+        return 0
+
+    grade_int = grade if isinstance(grade, int) else int(str(grade).lstrip("G") or 0)
+    lesson_ids = select(Lesson.id).where(Lesson.grade == grade_int)
+
+    moved = 0
+    for model in SECTION_KEYED_MODELS:
+        rows = list(
+            db.scalars(
+                select(model).where(
+                    model.teacher_id == teacher.id,
+                    model.section == old,
+                    model.lesson_id.in_(lesson_ids),
+                )
+            )
+        )
+        # Never merge two classes: if the new label already has a row for this
+        # lesson, the old one stays where it is rather than colliding with it or
+        # silently folding two rooms' histories together.
+        taken = {
+            row.lesson_id
+            for row in db.scalars(
+                select(model).where(
+                    model.teacher_id == teacher.id,
+                    model.section == new,
+                    model.lesson_id.in_(lesson_ids),
+                )
+            )
+        }
+        for row in rows:
+            if model is Progress and row.lesson_id in taken:
+                continue
+            row.section = new
+            moved += 1
+    return moved
 
 
 def sync_progress_sections(

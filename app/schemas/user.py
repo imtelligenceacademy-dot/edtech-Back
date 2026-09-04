@@ -62,6 +62,21 @@ class UserCreate(CamelModel):
         return _clean_grades(v)
 
 
+class SectionRename(CamelModel):
+    """A super-admin correcting the name of one class.
+
+    Sent alongside the new section list rather than inferred from it, because a
+    diff cannot tell a rename from a removal plus an addition — and the two mean
+    opposite things for the class's history. This says plainly "6A is now
+    6-Red", so its progress, conversations and pending access requests move with
+    the name instead of being stranded under a label nobody is keyed to.
+    """
+
+    grade: str
+    from_section: str = Field(min_length=1, max_length=16)
+    to_section: str = Field(min_length=1, max_length=16)
+
+
 class UserStatusUpdate(CamelModel):
     status: UserStatus
 
@@ -75,6 +90,9 @@ class UserUpdate(CamelModel):
     school_id: str | None = None
     grades: list[str] | None = None
     sections: dict[str, list[str]] | None = None
+    # Applied before the new section list takes effect, so a renamed class keeps
+    # everything recorded under its old name.
+    section_renames: list[SectionRename] = Field(default_factory=list)
     language: Language | None = None
     ict_fair_access: bool | None = None
 
