@@ -13,7 +13,12 @@ from app.models.enums import LessonStatus, WatchdogStatus
 
 class Progress(Base, TimestampMixin):
     __tablename__ = "progress"
-    __table_args__ = (UniqueConstraint("teacher_id", "lesson_id", name="uq_teacher_lesson"),)
+    # One row per teacher, lesson AND section. A teacher who takes 6A, 6B and
+    # 6C through the same lesson has three rows: each class is paced on its
+    # own, so completing the lesson with 6A must not lock it for 6B.
+    __table_args__ = (
+        UniqueConstraint("teacher_id", "lesson_id", "section", name="uq_teacher_lesson_section"),
+    )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     teacher_id: Mapped[str] = mapped_column(
@@ -21,6 +26,15 @@ class Progress(Base, TimestampMixin):
     )
     lesson_id: Mapped[str] = mapped_column(
         ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    # Which of the teacher's sections of this grade this row tracks, e.g. "A".
+    # Empty string means the grade has a single, unnamed section — the case for
+    # every teacher until a super-admin names any, and the reason this is "" and
+    # not NULL: SQLite and Postgres both treat NULLs as distinct in a UNIQUE
+    # constraint, so a nullable column would let duplicate rows in unnoticed.
+    section: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="", server_default=""
     )
 
     status: Mapped[LessonStatus] = mapped_column(

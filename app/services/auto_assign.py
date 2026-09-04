@@ -16,7 +16,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import Lesson, LessonAssignment, Progress, UploadedFile, User
-from app.models.enums import LessonStatus, Role, UserStatus, WatchdogStatus
+from app.models.enums import LessonStatus, Role, UserStatus
+from app.services.sections import ensure_progress_for_lessons
 from app.utils import new_id
 
 # "Grade 7 python lesson 04 Variables.pdf"  -> grade=7, course="python",   lesson_no=4
@@ -130,18 +131,11 @@ def sync_teacher_assignments(db: Session, teacher: User) -> int:
             select(LessonAssignment).where(LessonAssignment.teacher_id == teacher.id)
         )
     }
-    has_progress = {
-        p.lesson_id
-        for p in db.scalars(
-            select(Progress).where(Progress.teacher_id == teacher.id)
-        )
-    }
-
     lessons = db.scalars(select(Lesson).where(Lesson.language.isnot(None))).all()
+    matching = [l for l in lessons if _lesson_matches_teacher(l, teacher)]
+
     created = 0
-    for lesson in lessons:
-        if not _lesson_matches_teacher(lesson, teacher):
-            continue
+    for lesson in matching:
         if lesson.id not in already:
             db.add(
                 LessonAssignment(
@@ -152,18 +146,11 @@ def sync_teacher_assignments(db: Session, teacher: User) -> int:
                 )
             )
             created += 1
-        if lesson.id not in has_progress:
-            db.add(
-                Progress(
-                    id=new_id("p"),
-                    teacher_id=teacher.id,
-                    lesson_id=lesson.id,
-                    status=LessonStatus.not_started,
-                    percent_complete=0,
-                    watchdog=WatchdogStatus.not_opened,
-                    watchdog_message="Assigned by grade/language rule",
-                )
-            )
+
+    # One progress row per lesson per class the teacher takes for its grade.
+    ensure_progress_for_lessons(
+        db, teacher, matching, "Assigned by grade/language rule"
+    )
     return created
 
 
@@ -179,12 +166,11 @@ def prune_teacher_assignments(db: Session, teacher: User) -> int:
     assignments = db.scalars(
         select(LessonAssignment).where(LessonAssignment.teacher_id == teacher.id)
     ).all()
-    progress_by_lesson = {
-        p.lesson_id: p
-        for p in db.scalars(
-            select(Progress).where(Progress.teacher_id == teacher.id)
-        )
-    }
+    # Every class's row for a lesson, not one of them: a lesson 6A has started
+    # is history worth keeping even if 6B never opened it.
+    progress_by_lesson: dict[str, list[Progress]] = {}
+    for p in db.scalars(select(Progress).where(Progress.teacher_id == teacher.id)):
+        progress_by_lesson.setdefault(p.lesson_id, []).append(p)
 
     removed = 0
     for a in assignments:
@@ -195,12 +181,12 @@ def prune_teacher_assignments(db: Session, teacher: User) -> int:
             continue
         if _lesson_matches_teacher(lesson, teacher):
             continue  # still matches — keep
-        progress = progress_by_lesson.get(a.lesson_id)
-        if not _progress_untouched(progress):
-            continue  # teacher started it — keep their history
+        rows = progress_by_lesson.get(a.lesson_id) or []
+        if not all(_progress_untouched(row) for row in rows):
+            continue  # a class started it — keep their history
         db.delete(a)
-        if progress is not None:
-            db.delete(progress)
+        for row in rows:
+            db.delete(row)
         removed += 1
     return removed
 
@@ -273,12 +259,6 @@ def assign_uploaded_file(
             select(LessonAssignment).where(LessonAssignment.lesson_id == lesson.id)
         )
     }
-    existing_progress = {
-        p.teacher_id for p in db.scalars(
-            select(Progress).where(Progress.lesson_id == lesson.id)
-        )
-    }
-
     for t in matched:
         if t.id not in existing_assignment_teachers:
             db.add(
@@ -286,18 +266,9 @@ def assign_uploaded_file(
                     id=new_id("la"), lesson_id=lesson.id, teacher_id=t.id, source="rule"
                 )
             )
-        if t.id not in existing_progress:
-            db.add(
-                Progress(
-                    id=new_id("p"),
-                    teacher_id=t.id,
-                    lesson_id=lesson.id,
-                    status=LessonStatus.not_started,
-                    percent_complete=0,
-                    watchdog=WatchdogStatus.not_opened,
-                    watchdog_message="Newly assigned — not opened yet",
-                )
-            )
+        ensure_progress_for_lessons(
+            db, t, [lesson], "Newly assigned — not opened yet"
+        )
 
     return AssignResult(
         lesson_id=lesson.id,

@@ -25,6 +25,7 @@ def to_out(req: AccessRequest, lesson: Lesson | None, teacher: User | None) -> A
         lesson_id=req.lesson_id,
         lesson_title=lesson.title if lesson else req.lesson_id,
         grade=lesson.grade if lesson else 0,
+        section=req.section,
         language=lesson.language if lesson else None,
         lesson_no=lesson.lesson_no if lesson else None,
         status=req.status,

@@ -34,6 +34,11 @@ class UserOut(CamelModel):
     status: UserStatus
     school_id: str | None = None
     grades: list[str] = Field(default_factory=list)
+    # Named classes per grade, e.g. {"G6": ["A", "B"]}. A grade that is absent,
+    # or maps to an empty list, has one unnamed class — the default, and the
+    # case in which sections are never shown to the teacher at all. Normalized
+    # server-side against the account's final grades.
+    sections: dict[str, list[str]] = Field(default_factory=dict)
     language: Language | None = None
     ict_fair_access: bool = False
     created_at: datetime
@@ -47,6 +52,7 @@ class UserCreate(CamelModel):
     role: Role
     school_id: str | None = None
     grades: list[str] = Field(default_factory=list)
+    sections: dict[str, list[str]] = Field(default_factory=dict)
     language: Language | None = None
     ict_fair_access: bool = False
 
@@ -68,6 +74,7 @@ class UserUpdate(CamelModel):
     role: Role | None = None
     school_id: str | None = None
     grades: list[str] | None = None
+    sections: dict[str, list[str]] | None = None
     language: Language | None = None
     ict_fair_access: bool | None = None
 

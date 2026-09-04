@@ -25,6 +25,7 @@ from app.schemas.user import (
 )
 from app.security import hash_password
 from app.services.auto_assign import prune_teacher_assignments, sync_teacher_assignments
+from app.services.sections import normalize_sections, sync_progress_sections
 from app.utils import client_ip, new_id, user_agent
 
 router = APIRouter(prefix="/api/users", tags=["users"])
@@ -72,6 +73,11 @@ def create_user(
         status=UserStatus.active,
         school_id=payload.school_id,
         grades=payload.grades if payload.role == Role.teacher else [],
+        sections=(
+            normalize_sections(payload.sections, payload.grades)
+            if payload.role == Role.teacher
+            else {}
+        ),
         language=(
             payload.language.value
             if payload.role == Role.teacher and payload.language
@@ -133,10 +139,11 @@ def _apply_role_and_school(db: Session, user: User, data: dict) -> Role:
 def _apply_teacher_fields(
     user: User, payload: UserUpdate, data: dict, effective_role: Role
 ) -> None:
-    """Grades, language, and ICT Fair access only apply to teachers; clear them
-    for other roles."""
+    """Grades, sections, language, and ICT Fair access only apply to teachers;
+    clear them for other roles."""
     if effective_role != Role.teacher:
         user.grades = []
+        user.sections = {}
         user.language = None
         user.ict_fair_access = False
         return
@@ -146,6 +153,13 @@ def _apply_teacher_fields(
         user.language = payload.language.value
     if "ict_fair_access" in data and data["ict_fair_access"] is not None:
         user.ict_fair_access = data["ict_fair_access"]
+
+    # Normalized against the grades this edit leaves the account with, so that
+    # dropping a grade takes its classes with it rather than leaving them to
+    # reappear if the grade is ever added back. Re-run even when the edit didn't
+    # mention sections, because the grades it did change decide which survive.
+    incoming = data["sections"] if data.get("sections") is not None else user.sections
+    user.sections = normalize_sections(incoming, user.grades)
 
 
 @router.patch("/{user_id}", response_model=UserOut)
@@ -161,6 +175,10 @@ def update_user(
 
     data = payload.model_dump(exclude_unset=True)
 
+    # Snapshot before the edit: a teacher's existing progress follows their first
+    # class when sections are named or cleared, so the two states are compared.
+    sections_before = dict(user.sections or {})
+
     if data.get("name") is not None:
         user.name = data["name"].strip()
     _apply_email_change(db, user, user_id, data)
@@ -171,6 +189,9 @@ def update_user(
     # add newly-matching lessons, and strip untouched ones that no longer match.
     if user.role == Role.teacher:
         db.flush()
+        # Re-key existing progress onto the new class names first, so the rows
+        # created below fill in only the classes that genuinely have none.
+        sync_progress_sections(db, user, sections_before, user.sections or {})
         sync_teacher_assignments(db, user)
         prune_teacher_assignments(db, user)
 

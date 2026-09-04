@@ -38,6 +38,19 @@ class User(Base, TimestampMixin):
     # non-teacher roles.
     grades: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
 
+    # Named sections per grade, e.g. {"G6": ["A", "B", "C", "D"]}. A grade that
+    # is absent here, or maps to an empty list, has one unnamed section: either
+    # the school runs a single class for that grade, or this teacher takes only
+    # one of them. That is the default, and teachers in it never see a section
+    # anywhere in the product.
+    #
+    # Keyed by grade rather than a flat list because a teacher of G5 and G6 has
+    # 5A/5B and 6A/6B/6C, and those are different classes that happen to share a
+    # letter.
+    sections: Mapped[dict[str, list[str]]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+
     # Language of instruction for teachers: "en" | "fr" | "both". Null otherwise.
     language: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
 

@@ -222,23 +222,36 @@ def _school_sections(
     if include_detail:
         # Late and unfinished work first — the top of the table is the part
         # anybody reads.
-        def _urgency(p: Progress) -> tuple[int, str]:
+        def _urgency(p: Progress) -> tuple[int, str, str]:
             rank = {
                 LessonStatus.late: 0,
                 LessonStatus.in_progress: 1,
                 LessonStatus.not_started: 2,
                 LessonStatus.completed: 3,
             }
-            return (rank.get(p.status, 4), name_by_id.get(p.teacher_id, ""))
+            return (rank.get(p.status, 4), name_by_id.get(p.teacher_id, ""), p.section)
+
+        # A teacher who takes the same grade more than once has one row per
+        # class, so the class has to be named or the table reads as duplicates
+        # that contradict each other. Nobody else gets the column: for a teacher
+        # with one class per grade it would be an empty column all the way down.
+        sectioned = any(p.section for p in progress)
 
         _heading(doc, "Teacher progress")
-        _meta_line(doc, "Late and in-progress lessons first.")
+        _meta_line(
+            doc,
+            "Late and in-progress lessons first."
+            + (" One row per class." if sectioned else ""),
+        )
         _table(
             doc,
-            ["Teacher", "Lesson", "Status", "%", "Watchdog"],
+            ["Teacher"]
+            + (["Class"] if sectioned else [])
+            + ["Lesson", "Status", "%", "Watchdog"],
             [
-                [
-                    name_by_id.get(p.teacher_id, p.teacher_id),
+                [name_by_id.get(p.teacher_id, p.teacher_id)]
+                + ([p.section or "—"] if sectioned else [])
+                + [
                     lessons.get(p.lesson_id, p.lesson_id),
                     p.status.value,
                     str(p.percent_complete),

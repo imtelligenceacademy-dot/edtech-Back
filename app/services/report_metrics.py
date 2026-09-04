@@ -60,10 +60,23 @@ class ProgressStats:
     # Mean percent across the lessons that were actually begun. Reported only
     # when something has been; otherwise it is a statement about nothing.
     avg_of_started: int | None = None
+    # True when any counted row belongs to a named class. Every figure here is
+    # per class — a teacher who takes one lesson through 6A, 6B and 6C has
+    # delivered it three times — and this is what decides whether to say so.
+    # For the teacher with one class per grade the two are the same thing, and
+    # naming the distinction would only puzzle them.
+    sectioned: bool = False
+
+    @property
+    def unit(self) -> str:
+        return "lesson deliveries" if self.sectioned else "lessons"
 
     @property
     def headline(self) -> str:
-        done = f"{self.completed} of {self.assigned} lessons complete ({self.completion_rate}%)"
+        done = (
+            f"{self.completed} of {self.assigned} {self.unit} complete "
+            f"({self.completion_rate}%)"
+        )
         if self.not_started:
             done += f", {self.not_started} not yet opened"
         return done
@@ -87,6 +100,7 @@ def progress_stats(rows: list[Progress]) -> ProgressStats:
         avg_of_started=(
             round(sum(p.percent_complete for p in started) / len(started)) if started else None
         ),
+        sectioned=any(p.section for p in rows),
     )
 
 
@@ -126,13 +140,17 @@ class Movement:
     teachers_active: int = 0
     lessons_touched: int = 0
     new_alerts: int = 0
+    # As in ProgressStats: these are per class, and this says whether that is a
+    # distinction worth drawing for the teachers being reported on.
+    sectioned: bool = False
 
     def lines(self) -> list[str]:
+        unit = "lesson deliveries" if self.sectioned else "lesson(s)"
         return [
             self.completed.describe(),
             self.questions.describe(),
             f"{self.teachers_active} teacher(s) opened something in the last 7 days, "
-            f"across {self.lessons_touched} lesson(s)",
+            f"across {self.lessons_touched} {unit}",
             f"{self.new_alerts} new security alert(s) in the last 7 days",
         ]
 
@@ -183,6 +201,18 @@ def movement(db: Session, teacher_ids: list[str], school_id: str | None = None) 
     ).all()
     out.teachers_active = len(active)
     out.lessons_touched = sum(count for _, count in active)
+
+    # Whether any of these teachers has named classes at all decides the wording
+    # above; one query rather than a flag threaded down from the caller.
+    out.sectioned = bool(
+        db.scalar(
+            select(func.count(Progress.id)).where(
+                Progress.teacher_id.in_(teacher_ids), Progress.section != ""
+            )
+        )
+    )
+    if out.sectioned:
+        out.completed.label = "lesson deliveries completed"
 
     alert_stmt = select(func.count(SecurityLog.id)).where(
         SecurityLog.status != SecurityStatus.ok, SecurityLog.timestamp >= week_start

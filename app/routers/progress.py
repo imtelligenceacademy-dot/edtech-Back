@@ -12,6 +12,7 @@ from app.models import Lesson, LessonAssignment, Progress, User
 from app.models.enums import LessonStatus, Role, WatchdogStatus
 from app.schemas.progress import ProgressOut, ProgressUpdate
 from app.services.lesson_access import get_access_status
+from app.services.sections import find_progress, resolve_section
 from app.utils import new_id
 
 router = APIRouter(prefix="/api/progress", tags=["progress"])
@@ -29,27 +30,24 @@ def _compute_watchdog(
     return WatchdogStatus.on_track, f"In progress — {percent}%"
 
 
-def _existing_progress(db: Session, teacher_id: str, lesson_id: str) -> Progress | None:
-    return db.scalar(
-        select(Progress).where(
-            Progress.lesson_id == lesson_id, Progress.teacher_id == teacher_id
-        )
-    )
-
-
-def _guard_write_access(db: Session, teacher: User, lesson_id: str) -> Progress | None:
+def _guard_write_access(
+    db: Session, teacher: User, lesson_id: str, section: str
+) -> Progress | None:
     """Enforce sequential unlocking on writes. Raises 403 for a lesson that's
     locked or still in its waiting period. For an already-completed lesson,
     returns its Progress row so the caller can no-op instead of downgrading it;
-    otherwise returns None to proceed with the write."""
-    access_status = get_access_status(db, teacher, lesson_id)
+    otherwise returns None to proceed with the write.
+
+    Judged for the class being taught, not the teacher as a whole: a lesson
+    finished with 6A is still open to record against 6B."""
+    access_status = get_access_status(db, teacher, lesson_id, section)
     if access_status in ("locked", "waiting"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="This lesson isn't available yet — ask your admin for access.",
         )
     if access_status == "completed":
-        return _existing_progress(db, teacher.id, lesson_id)
+        return find_progress(db, teacher.id, lesson_id, section)
     return None
 
 
@@ -109,7 +107,14 @@ def update_progress(
     # Sequential unlocking: block writes to a lesson the teacher hasn't reached
     # yet (locked / still in its waiting period). A lesson they've already
     # completed is left untouched — re-saving it is a harmless no-op, never a 403.
-    already_completed = _guard_write_access(db, current, lesson_id)
+    section = resolve_section(current, lesson.grade, payload.section)
+    if section is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That class isn't one of yours for this grade.",
+        )
+
+    already_completed = _guard_write_access(db, current, lesson_id, section)
     if already_completed is not None:
         return already_completed  # already done; don't downgrade or error
 
@@ -121,9 +126,11 @@ def update_progress(
     percent = _resolve_percent(payload, total)
 
     now = datetime.now(timezone.utc)
-    progress = _existing_progress(db, current.id, lesson_id)
+    progress = find_progress(db, current.id, lesson_id, section)
     if progress is None:
-        progress = Progress(id=new_id("p"), teacher_id=current.id, lesson_id=lesson_id)
+        progress = Progress(
+            id=new_id("p"), teacher_id=current.id, lesson_id=lesson_id, section=section
+        )
         db.add(progress)
 
     progress.percent_complete = percent

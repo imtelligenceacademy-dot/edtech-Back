@@ -24,6 +24,7 @@ from app.schemas.access_request import AccessRequestCreate, AccessRequestOut
 from app.services.access_requests import list_pending, to_out
 from app.services.backup import send_email
 from app.services.lesson_access import is_lesson_available
+from app.services.sections import find_progress, has_named_sections, resolve_section
 from app.utils import new_id
 
 logger = logging.getLogger("app.access_requests")
@@ -47,13 +48,22 @@ def _admin_recipients(db: Session) -> list[str]:
     ]
 
 
-def _notify_access_request(recipients: list[str], teacher: User, lesson: Lesson, note: str | None) -> None:
+def _notify_access_request(
+    recipients: list[str],
+    teacher: User,
+    lesson: Lesson,
+    note: str | None,
+    section: str = "",
+) -> None:
     """Best-effort email to admins about a teacher's access request. Runs in a
     background task, so a mail failure never breaks the teacher's request."""
     subject = f"IM-Telligence — lesson access request from {teacher.name}"
+    # Name the class only when the teacher has more than one; for everyone
+    # else a section would be noise about a distinction they don't have.
+    where = f"Grade {lesson.grade}" + (f" — {section}" if section else "")
     text = (
         f"{teacher.name} ({teacher.email}) has requested access to a locked lesson:\n\n"
-        f"  {lesson.title} (Grade {lesson.grade})\n\n"
+        f"  {lesson.title} ({where})\n\n"
         + (f'Their note: "{note.strip()}"\n\n' if note else "")
         + "Review and grant or deny it in IM-Telligence under Access Control."
     )
@@ -87,17 +97,27 @@ def create_request(
     if not assigned:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Lesson not assigned to you")
 
-    if is_lesson_available(db, current, payload.lesson_id):
+    section = resolve_section(current, lesson.grade, payload.section)
+    if section is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That class isn't one of yours for this grade.",
+        )
+
+    if is_lesson_available(db, current, payload.lesson_id, section):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="This lesson is already available to you.",
         )
 
-    # One pending request per (teacher, lesson) — reuse it if it already exists.
+    # One pending request per (teacher, lesson, class) — reuse it if it already
+    # exists. A teacher stuck on this lesson in both 6B and 6C has two requests,
+    # because granting one unlocks one class.
     existing = db.scalar(
         select(AccessRequest).where(
             AccessRequest.teacher_id == current.id,
             AccessRequest.lesson_id == payload.lesson_id,
+            AccessRequest.section == section,
             AccessRequest.status == PENDING,
         )
     )
@@ -111,6 +131,7 @@ def create_request(
         id=new_id("req"),
         teacher_id=current.id,
         lesson_id=payload.lesson_id,
+        section=section,
         status=PENDING,
         note=payload.note,
     )
@@ -122,7 +143,12 @@ def create_request(
     recipients = _admin_recipients(db)
     if recipients:
         background_tasks.add_task(
-            _notify_access_request, recipients, current, lesson, payload.note
+            _notify_access_request,
+            recipients,
+            current,
+            lesson,
+            payload.note,
+            section if has_named_sections(current, lesson.grade) else "",
         )
 
     return _to_out(req, lesson, current)
@@ -171,13 +197,14 @@ def _resolve(db: Session, request_id: str, admin: User, granted: bool) -> Access
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request already resolved")
 
     if granted:
-        progress = db.scalar(
-            select(Progress).where(
-                Progress.teacher_id == req.teacher_id, Progress.lesson_id == req.lesson_id
-            )
-        )
+        progress = find_progress(db, req.teacher_id, req.lesson_id, req.section)
         if progress is None:
-            progress = Progress(id=new_id("p"), teacher_id=req.teacher_id, lesson_id=req.lesson_id)
+            progress = Progress(
+                id=new_id("p"),
+                teacher_id=req.teacher_id,
+                lesson_id=req.lesson_id,
+                section=req.section,
+            )
             db.add(progress)
         progress.unlocked_override = True
 

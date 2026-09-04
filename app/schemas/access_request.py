@@ -9,6 +9,8 @@ from app.schemas.base import CamelModel
 
 class AccessRequestCreate(CamelModel):
     lesson_id: str
+    # The class the teacher is blocked on. Omitted by single-class teachers.
+    section: str | None = None
     note: str | None = Field(default=None, max_length=500)
 
 
@@ -19,6 +21,8 @@ class AccessRequestOut(CamelModel):
     lesson_id: str
     lesson_title: str
     grade: int
+    # Which of the teacher's classes is blocked. "" when the grade has one.
+    section: str = ""
     language: str | None = None
     lesson_no: int | None = None
     status: str  # pending | granted | denied

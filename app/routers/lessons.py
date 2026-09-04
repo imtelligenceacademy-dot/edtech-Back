@@ -8,7 +8,7 @@ Scoping:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -25,6 +25,7 @@ from app.schemas.lesson import (
     BulkAssignment,
     BulkAssignmentPreview,
     BulkAssignmentResult,
+    ClassSummary,
     LessonCreate,
     LessonOut,
     OverrideRequest,
@@ -33,7 +34,20 @@ from app.schemas.lesson import (
     TeacherAccessTrack,
     TeacherLessonAccessRow,
 )
-from app.services.lesson_access import COURSE_ORDER, LessonAccess, compute_access
+from app.services.lesson_access import (
+    COURSE_ORDER,
+    LessonAccess,
+    compute_access,
+    lesson_order_key,
+    section_access,
+)
+from app.services.sections import (
+    all_sections,
+    ensure_progress_rows,
+    find_progress,
+    resolve_section,
+    sections_for,
+)
 from app.utils import new_id
 
 router = APIRouter(prefix="/api/lessons", tags=["lessons"])
@@ -71,6 +85,10 @@ def _base_query():
 
 @router.get("", response_model=list[LessonOut])
 def list_lessons(
+    section: str | None = Query(
+        default=None,
+        description="The class being taught. Omit for teachers with one class.",
+    ),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ) -> list[LessonOut]:
@@ -80,7 +98,7 @@ def list_lessons(
             LessonAssignment.teacher_id == current.id
         )
         stmt = stmt.where(Lesson.id.in_(assigned))
-        access = compute_access(db, current)
+        access = section_access(db, current, section)
         return [
             _to_out(l, access.get(l.id))
             for l in db.scalars(stmt.order_by(Lesson.created_at.desc()))
@@ -98,9 +116,84 @@ def list_lessons(
     return [_to_out(l) for l in db.scalars(stmt.order_by(Lesson.created_at.desc()))]
 
 
+@router.get("/my-classes", response_model=list[ClassSummary])
+def my_classes(
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> list[ClassSummary]:
+    """Where each of a teacher's classes has got to.
+
+    The teacher picks a grade, and — when they take that grade more than once
+    — a class, before teaching. Both pickers need the same thing: how far each
+    class is, what opens next for them, and where they stopped. Computing it
+    here keeps the picker honest, because it is the same access calculation the
+    lesson list and the assistant use rather than a second guess at it.
+
+    A teacher with one class per grade gets one row per grade with an empty
+    section, and never sees a class named anywhere.
+    """
+    if current.role != Role.teacher:
+        return []
+
+    access = compute_access(db, current)
+    if not access:
+        return []
+
+    lesson_ids = {lesson_id for lesson_id, _ in access}
+    lessons = {l.id: l for l in db.scalars(select(Lesson).where(Lesson.id.in_(lesson_ids)))}
+    progress = {
+        (p.lesson_id, p.section): p
+        for p in db.scalars(
+            select(Progress).where(
+                Progress.teacher_id == current.id, Progress.lesson_id.in_(lesson_ids)
+            )
+        )
+    }
+
+    # Group by class, then walk each in teaching order so "next" is the next
+    # lesson that class actually reaches, not merely the first unfinished one
+    # in the database.
+    by_class: dict[tuple[int, str], list[Lesson]] = {}
+    for (lesson_id, section) in access:
+        lesson = lessons.get(lesson_id)
+        if lesson is not None:
+            by_class.setdefault((lesson.grade, section), []).append(lesson)
+
+    out: list[ClassSummary] = []
+    for (grade, section), group in sorted(by_class.items()):
+        group.sort(key=lesson_order_key)
+        row = ClassSummary(
+            grade=grade,
+            section=section,
+            total=len(group),
+            completed=sum(
+                1
+                for l in group
+                if (a := access.get((l.id, section))) and a.status == "completed"
+            ),
+        )
+        # The first lesson this class has not finished: what they open next, or
+        # what they are waiting on.
+        for lesson in group:
+            a = access.get((lesson.id, section))
+            if a is None or a.status == "completed":
+                continue
+            p = progress.get((lesson.id, section))
+            row.next_lesson_id = lesson.id
+            row.next_title = lesson.title
+            row.next_status = a.status
+            row.available_at = a.available_at
+            row.last_slide = p.last_slide if p else None
+            row.slide_total = p.slide_total if p else None
+            break
+        out.append(row)
+    return out
+
+
 @router.get("/{lesson_id}", response_model=LessonOut)
 def get_lesson(
     lesson_id: str,
+    section: str | None = Query(default=None),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ) -> LessonOut:
@@ -111,7 +204,7 @@ def get_lesson(
     if current.role == Role.teacher:
         if current.id not in {a.teacher_id for a in lesson.assignments}:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not assigned to you")
-        access = compute_access(db, current).get(lesson.id)
+        access = section_access(db, current, section).get(lesson.id)
         if access is None or access.status != "available":
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -308,6 +401,12 @@ def bulk_assignments(
     """Apply one assignment edit across many lessons, in one transaction."""
     lessons, add, remove = _resolve_bulk(db, payload)
 
+    # A progress row per class needs each teacher's sections, so load the
+    # teachers once for the whole edit rather than per lesson.
+    teachers_by_id = {
+        t.id: t for t in db.scalars(select(User).where(User.id.in_(add)))
+    }
+
     added = 0
     removed = 0
     touched: set[str] = set()
@@ -323,19 +422,9 @@ def bulk_assignments(
                     source="manual",
                 )
             )
-            if not db.scalar(
-                select(Progress).where(
-                    Progress.lesson_id == lesson.id, Progress.teacher_id == teacher_id
-                )
-            ):
-                db.add(
-                    Progress(
-                        id=new_id("p"),
-                        teacher_id=teacher_id,
-                        lesson_id=lesson.id,
-                        watchdog_message="Manually assigned — not opened yet",
-                    )
-                )
+            teacher = teachers_by_id.get(teacher_id)
+            if teacher is not None:
+                ensure_progress_rows(db, teacher, lesson, "Manually assigned — not opened yet")
             added += 1
             touched.add(lesson.id)
 
@@ -402,19 +491,7 @@ def assign_teacher(
                 source="manual",
             )
         )
-        if not db.scalar(
-            select(Progress).where(
-                Progress.lesson_id == lesson.id, Progress.teacher_id == payload.teacher_id
-            )
-        ):
-            db.add(
-                Progress(
-                    id=new_id("p"),
-                    teacher_id=payload.teacher_id,
-                    lesson_id=lesson.id,
-                    watchdog_message="Manually assigned — not opened yet",
-                )
-            )
+        ensure_progress_rows(db, teacher, lesson, "Manually assigned — not opened yet")
         db.commit()
 
     lesson = db.scalar(
@@ -476,19 +553,9 @@ def replace_assignments(
                 source="manual",
             )
         )
-        if not db.scalar(
-            select(Progress).where(
-                Progress.lesson_id == lesson.id, Progress.teacher_id == teacher_id
-            )
-        ):
-            db.add(
-                Progress(
-                    id=new_id("p"),
-                    teacher_id=teacher_id,
-                    lesson_id=lesson.id,
-                    watchdog_message="Manually assigned — not opened yet",
-                )
-            )
+        ensure_progress_rows(
+            db, school_teachers[teacher_id], lesson, "Manually assigned — not opened yet"
+        )
 
     if to_remove:
         for assignment in db.scalars(
@@ -543,7 +610,7 @@ def teacher_access(
     ]
     lessons = {l.id: l for l in db.scalars(select(Lesson).where(Lesson.id.in_(assigned_ids)))}
     progress = {
-        p.lesson_id: p
+        (p.lesson_id, p.section): p
         for p in db.scalars(
             select(Progress).where(
                 Progress.teacher_id == teacher_id,
@@ -552,39 +619,57 @@ def teacher_access(
         )
     }
 
-    # Group lessons into (grade, language, year) tracks, ordered by course then
-    # lesson number — matching the sequencing in lesson_access.
-    tracks: dict[tuple[int, str | None, int], list[tuple[int, TeacherLessonAccessRow]]] = {}
+    # Group lessons into (grade, language, year, section) tracks, ordered by
+    # course then lesson number — matching the sequencing in lesson_access. A
+    # teacher who takes three classes of one grade has three tracks there, each
+    # at its own point in the curriculum, which is exactly what the admin needs
+    # to see before reopening a lesson for one of them.
+    tracks: dict[
+        tuple[int, str | None, int, str], list[tuple[int, TeacherLessonAccessRow]]
+    ] = {}
     for lid in assigned_ids:
         lesson = lessons.get(lid)
         if lesson is None:
             continue
-        a = access.get(lid)
-        p = progress.get(lid)
-        row = TeacherLessonAccessRow(
-            lesson_id=lid,
-            title=lesson.title,
-            grade=lesson.grade,
-            language=lesson.language,
-            course=lesson.course,
-            lesson_no=lesson.lesson_no,
-            status=a.status if a else "locked",
-            available_at=a.available_at if a else None,
-            percent_complete=p.percent_complete if p else 0,
-            completed_at=p.completed_at if p else None,
-            unlocked_override=bool(p and p.unlocked_override),
-        )
-        order = COURSE_ORDER.get(lesson.course or "", 0)
-        tracks.setdefault((lesson.grade, lesson.language, lesson.year), []).append((order, row))
+        for section in sections_for(teacher, lesson.grade):
+            a = access.get((lid, section))
+            p = progress.get((lid, section))
+            row = TeacherLessonAccessRow(
+                lesson_id=lid,
+                title=lesson.title,
+                grade=lesson.grade,
+                section=section,
+                language=lesson.language,
+                course=lesson.course,
+                lesson_no=lesson.lesson_no,
+                status=a.status if a else "locked",
+                available_at=a.available_at if a else None,
+                percent_complete=p.percent_complete if p else 0,
+                completed_at=p.completed_at if p else None,
+                unlocked_override=bool(p and p.unlocked_override),
+            )
+            order = COURSE_ORDER.get(lesson.course or "", 0)
+            key = (lesson.grade, lesson.language, lesson.year, section)
+            tracks.setdefault(key, []).append((order, row))
 
     track_out = []
-    for (grade, language, year), rows in sorted(
-        tracks.items(), key=lambda kv: (kv[0][0], kv[0][1] or "", kv[0][2])
+    for (grade, language, year, section), rows in sorted(
+        tracks.items(), key=lambda kv: (kv[0][0], kv[0][3], kv[0][1] or "", kv[0][2])
     ):
-        rows.sort(key=lambda cr: (cr[0], cr[1].lesson_no if cr[1].lesson_no is not None else 10_000, cr[1].title))
+        rows.sort(
+            key=lambda cr: (
+                cr[0],
+                cr[1].lesson_no if cr[1].lesson_no is not None else 10_000,
+                cr[1].title,
+            )
+        )
         track_out.append(
             TeacherAccessTrack(
-                grade=grade, language=language, year=year, lessons=[r for _, r in rows]
+                grade=grade,
+                section=section,
+                language=language,
+                year=year,
+                lessons=[r for _, r in rows],
             )
         )
 
@@ -594,6 +679,7 @@ def teacher_access(
         email=teacher.email,
         school_id=teacher.school_id,
         grades=list(teacher.grades or []),
+        sections=all_sections(teacher),
         language=teacher.language,
         tracks=track_out,
     )
@@ -623,13 +709,24 @@ def set_lesson_override(
     if assignment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not assigned to this teacher")
 
-    progress = db.scalar(
-        select(Progress).where(
-            Progress.lesson_id == lesson_id, Progress.teacher_id == teacher_id
+    lesson = db.get(Lesson, lesson_id)
+    if lesson is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found")
+
+    # An override belongs to one class. Unlocking a lesson for 6B must not also
+    # reopen it for 6A, which finished it last week.
+    section = resolve_section(teacher, lesson.grade, payload.section)
+    if section is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That class isn't one of this teacher's for the grade.",
         )
-    )
+
+    progress = find_progress(db, teacher_id, lesson_id, section)
     if progress is None:
-        progress = Progress(id=new_id("p"), teacher_id=teacher_id, lesson_id=lesson_id)
+        progress = Progress(
+            id=new_id("p"), teacher_id=teacher_id, lesson_id=lesson_id, section=section
+        )
         db.add(progress)
     progress.unlocked_override = payload.unlocked
 
@@ -639,6 +736,7 @@ def set_lesson_override(
             select(AccessRequest).where(
                 AccessRequest.teacher_id == teacher_id,
                 AccessRequest.lesson_id == lesson_id,
+                AccessRequest.section == section,
                 AccessRequest.status == "pending",
             )
         )
@@ -648,14 +746,14 @@ def set_lesson_override(
             req.resolved_at = datetime.now(timezone.utc)
     db.commit()
 
-    lesson = db.get(Lesson, lesson_id)
-    access = compute_access(db, teacher).get(lesson_id)
+    access = compute_access(db, teacher).get((lesson_id, section))
     return TeacherLessonAccessRow(
         lesson_id=lesson_id,
-        title=lesson.title if lesson else lesson_id,
-        grade=lesson.grade if lesson else 0,
-        language=lesson.language if lesson else None,
-        lesson_no=lesson.lesson_no if lesson else None,
+        title=lesson.title,
+        grade=lesson.grade,
+        section=section,
+        language=lesson.language,
+        lesson_no=lesson.lesson_no,
         status=access.status if access else "locked",
         available_at=access.available_at if access else None,
         percent_complete=progress.percent_complete,

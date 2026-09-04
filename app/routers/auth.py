@@ -268,6 +268,7 @@ def login(
         school_id=user.school_id,
         ict_fair_access=user.ict_fair_access,
         grades=list(user.grades or []),
+        sections=dict(user.sections or {}),
         access_token=access,
     )
 
@@ -337,4 +338,5 @@ def me(user: User = Depends(get_current_user)) -> SessionUser:
         school_id=user.school_id,
         ict_fair_access=user.ict_fair_access,
         grades=list(user.grades or []),
+        sections=dict(user.sections or {}),
     )

@@ -26,6 +26,13 @@ class AccessRequest(Base, TimestampMixin):
         ForeignKey("lessons.id", ondelete="CASCADE"), nullable=False, index=True
     )
 
+    # The section the request is for ("" when the grade has one unnamed
+    # section). Without it, granting would unlock the lesson for every section
+    # the teacher takes, not the one class they are actually stuck on.
+    section: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="", server_default=""
+    )
+
     # pending | granted | denied
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

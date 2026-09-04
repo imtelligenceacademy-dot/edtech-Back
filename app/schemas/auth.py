@@ -32,6 +32,13 @@ class SessionUser(CamelModel):
     # round trip — and because "the grades I teach" is this field, not whichever
     # grades happen to have lessons assigned right now.
     grades: list[str] = []
+
+    # Named classes per grade, e.g. {"G6": ["A", "B"]}. Carried here for the
+    # same reason as grades: the teacher surface has to know, before it draws
+    # anything, whether this teacher picks a class or goes straight to the
+    # lessons. A grade absent here has one unnamed class and shows no section
+    # anywhere.
+    sections: dict[str, list[str]] = {}
     access_token: str | None = Field(default=None, serialization_alias="accessToken")
 
 

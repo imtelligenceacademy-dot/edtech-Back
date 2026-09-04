@@ -107,12 +107,38 @@ class BulkAssignmentResult(CamelModel):
 
 
 # --- Super-admin lesson-access management --------------------------------- #
+class ClassSummary(CamelModel):
+    """One class of one grade, summarised for the teacher's own picker.
+
+    Enough to choose a class without opening it: how far through the curriculum
+    that class is, what opens next for them, and where they stopped. The counts
+    are per class, so four classes of the same grade have four of these.
+    """
+
+    grade: int
+    # "" when the grade has a single unnamed class, in which case the teacher is
+    # never shown a class at all and this is one row for the whole grade.
+    section: str = ""
+    total: int = 0
+    completed: int = 0
+    next_lesson_id: str | None = None
+    next_title: str | None = None
+    # available | waiting | locked, for the next lesson that isn't finished.
+    next_status: str | None = None
+    available_at: datetime | None = None
+    # Where this class stopped in the lesson that is open to them now.
+    last_slide: int | None = None
+    slide_total: int | None = None
+
+
 class TeacherLessonAccessRow(CamelModel):
     """One lesson in a teacher's track, with its gating state + override flag."""
 
     lesson_id: str
     title: str
     grade: int
+    # The class this row is for. "" when the grade has one unnamed section.
+    section: str = ""
     language: str | None = None
     course: str | None = None
     lesson_no: int | None = None
@@ -125,6 +151,9 @@ class TeacherLessonAccessRow(CamelModel):
 
 class TeacherAccessTrack(CamelModel):
     grade: int
+    # Each of a teacher's classes walks the curriculum on its own, so a grade
+    # with named sections contributes one track per class.
+    section: str = ""
     language: str | None = None
     year: int | None = None
     lessons: list[TeacherLessonAccessRow] = Field(default_factory=list)
@@ -136,9 +165,15 @@ class TeacherAccessOut(CamelModel):
     email: str
     school_id: str | None = None
     grades: list[str] = Field(default_factory=list)
+    # Named classes per grade, e.g. {"G6": ["A", "B"]}. Absent grades have one
+    # unnamed class.
+    sections: dict[str, list[str]] = Field(default_factory=dict)
     language: str | None = None
     tracks: list[TeacherAccessTrack] = Field(default_factory=list)
 
 
 class OverrideRequest(CamelModel):
     unlocked: bool
+    # Which class to unlock the lesson for. Omitted means the teacher's first
+    # (or only) class for that grade.
+    section: str | None = None
