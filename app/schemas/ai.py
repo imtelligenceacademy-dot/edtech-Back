@@ -16,6 +16,9 @@ class ChatTurn(CamelModel):
 class AIChatRequest(CamelModel):
     message: str = Field(min_length=1, max_length=4000)
     lesson_id: str | None = None
+    # The class being taught. Threads are per class, so the same lesson taught
+    # to 6A and 6B keeps two conversations. Omitted by teachers with one class.
+    section: str | None = None
     fair_project_id: str | None = None
     # 1-based page the teacher is currently viewing, so the assistant can look at
     # that exact slide. Desktop viewers report it; null means "no visual context".

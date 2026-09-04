@@ -1,4 +1,4 @@
-"""Teacher chat history — one thread per (teacher, lesson).
+"""Teacher chat history — one thread per (teacher, lesson, class).
 
 Access is stated at every endpoint rather than inferred: a teacher is pinned to
 their own rows, the super-admin may read anyone's, and every other role is
@@ -50,19 +50,27 @@ def _resolve_subject(current: User, teacher_id: str | None) -> str:
 @router.get("/messages", response_model=list[ChatMessageOut])
 def list_messages(
     lesson_id: str = Query(..., alias="lessonId"),
+    section: str = "",
     teacher_id: str | None = Query(None, alias="teacherId"),
     limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ) -> list[ChatMessage]:
-    """One lesson's thread, oldest first.
+    """One class's thread about one lesson, oldest first.
 
     Deliberately independent of the lesson's unlock state: a lesson a teacher
     has finished is locked again, and their own notes about it should not lock
     with it.
+
+    The section is not validated against the teacher's classes on purpose. This
+    is a read of their own rows, so an unknown class simply has no messages —
+    there is nothing to widen, and refusing would break a teacher whose admin
+    renamed a class out from under a tab they still had open.
     """
     subject = _resolve_subject(current, teacher_id)
-    return thread_messages(db, teacher_id=subject, lesson_id=lesson_id, limit=limit)
+    return thread_messages(
+        db, teacher_id=subject, lesson_id=lesson_id, section=section, limit=limit
+    )
 
 
 @router.delete(
@@ -70,13 +78,16 @@ def list_messages(
 )
 def clear_messages(
     lesson_id: str = Query(..., alias="lessonId"),
+    section: str = "",
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ) -> Response:
-    """A teacher clears one lesson's thread. Only ever their own."""
+    """A teacher clears one class's thread. Only ever their own, and only the
+    class they are in — the same lesson's conversation with another class is
+    left standing."""
     if current.role != Role.teacher:
         raise _FORBIDDEN
-    clear_thread(db, teacher_id=current.id, lesson_id=lesson_id)
+    clear_thread(db, teacher_id=current.id, lesson_id=lesson_id, section=section)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -86,7 +97,8 @@ def list_threads(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ) -> list[ChatThreadOut]:
-    """Which lessons a teacher has talked about, most recent first."""
+    """Which lessons a teacher has talked about, and with which class, most
+    recent first."""
     subject = _resolve_subject(current, teacher_id)
     threads = threads_for_teacher(db, teacher_id=subject)
     if not threads:
@@ -103,6 +115,7 @@ def list_threads(
             lesson_id=t["lesson_id"],
             lesson_title=getattr(lessons.get(t["lesson_id"]), "title", None),
             grade=getattr(lessons.get(t["lesson_id"]), "grade", None),
+            section=t["section"],
             message_count=t["message_count"],
             last_message_at=t["last_message_at"],
         )
@@ -124,13 +137,17 @@ def export_chats(current: User = Depends(get_current_user)) -> StreamingResponse
     def rows() -> Iterator[str]:
         with SessionLocal() as db:
             stmt = select(ChatMessage).order_by(
-                ChatMessage.teacher_id, ChatMessage.lesson_id, ChatMessage.created_at
+                ChatMessage.teacher_id,
+                ChatMessage.lesson_id,
+                ChatMessage.section,
+                ChatMessage.created_at,
             )
             for message in db.scalars(stmt).yield_per(500):
                 yield json.dumps(
                     {
                         "teacherId": message.teacher_id,
                         "lessonId": message.lesson_id,
+                        "section": message.section,
                         "role": message.role,
                         "content": message.content,
                         "createdAt": message.created_at.isoformat()

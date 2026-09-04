@@ -1,4 +1,9 @@
-"""Storage for the teacher assistant's conversations, one thread per lesson.
+"""Storage for the teacher assistant's conversations, one thread per class.
+
+A teacher who takes the same grade more than once teaches the same lesson to
+each of their classes, and asks different things in each room. So the thread
+is keyed by (teacher, lesson, section), and "" — the single unnamed class —
+is what every teacher who takes a grade once has.
 
 Writing happens from inside the streaming response, after the request's own DB
 session has been closed, so these helpers open their own session and never
@@ -29,8 +34,10 @@ def save_exchange(
     question: str,
     answer: str,
     source_ref: str | None,
+    section: str = "",
 ) -> None:
-    """Record one question and its reply against the lesson it was asked about.
+    """Record one question and its reply against the lesson and class it was
+    asked in.
 
     A question with no lesson in context is not stored — the assistant refuses
     those, so there is nothing worth coming back to.
@@ -46,6 +53,7 @@ def save_exchange(
                     id=new_id("msg"),
                     teacher_id=teacher_id,
                     lesson_id=lesson_id,
+                    section=section,
                     role="user",
                     content=question,
                     created_at=now,
@@ -57,6 +65,7 @@ def save_exchange(
                         id=new_id("msg"),
                         teacher_id=teacher_id,
                         lesson_id=lesson_id,
+                        section=section,
                         role="assistant",
                         content=answer,
                         source_ref=source_ref,
@@ -72,22 +81,33 @@ def save_exchange(
 
 
 def thread_messages(
-    db: Session, *, teacher_id: str, lesson_id: str, limit: int = 50
+    db: Session, *, teacher_id: str, lesson_id: str, section: str = "", limit: int = 50
 ) -> list[ChatMessage]:
-    """The tail of one thread, oldest first — the order the chat renders in."""
+    """The tail of one class's thread, oldest first — the order the chat renders
+    in."""
     newest = db.scalars(
         select(ChatMessage)
-        .where(ChatMessage.teacher_id == teacher_id, ChatMessage.lesson_id == lesson_id)
+        .where(
+            ChatMessage.teacher_id == teacher_id,
+            ChatMessage.lesson_id == lesson_id,
+            ChatMessage.section == section,
+        )
         .order_by(ChatMessage.created_at.desc())
         .limit(limit)
     ).all()
     return list(reversed(newest))
 
 
-def clear_thread(db: Session, *, teacher_id: str, lesson_id: str) -> int:
+def clear_thread(
+    db: Session, *, teacher_id: str, lesson_id: str, section: str = ""
+) -> int:
+    """Wipe one class's thread. The other classes' conversations about the same
+    lesson are left alone — clearing 6A must not erase what was asked in 6B."""
     result = db.execute(
         delete(ChatMessage).where(
-            ChatMessage.teacher_id == teacher_id, ChatMessage.lesson_id == lesson_id
+            ChatMessage.teacher_id == teacher_id,
+            ChatMessage.lesson_id == lesson_id,
+            ChatMessage.section == section,
         )
     )
     db.commit()
@@ -95,19 +115,25 @@ def clear_thread(db: Session, *, teacher_id: str, lesson_id: str) -> int:
 
 
 def threads_for_teacher(db: Session, *, teacher_id: str) -> list[dict]:
-    """Which lessons this teacher has chats for, most recent first."""
+    """Which lessons and classes this teacher has chats for, most recent first."""
     rows = db.execute(
         select(
             ChatMessage.lesson_id,
+            ChatMessage.section,
             func.count(ChatMessage.id),
             func.max(ChatMessage.created_at),
         )
         .where(ChatMessage.teacher_id == teacher_id)
-        .group_by(ChatMessage.lesson_id)
+        .group_by(ChatMessage.lesson_id, ChatMessage.section)
     ).all()
     threads = [
-        {"lesson_id": lesson_id, "message_count": count, "last_message_at": last}
-        for lesson_id, count, last in rows
+        {
+            "lesson_id": lesson_id,
+            "section": section,
+            "message_count": count,
+            "last_message_at": last,
+        }
+        for lesson_id, section, count, last in rows
     ]
     threads.sort(key=lambda t: t["last_message_at"] or datetime.min, reverse=True)
     return threads

@@ -59,12 +59,21 @@ def _drain(response) -> str:
     return anyio.run(collect)
 
 
-def _say(db, teacher: User, lesson: Lesson, text: str, *, age_days: int = 0) -> None:
+def _say(
+    db,
+    teacher: User,
+    lesson: Lesson,
+    text: str,
+    *,
+    age_days: int = 0,
+    section: str = "",
+) -> None:
     db.add(
         ChatMessage(
             id=new_id("msg"),
             teacher_id=teacher.id,
             lesson_id=lesson.id,
+            section=section,
             role="user",
             content=text,
             created_at=datetime.now(timezone.utc) - timedelta(days=age_days),
@@ -197,3 +206,110 @@ def test_chat_is_not_in_the_database_backup(db):
     payload = json.loads(_json_snapshot_bytes())
     assert "chat_messages" not in payload["tables"]
     assert "should not be in the dump" not in _json_snapshot_bytes().decode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# One thread per class
+# --------------------------------------------------------------------------- #
+# A teacher who takes the same grade more than once teaches the same lesson in
+# each room and asks different things in each. Threads used to be keyed by
+# (teacher, lesson) alone, so opening a lesson for 6B replayed the conversation
+# from 6A.
+def test_each_class_has_its_own_thread_for_the_same_lesson(db):
+    teacher = _user(db, Role.teacher, "teacher")
+    teacher.sections = {"G6": ["A", "B"]}
+    lesson = _lesson(db, "Grade 6 python lesson 03", grade=6)
+    _say(db, teacher, lesson, "asked in 6A", section="A")
+    _say(db, teacher, lesson, "asked in 6B", section="B")
+
+    in_a = list_messages(
+        lesson_id=lesson.id, section="A", teacher_id=None, limit=50, db=db, current=teacher
+    )
+    in_b = list_messages(
+        lesson_id=lesson.id, section="B", teacher_id=None, limit=50, db=db, current=teacher
+    )
+
+    assert [m.content for m in in_a] == ["asked in 6A"]
+    assert [m.content for m in in_b] == ["asked in 6B"]
+
+
+def test_clearing_one_class_thread_leaves_the_others_standing(db):
+    teacher = _user(db, Role.teacher, "teacher")
+    teacher.sections = {"G6": ["A", "B"]}
+    lesson = _lesson(db, "Grade 6 python lesson 04", grade=6)
+    _say(db, teacher, lesson, "asked in 6A", section="A")
+    _say(db, teacher, lesson, "asked in 6B", section="B")
+
+    clear_messages(lesson_id=lesson.id, section="A", db=db, current=teacher)
+
+    assert (
+        list_messages(
+            lesson_id=lesson.id, section="A", teacher_id=None, limit=50, db=db,
+            current=teacher,
+        )
+        == []
+    )
+    assert (
+        len(
+            list_messages(
+                lesson_id=lesson.id, section="B", teacher_id=None, limit=50, db=db,
+                current=teacher,
+            )
+        )
+        == 1
+    )
+
+
+def test_a_single_class_teacher_keeps_one_thread_per_lesson(db):
+    """No section anywhere: the behaviour every teacher had before classes."""
+    teacher = _user(db, Role.teacher, "teacher")
+    lesson = _lesson(db, "Grade 7 python lesson 07", grade=7)
+    _say(db, teacher, lesson, "a question")
+
+    got = list_messages(lesson_id=lesson.id, teacher_id=None, limit=50, db=db, current=teacher)
+    assert [m.content for m in got] == ["a question"]
+    assert got[0].section == ""
+
+
+def test_threads_list_names_the_class(db):
+    teacher = _user(db, Role.teacher, "teacher")
+    teacher.sections = {"G6": ["A", "B"]}
+    lesson = _lesson(db, "Grade 6 python lesson 05", grade=6)
+    _say(db, teacher, lesson, "asked in 6A", section="A")
+    _say(db, teacher, lesson, "asked in 6B", section="B")
+    _say(db, teacher, lesson, "asked again in 6B", section="B")
+
+    threads = list_threads(teacher_id=None, db=db, current=teacher)
+    by_section = {t.section: t for t in threads if t.lesson_id == lesson.id}
+
+    # One lesson, two conversations — not one thread with three messages in it.
+    assert set(by_section) == {"A", "B"}
+    assert by_section["A"].message_count == 1
+    assert by_section["B"].message_count == 2
+
+
+def test_saving_an_exchange_files_it_under_the_class(db):
+    teacher = _user(db, Role.teacher, "teacher")
+    teacher.sections = {"G6": ["A", "B"]}
+    lesson = _lesson(db, "Grade 6 python lesson 06", grade=6)
+
+    save_exchange(
+        teacher_id=teacher.id,
+        lesson_id=lesson.id,
+        section="B",
+        question="what is a variable?",
+        answer="a named box",
+        source_ref=lesson.title,
+    )
+
+    in_b = list_messages(
+        lesson_id=lesson.id, section="B", teacher_id=None, limit=50, db=db, current=teacher
+    )
+    assert [m.content for m in in_b] == ["what is a variable?", "a named box"]
+    assert (
+        list_messages(
+            lesson_id=lesson.id, section="A", teacher_id=None, limit=50, db=db,
+            current=teacher,
+        )
+        == []
+    )

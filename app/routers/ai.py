@@ -43,6 +43,7 @@ from app.services.ai_usage import (
 )
 from app.services.chat_history import save_exchange
 from app.services.lesson_access import is_lesson_available
+from app.services.sections import resolve_section, sections_for
 from app.services.file_storage import resolve_stored_file
 from app.services.llm import ChatMessage, LLMError, get_provider
 from app.services.pdf_render import SlideRenderError, render_page_data_url
@@ -640,6 +641,18 @@ def chat_stream(
     teacher_id = current.id
     lesson_id = payload.lesson_id if bundle.grounded else None
     question = payload.message
+    # Which class this was asked in, so the thread comes back to the right room.
+    # An unrecognised class falls back to the teacher's first rather than
+    # failing: the answer is already being streamed, and losing the record of it
+    # would be a worse outcome than filing it one class over.
+    section = ""
+    if lesson_id is not None:
+        grade = db.scalar(select(Lesson.grade).where(Lesson.id == lesson_id))
+        if grade is not None:
+            section = (
+                resolve_section(current, grade, payload.section)
+                or sections_for(current, grade)[0]
+            )
 
     def event_stream():
         answer: list[str] = []
@@ -660,6 +673,7 @@ def chat_stream(
             save_exchange(
                 teacher_id=teacher_id,
                 lesson_id=lesson_id,
+                section=section,
                 question=question,
                 answer="".join(answer),
                 source_ref=bundle.source_ref,
