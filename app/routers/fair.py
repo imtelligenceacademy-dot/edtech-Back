@@ -6,10 +6,15 @@ what every read here is scoped by:
 
 - **super-admin** sees every school, and filters to one when working on it.
 - **school-admin** sees their own school only.
-- **teacher** sees their own school only, and only with `ict_fair_access`.
+- **teacher** sees their own school, and only the sections tagged with a grade
+  they actually teach.
 
 A project with no section has no school either, so it is shown to super-admins
 to be filed and to nobody else. Scoping fails closed rather than guessing.
+
+The rules themselves live in ``app.services.fair_access`` because the PDF route
+in ``files.py`` has to apply exactly the same ones — hiding a section from this
+list means nothing if the file behind it still opens.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from app.schemas.fair import (
     FairSectionOut,
     FairSectionUpdate,
 )
+from app.services.fair_access import can_see_fair, scope_sections, visible_sections
 from app.services.file_storage import resolve_stored_file, upload_root
 from app.utils import new_id
 
@@ -48,25 +54,6 @@ def _title_from_filename(filename: str) -> str:
     if base.lower().endswith(".pdf"):
         base = base[:-4]
     return base.strip() or "Untitled project"
-
-
-def _visible_school_id(current: User) -> str | None:
-    """The single school this user is confined to, or None for super-admins.
-
-    Returning the sentinel `""` would be clever and wrong; a teacher with no
-    school is handled by the callers, which show them nothing.
-    """
-    return None if current.role == Role.super_admin else current.school_id
-
-
-def _can_see_fair(current: User) -> bool:
-    if current.role == Role.teacher and not current.ict_fair_access:
-        return False
-    # Everyone below super-admin is pinned to a school. Without one there is no
-    # scope to apply, so there is nothing they may be shown.
-    if current.role != Role.super_admin and not current.school_id:
-        return False
-    return True
 
 
 def _serialize(section: FairSection, school_names: dict[str, str]) -> FairSectionOut:
@@ -96,19 +83,9 @@ def list_sections(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ) -> list[FairSectionOut]:
-    if not _can_see_fair(current):
+    sections = visible_sections(db, current, school_id)
+    if not sections:
         return []
-
-    scope = _visible_school_id(current)
-    # A super-admin may filter to one school; everyone else *is* filtered, and
-    # a school_id they do not own is ignored rather than honoured.
-    effective = scope if scope is not None else school_id
-
-    query = select(FairSection).options(selectinload(FairSection.projects))
-    if effective:
-        query = query.where(FairSection.school_id == effective)
-
-    sections = list(db.scalars(query.order_by(FairSection.title)))
     school_names = dict(db.execute(select(School.id, School.name)).all())
     return [_serialize(s, school_names) for s in sections]
 
@@ -225,16 +202,21 @@ def list_fair_projects(
 ) -> list[FairProject]:
     """Flat list of the projects this user may see, kept for the existing
     teacher screen. Scoped to their school through the section."""
-    if not _can_see_fair(current):
+    if not can_see_fair(current):
         return []
 
-    query = select(FairProject).order_by(FairProject.created_at.desc())
-    scope = _visible_school_id(current)
-    if scope is not None:
-        query = query.join(FairSection, FairProject.section_id == FairSection.id).where(
-            FairSection.school_id == scope
+    # Filed under a section this user may see — which for a teacher means one of
+    # their own grades, not merely one of their school's.
+    visible_ids = {section.id for section in visible_sections(db, current)}
+    if not visible_ids:
+        return []
+    return list(
+        db.scalars(
+            select(FairProject)
+            .where(FairProject.section_id.in_(visible_ids))
+            .order_by(FairProject.created_at.desc())
         )
-    return list(db.scalars(query))
+    )
 
 
 @router.post("", response_model=FairProjectOut, status_code=status.HTTP_201_CREATED)

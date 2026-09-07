@@ -169,7 +169,7 @@ def test_school_filter_cannot_be_used_to_escape_your_own_school(db):
     _section(db, mine, "Mine section", ["G7"])
     _section(db, theirs, "Their section", ["G7"])
 
-    teacher = _user(db, Role.teacher, mine, fair_access=True)
+    teacher = _user(db, Role.teacher, mine, fair_access=True, grades=["G7"])
 
     sections = list_sections(school_id=theirs.id, db=db, current=teacher)
 
@@ -287,7 +287,7 @@ def test_filing_an_unfiled_project_gives_it_a_school(db):
     section = _section(db, school, "Destination", ["G6"])
     project = _project(db, "Loose", None)
     owner = _user(db, Role.super_admin)
-    teacher = _user(db, Role.teacher, school, fair_access=True)
+    teacher = _user(db, Role.teacher, school, fair_access=True, grades=["G6"])
 
     assert list_fair_projects(db=db, current=teacher) == []
 

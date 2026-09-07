@@ -42,6 +42,7 @@ from app.schemas.file import (
 from app.services.auto_assign import assign_uploaded_file, preview_uploads
 from app.services.backup import build_files_archive, files_archive_filename
 from app.services.file_storage import resolve_stored_file, upload_root
+from app.services.fair_access import can_open_fair_file
 from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
 
@@ -344,10 +345,17 @@ def download_selection(
 def _can_access(db: Session, user: User, uploaded: UploadedFile) -> bool:
     if user.role == Role.super_admin:
         return True
-    # ICT Fair PDFs open for teachers who have been granted fair access.
+    # ICT Fair PDFs open for teachers who have been granted fair access — and
+    # only for the school and grades that teacher actually takes. Scoping the
+    # section list without scoping this would hide a project from the screen and
+    # still serve it to anyone holding its id.
     fair_file = db.scalar(select(FairProject.id).where(FairProject.file_id == uploaded.id))
     if fair_file is not None:
-        return user.role == Role.teacher and bool(user.ict_fair_access)
+        # Only teachers have ever opened fair PDFs here; a school-admin
+        # administers the fair rather than presents it. Left as it was.
+        if user.role != Role.teacher:
+            return False
+        return can_open_fair_file(db, user, uploaded.id)
     if uploaded.linked_lesson_id is None:
         return False
     lesson = db.get(Lesson, uploaded.linked_lesson_id)
