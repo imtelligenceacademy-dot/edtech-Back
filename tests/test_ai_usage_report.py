@@ -17,7 +17,7 @@ from fastapi import HTTPException
 from app.models import AiUsage, School, User
 from app.models.enums import Role, UserStatus
 from app.routers.ai import usage_by_teacher
-from app.services.ai_usage import teacher_usage_report
+from app.services.ai_usage import _report_tz, teacher_usage_report
 from app.utils import new_id
 
 
@@ -42,6 +42,19 @@ def _school(db, name: str) -> School:
     db.add(school)
     db.commit()
     return school
+
+
+def _usage_at_midday(db, user: User, *, days_ago: int, kind: str = "teacher") -> AiUsage:
+    """A usage row at midday, `days_ago` days back in the report's timezone.
+
+    Midday, so the row cannot drift into the neighbouring calendar day whatever
+    time the suite happens to run at.
+    """
+    tz, _ = _report_tz()
+    local = (datetime.now(tz) - timedelta(days=days_ago)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
+    return _usage(db, user, datetime.now(timezone.utc) - local.astimezone(timezone.utc), kind)
 
 
 def _usage(db, user: User, ago: timedelta, kind: str = "teacher") -> AiUsage:
@@ -119,10 +132,16 @@ def test_first_and_last_use_are_the_real_timestamps(db):
 def test_active_days_counts_days_not_interactions(db):
     teacher = _user(db, Role.teacher, "Bursty")
     # Four questions across two days is two active days, not four.
-    _usage(db, teacher, timedelta(hours=1))
-    _usage(db, teacher, timedelta(hours=2))
-    _usage(db, teacher, timedelta(days=2, hours=1))
-    _usage(db, teacher, timedelta(days=2, hours=3))
+    #
+    # Pinned to midday in the report's own timezone rather than "now minus a few
+    # hours": the report buckets by local calendar day, so subtracting three
+    # hours from a run that starts near midnight lands the four rows on four
+    # different days and the assertion below fails for reasons that have nothing
+    # to do with what it is testing.
+    _usage_at_midday(db, teacher, days_ago=1)
+    _usage_at_midday(db, teacher, days_ago=1)
+    _usage_at_midday(db, teacher, days_ago=3)
+    _usage_at_midday(db, teacher, days_ago=3)
 
     row = _row_for(teacher_usage_report(db), teacher)
 
