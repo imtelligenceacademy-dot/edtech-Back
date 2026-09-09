@@ -177,8 +177,21 @@ def _policy(
     return "\n\n".join(part for part in parts if part)
 
 
-_NO_LESSON = """You are IM-Telligence, a classroom robotics teaching assistant. No lesson or ICT Fair project is open right now, so you cannot help yet. Reply with exactly this sentence and nothing else:
-"Open one of your lessons or an ICT Fair project first, then I can help you with it.\""""
+# Said directly to the teacher rather than asked of a model: the answer is
+# fixed, so routing it through a provider only made it slower, cost a question
+# from her hourly allowance, and turned a clear instruction into "the AI
+# assistant is unavailable" whenever the provider was having a bad minute.
+_NO_LESSON_OPEN = (
+    "Open one of your lessons or an ICT Fair project first, then I can help you "
+    "with it — I answer from the lesson in front of you, so I need to know which "
+    "one you are teaching."
+)
+
+_LESSON_NOT_OPEN_TO_YOU = (
+    "That lesson isn't open to you right now, so I can't answer from it. Finish "
+    "the lesson you are on, or use “Request access” beside it to ask your "
+    "admin to unlock it."
+)
 
 
 def _accessible_lesson(db: Session, teacher: User, lesson_id: str) -> Lesson | None:
@@ -217,6 +230,13 @@ class PromptBundle:
     source_ref: str | None
     image_data_url: str | None = None
     grounded: bool = False
+    # Set when the question cannot be answered for a reason we already know:
+    # nothing is open, or the lesson named is not this teacher's to open yet.
+    # It is sent as the reply verbatim — no provider call, and no question
+    # deducted from the teacher's allowance, because nothing was asked of a
+    # model. Telling her to open a lesson should never depend on OpenAI being
+    # reachable, and should never read as "the assistant is broken".
+    refusal: str | None = None
     # Rebuilds the prompt for a model that cannot see, routing the slide through
     # the Gemini reader instead of attaching it. Set only when an image was
     # attached; called only if that provider drops out.
@@ -305,9 +325,20 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
     messages.append({"role": "user", "content": payload.message})
 
     # Nothing open (or not accessible to this teacher) - refuse before doing any
-    # rendering or provider work.
+    # rendering or provider work. The two cases read very differently to a
+    # teacher: one means "pick a lesson", the other means "that one is locked",
+    # and answering both with the same sentence sent her looking in the wrong
+    # place.
     if lesson is None and project is None:
-        return PromptBundle(system=_NO_LESSON, messages=messages, source_ref=None)
+        asked_for_one = bool(payload.lesson_id or payload.fair_project_id)
+        return PromptBundle(
+            system="",
+            messages=messages,
+            source_ref=None,
+            refusal=(
+                _LESSON_NOT_OPEN_TO_YOU if asked_for_one else _NO_LESSON_OPEN
+            ),
+        )
 
     image_data_url, attempted = _slide_image(
         db, lesson=lesson, project=project, current_slide=payload.current_slide
@@ -591,6 +622,10 @@ def chat(
     current: User = Depends(require_capability("use-ai-assistant")),
 ) -> AIChatResponse:
     bundle = _build_prompt(db, current, payload)
+    if bundle.refusal:
+        return AIChatResponse(
+            content=bundle.refusal, source_ref=None, provider="none"
+        )
     try:
         enforce_ai_limit(db, current, "teacher")
     except AILimitExceeded as exc:
@@ -623,6 +658,22 @@ def chat_stream(
     # Everything DB-bound (and the slide image) is resolved before the generator
     # runs, because the session is closed by the time streaming starts.
     bundle = _build_prompt(db, current, payload)
+
+    # A refusal we already know the answer to: send it as the reply and stop.
+    # No provider, no quota, and no way for it to surface as "unavailable".
+    if bundle.refusal:
+        refusal = bundle.refusal
+
+        def refusal_stream():
+            yield f"data: {json.dumps({'delta': refusal})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+        return StreamingResponse(
+            refusal_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     try:
         enforce_ai_limit(db, current, "teacher")
     except AILimitExceeded as exc:
