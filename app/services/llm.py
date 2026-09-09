@@ -46,6 +46,19 @@ def _raise_for_status(status_code: int) -> None:
         raise LLMError("unavailable", f"provider returned {status_code}")
 
 
+def _transport_error(exc: Exception) -> LLMError:
+    """A transport failure as one of our own kinds.
+
+    Every provider call is wrapped in this. The chain falls through on LLMError
+    and nothing else, so a provider that lets an httpx exception escape takes
+    the whole request down with it and no fallback is ever tried — which is
+    exactly what used to happen on the text path.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return LLMError("timeout", "provider timed out")
+    return LLMError("unavailable", "provider connection failed")
+
+
 class LLMProvider(Protocol):
     name: str
     model: str | None
@@ -193,16 +206,33 @@ class OpenAICompatProvider:
         }
 
     def chat(self, system: str, messages: list[ChatMessage]) -> str:
-        resp = httpx.post(
-            f"{self._base_url}/chat/completions",
-            headers={"Authorization": f"Bearer {self._api_key}"},
-            json=self._payload(system, messages, stream=False),
-            timeout=settings.ai_timeout_seconds,
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        try:
+            resp = httpx.post(
+                f"{self._base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=self._payload(system, messages, stream=False),
+                timeout=settings.ai_timeout_seconds,
+            )
+            _raise_for_status(resp.status_code)
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except LLMError:
+            raise
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc) from exc
+        except (KeyError, IndexError, ValueError) as exc:
+            raise LLMError("unavailable", "provider sent an unreadable reply") from exc
 
     def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+        try:
+            yield from self._stream_completions(system, messages)
+        except LLMError:
+            raise
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc) from exc
+
+    def _stream_completions(
+        self, system: str, messages: list[ChatMessage]
+    ) -> Iterator[str]:
         with httpx.stream(
             "POST",
             f"{self._base_url}/chat/completions",
@@ -210,7 +240,7 @@ class OpenAICompatProvider:
             json=self._payload(system, messages, stream=True),
             timeout=settings.ai_timeout_seconds,
         ) as resp:
-            resp.raise_for_status()
+            _raise_for_status(resp.status_code)
             for line in resp.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue
@@ -244,21 +274,40 @@ class AnthropicProvider:
         }
 
     def chat(self, system: str, messages: list[ChatMessage]) -> str:
-        resp = httpx.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=self._headers(),
-            json={
-                "model": self.model,
-                "max_tokens": 1024,
-                "system": system,
-                "messages": messages,
-            },
-            timeout=settings.ai_timeout_seconds,
-        )
-        resp.raise_for_status()
-        return "".join(block.get("text", "") for block in resp.json()["content"]).strip()
+        try:
+            resp = httpx.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=self._headers(),
+                json={
+                    "model": self.model,
+                    "max_tokens": 1024,
+                    "system": system,
+                    "messages": messages,
+                },
+                timeout=settings.ai_timeout_seconds,
+            )
+            _raise_for_status(resp.status_code)
+            return "".join(
+                block.get("text", "") for block in resp.json()["content"]
+            ).strip()
+        except LLMError:
+            raise
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc) from exc
+        except (KeyError, IndexError, ValueError) as exc:
+            raise LLMError("unavailable", "provider sent an unreadable reply") from exc
 
     def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+        try:
+            yield from self._stream_messages(system, messages)
+        except LLMError:
+            raise
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc) from exc
+
+    def _stream_messages(
+        self, system: str, messages: list[ChatMessage]
+    ) -> Iterator[str]:
         with httpx.stream(
             "POST",
             "https://api.anthropic.com/v1/messages",
@@ -272,7 +321,7 @@ class AnthropicProvider:
             },
             timeout=settings.ai_timeout_seconds,
         ) as resp:
-            resp.raise_for_status()
+            _raise_for_status(resp.status_code)
             for line in resp.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue
