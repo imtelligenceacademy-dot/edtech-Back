@@ -73,7 +73,7 @@ def build_school_context(db: Session, admin: User) -> tuple[str, str]:
         f"SUMMARY: {len(active)} active teachers, {len(pending)} pending. "
         f"{stats.assigned} lessons assigned, {stats.started} started, "
         f"{stats.completed} completed ({stats.completion_rate}%), "
-        f"{stats.not_started} never opened, {stats.late} late."
+        f"{stats.not_started} never opened."
         + (
             f" Average progress across the lessons actually begun: "
             f"{stats.avg_of_started}%."

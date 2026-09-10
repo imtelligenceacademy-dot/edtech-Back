@@ -531,9 +531,15 @@ def my_quota(
 @router.get("/usage", response_model=AIUsageStats)
 def usage(
     db: Session = Depends(get_db),
-    current: User = Depends(require_roles(Role.super_admin, Role.school_admin)),
+    current: User = Depends(require_roles(Role.super_admin)),
 ) -> AIUsageStats:
-    # Super-admins see every school; school-admins only their own (scoped in the service).
+    """How much the assistant is being used, across every school.
+
+    Super-admin only. A school admin used to see their own school's figures, and
+    it read as monitoring their teachers rather than supporting them — how many
+    questions someone asked is not a performance measure and is not theirs to
+    act on.
+    """
     return AIUsageStats(**usage_stats(db, current))
 
 

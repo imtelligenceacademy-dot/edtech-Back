@@ -21,12 +21,18 @@ router = APIRouter(prefix="/api/progress", tags=["progress"])
 def _compute_watchdog(
     percent: int, due: date | None, last_opened: datetime | None
 ) -> tuple[WatchdogStatus, str | None]:
+    """Where a lesson stands: never opened, in progress, or finished.
+
+    Nothing is ever "late". A teacher works through the curriculum at the pace
+    their classes allow, and a lesson they have not reached yet is not a failing
+    — calling it one put a red mark against teachers who were simply where they
+    were. The due date is left on the lesson for whoever wants to sort by it,
+    but it no longer produces a verdict.
+    """
     if percent >= 100:
         return WatchdogStatus.completed, None
     if last_opened is None and percent == 0:
         return WatchdogStatus.not_opened, "Not opened yet"
-    if due is not None and due < date.today():
-        return WatchdogStatus.late, f"Overdue (due {due.isoformat()}), {percent}% done"
     return WatchdogStatus.on_track, f"In progress — {percent}%"
 
 

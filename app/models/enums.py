@@ -26,16 +26,17 @@ class UserStatus(str, enum.Enum):
     rejected = "rejected"
 
 
+# Nothing here is "late". A lesson a teacher has not reached is where they
+# are, not a failing, and the value it replaced is cleared by the
+# d8b21c60fa73 migration.
 class LessonStatus(str, enum.Enum):
     not_started = "not-started"
     in_progress = "in-progress"
     completed = "completed"
-    late = "late"
 
 
 class WatchdogStatus(str, enum.Enum):
     on_track = "on-track"
-    late = "late"
     not_opened = "not-opened"
     completed = "completed"
     needs_attention = "needs-attention"
@@ -79,6 +80,10 @@ class SecurityEvent(str, enum.Enum):
     # one for them, and that silently ends every session the teacher had open.
     password_reset = "password-reset"
     signed_out_all = "signed-out-all"
+    # A super-admin clearing what a teacher had recorded as done. Destructive
+    # and not reconstructable, so it is written down with who did it and how
+    # much it covered.
+    progress_reset = "progress-reset"
 
 
 class SecurityStatus(str, enum.Enum):

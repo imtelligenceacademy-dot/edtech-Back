@@ -12,11 +12,10 @@ from sqlalchemy.orm import Session
 
 from app.models import AiUsage, Lesson, Progress, School, User
 from app.models.enums import LessonStatus, Role, UserStatus
-from app.services.ai_usage import (
-    usage_breakdown_for_school,
-    usage_by_user,
-    usage_total_for_school,
-)
+# Only the platform report reports AI usage. A school admin does not see how
+# many questions their teachers asked: it reads as monitoring rather than
+# support, and it is not theirs to act on.
+from app.services.ai_usage import usage_total_for_school
 from app.services.report_metrics import (
     QUIET_AFTER_DAYS,
     movement,
@@ -119,8 +118,6 @@ def _school_sections(
         else {}
     )
 
-    usage = usage_by_user(db, tids)
-    ai = usage_breakdown_for_school(db, school.id)
 
     stats = progress_stats(progress)
     moved = movement(db, tids, school_id=school.id)
@@ -134,7 +131,7 @@ def _school_sections(
     _heading(doc, "Summary")
     _table(
         doc,
-        ["Active teachers", "Assigned", "Started", "Completed", "Not opened", "Late"],
+        ["Active teachers", "Assigned", "Started", "Completed", "Not opened"],
         [
             [
                 str(active),
@@ -142,7 +139,6 @@ def _school_sections(
                 str(stats.started),
                 str(stats.completed),
                 str(stats.not_started),
-                str(stats.late),
             ]
         ],
     )
@@ -182,54 +178,29 @@ def _school_sections(
     _heading(doc, "Teachers")
     _table(
         doc,
-        ["Name", "Grades", "Language", "Status", "AI questions"],
+        ["Name", "Grades", "Language", "Status"],
         [
             [
                 t.name,
                 ", ".join(t.grades or []) or "—",
                 (t.language or "—"),
                 t.status.value,
-                str(usage.get(t.id, {}).get("total", 0)),
             ]
             for t in teachers
         ],
     )
 
-    _heading(doc, "AI assistant usage")
-    _meta_line(doc, "Teacher questions to the lesson assistant — last 7 days and all time.")
-    _meta_line(
-        doc,
-        f"School total {ai['total']}: {ai['teacher']} from teachers (below) + "
-        f"{ai['admin']} from the school admin's operations assistant.",
-    )
-    _table(
-        doc,
-        ["Teacher", "Last 7 days", "Total questions"],
-        [
-            [
-                t.name,
-                str(usage.get(t.id, {}).get("last7", 0)),
-                str(usage.get(t.id, {}).get("total", 0)),
-            ]
-            for t in sorted(
-                teachers,
-                key=lambda t: usage.get(t.id, {}).get("total", 0),
-                reverse=True,
-            )
-        ],
-    )
-
     if include_detail:
-        # Late and unfinished work first — the top of the table is the part
-        # anybody reads.
+        # Unfinished work first — the top of the table is the part anybody reads.
+        # In progress before not-started, because a lesson somebody is partway
+        # through is the one a conversation is most likely to be about.
         def _urgency(p: Progress) -> tuple[int, str, str]:
             rank = {
-                LessonStatus.late: 0,
-                LessonStatus.in_progress: 1,
-                LessonStatus.not_started: 2,
-                LessonStatus.completed: 3,
+                LessonStatus.in_progress: 0,
+                LessonStatus.not_started: 1,
+                LessonStatus.completed: 2,
             }
-            return (rank.get(p.status, 4), name_by_id.get(p.teacher_id, ""), p.section)
+            return (rank.get(p.status, 3), name_by_id.get(p.teacher_id, ""), p.section)
 
         # A teacher who takes the same grade more than once has one row per
         # class, so the class has to be named or the table reads as duplicates
@@ -240,7 +211,7 @@ def _school_sections(
         _heading(doc, "Teacher progress")
         _meta_line(
             doc,
-            "Late and in-progress lessons first."
+            "Unfinished lessons first."
             + (" One row per class." if sectioned else ""),
         )
         _table(
@@ -378,7 +349,6 @@ def _platform_body(db: Session, doc: Document) -> None:
             "Started",
             "Completed",
             "Not opened",
-            "Late",
             "Alerts (30d)",
             "AI questions (all time)",
         ],
@@ -387,7 +357,6 @@ def _platform_body(db: Session, doc: Document) -> None:
                 str(stats.started),
                 str(stats.completed),
                 str(stats.not_started),
-                str(stats.late),
                 str(alerts_recent),
                 str(ai_total),
             ]
@@ -420,13 +389,12 @@ def _platform_body(db: Session, doc: Document) -> None:
                 str(s_stats.assigned),
                 str(s_stats.completed),
                 f"{s_stats.completion_rate}%",
-                str(s_stats.late),
                 str(usage_total_for_school(db, s.id)),
             ]
         )
     _table(
         doc,
-        ["School", "City", "Teachers", "Assigned", "Done", "Rate", "Late", "AI"],
+        ["School", "City", "Teachers", "Assigned", "Done", "Rate", "AI"],
         rows,
     )
 

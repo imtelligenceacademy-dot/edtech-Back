@@ -51,10 +51,9 @@ def _aware(value: datetime | None) -> datetime | None:
 @dataclass
 class ProgressStats:
     assigned: int = 0
-    started: int = 0          # opened at least once (in-progress, late, or done)
+    started: int = 0          # opened at least once (in progress or done)
     completed: int = 0
     not_started: int = 0
-    late: int = 0
     # Share of everything assigned that is finished.
     completion_rate: int = 0
     # Mean percent across the lessons that were actually begun. Reported only
@@ -88,14 +87,12 @@ def progress_stats(rows: list[Progress]) -> ProgressStats:
     completed = [p for p in rows if p.status == LessonStatus.completed]
     not_started = [p for p in rows if p.status == LessonStatus.not_started]
     started = [p for p in rows if p.status != LessonStatus.not_started]
-    late = [p for p in rows if p.status == LessonStatus.late or p.watchdog.value == "late"]
 
     return ProgressStats(
         assigned=len(rows),
         started=len(started),
         completed=len(completed),
         not_started=len(not_started),
-        late=len(late),
         completion_rate=round(100 * len(completed) / len(rows)),
         avg_of_started=(
             round(sum(p.percent_complete for p in started) / len(started)) if started else None

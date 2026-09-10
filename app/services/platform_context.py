@@ -52,8 +52,7 @@ def build_platform_context(db: Session) -> str:
         f"PLATFORM SUMMARY: {len(schools)} schools, {len(teachers)} teachers, "
         f"{lesson_count} lessons in the curriculum. {stats.assigned} lessons assigned, "
         f"{stats.started} started, {stats.completed} completed "
-        f"({stats.completion_rate}%), {stats.not_started} never opened, "
-        f"{stats.late} late.",
+        f"({stats.completion_rate}%), {stats.not_started} never opened.",
         "",
         "THIS WEEK vs LAST WEEK (platform-wide):",
     ]
@@ -69,7 +68,7 @@ def build_platform_context(db: Session) -> str:
             f"- {school.name} ({school.city or '—'}, {school.country or '—'}) | "
             f"{active} active teachers | {s_stats.assigned} assigned | "
             f"{s_stats.started} started | {s_stats.completed} completed | "
-            f"{s_stats.completion_rate}% | {s_stats.late} late | "
+            f"{s_stats.completion_rate}% | "
             f"{usage_total_for_school(db, school.id)} AI questions all time | "
             f"{s_moved.completed.this_week} completed this week vs "
             f"{s_moved.completed.prior_week} last week"
