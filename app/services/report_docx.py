@@ -28,13 +28,28 @@ BRAND = RGBColor(0x0F, 0x76, 0x6E)  # teal-700
 MUTED = RGBColor(0x64, 0x74, 0x8B)  # slate-500
 
 
-def _heading(doc: Document, text: str, size: int = 14) -> None:
-    p = doc.add_paragraph()
+def _heading(doc: Document, text: str, size: int = 14, level: int = 1) -> None:
+    """A section title, styled by hand but carrying a real Word heading style.
+
+    The style is what puts it in Word's navigation pane, which is how somebody
+    reads a report of this length: a school with nine grades produces a progress
+    table hundreds of rows long, and scrolling for Grade 4 is not reading. The
+    run formatting is set afterwards so the document still looks the way it did
+    rather than adopting Word's own blue Calibri headings.
+    """
+    p = doc.add_paragraph(style=f"Heading {level}")
     p.space_before = Pt(6)
     run = p.add_run(text)
     run.bold = True
     run.font.size = Pt(size)
     run.font.color.rgb = BRAND
+
+
+def _grade_title(grade: int) -> str:
+    """The grade as a school says it. 0 is the fallback for a progress row whose
+    lesson has since been deleted — it still belongs somewhere in the table
+    rather than vanishing from a count the reader is checking."""
+    return f"Grade {grade}" if grade else "Ungraded"
 
 
 def _meta_line(doc: Document, text: str) -> None:
@@ -112,11 +127,11 @@ def _school_sections(
         list(db.scalars(select(Progress).where(Progress.teacher_id.in_(tids)))) if tids else []
     )
     lesson_ids = {p.lesson_id for p in progress}
-    lessons = (
-        {l.id: l.title for l in db.scalars(select(Lesson).where(Lesson.id.in_(lesson_ids)))}
-        if lesson_ids
-        else {}
+    lesson_rows = (
+        list(db.scalars(select(Lesson).where(Lesson.id.in_(lesson_ids)))) if lesson_ids else []
     )
+    lessons = {l.id: l.title for l in lesson_rows}
+    grade_of = {l.id: l.grade for l in lesson_rows}
 
 
     stats = progress_stats(progress)
@@ -211,26 +226,49 @@ def _school_sections(
         _heading(doc, "Teacher progress")
         _meta_line(
             doc,
-            "Unfinished lessons first."
-            + (" One row per class." if sectioned else ""),
+            "One grade at a time, unfinished lessons first."
+            + (" One row per class." if sectioned else "")
+            + " Open the navigation pane in Word to jump between grades.",
         )
-        _table(
-            doc,
-            ["Teacher"]
-            + (["Class"] if sectioned else [])
-            + ["Lesson", "Status", "%", "Watchdog"],
-            [
-                [name_by_id.get(p.teacher_id, p.teacher_id)]
-                + ([p.section or "—"] if sectioned else [])
-                + [
-                    lessons.get(p.lesson_id, p.lesson_id),
-                    p.status.value,
-                    str(p.percent_complete),
-                    p.watchdog.value,
-                ]
-                for p in sorted(progress, key=_urgency)
-            ],
-        )
+
+        # Split by grade rather than running one long table. A school with nine
+        # grades produces hundreds of rows, and an admin looking at Grade 4 was
+        # scrolling past every other grade to find where it started — the rows
+        # were ordered by urgency, so a grade was not even contiguous.
+        by_grade: dict[int, list[Progress]] = {}
+        for row in progress:
+            by_grade.setdefault(grade_of.get(row.lesson_id, 0), []).append(row)
+
+        for grade in sorted(by_grade):
+            rows = by_grade[grade]
+            done = sum(1 for r in rows if r.status == LessonStatus.completed)
+            _heading(doc, _grade_title(grade), size=12, level=2)
+            _meta_line(
+                doc,
+                f"{done} of {len(rows)} complete"
+                + (
+                    f" · {len({r.teacher_id for r in rows})} teachers"
+                    if len({r.teacher_id for r in rows}) > 1
+                    else ""
+                ),
+            )
+            _table(
+                doc,
+                ["Teacher"]
+                + (["Class"] if sectioned else [])
+                + ["Lesson", "Status", "%", "Watchdog"],
+                [
+                    [name_by_id.get(p.teacher_id, p.teacher_id)]
+                    + ([p.section or "—"] if sectioned else [])
+                    + [
+                        lessons.get(p.lesson_id, p.lesson_id),
+                        p.status.value,
+                        str(p.percent_complete),
+                        p.watchdog.value,
+                    ]
+                    for p in sorted(rows, key=_urgency)
+                ],
+            )
 
     if include_security:
         # Only what went wrong, grouped. Fifty lines of ordinary logins used to

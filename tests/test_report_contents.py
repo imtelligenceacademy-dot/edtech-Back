@@ -17,6 +17,7 @@ import io
 import re
 import zipfile
 
+import docx
 import pytest
 
 from app.models import Lesson, LessonAssignment, Progress, School, User
@@ -47,23 +48,24 @@ def school_with_work(db):
     teacher = User(
         id=new_id("u"), name="Teacher", email=f"{new_id('t')}@x.com", password_hash="x",
         role=Role.teacher, status=UserStatus.active, school_id=school.id,
-        grades=["G6"], sections={"G6": ["A", "B"]}, language="en",
+        grades=["G6", "G7"], sections={"G6": ["A", "B"]}, language="en",
     )
     db.add_all([admin, teacher])
     db.flush()
 
     lessons = []
-    for n in (1, 2):
-        lesson = Lesson(
-            id=new_id("les"), title=f"Grade 6 python lesson 0{n}", grade=6,
-            subject="STEAM", language="en", year=2, course="python", lesson_no=n,
-        )
-        db.add(lesson)
-        db.flush()
-        db.add(LessonAssignment(
-            id=new_id("la"), lesson_id=lesson.id, teacher_id=teacher.id, source="rule"
-        ))
-        lessons.append(lesson)
+    for grade in (6, 7):
+        for n in (1, 2):
+            lesson = Lesson(
+                id=new_id("les"), title=f"Grade {grade} python lesson 0{n}", grade=grade,
+                subject="STEAM", language="en", year=2, course="python", lesson_no=n,
+            )
+            db.add(lesson)
+            db.flush()
+            db.add(LessonAssignment(
+                id=new_id("la"), lesson_id=lesson.id, teacher_id=teacher.id, source="rule"
+            ))
+            lessons.append(lesson)
     ensure_progress_for_lessons(db, teacher, lessons)
     db.flush()
 
@@ -118,3 +120,42 @@ def test_the_platform_report_still_shows_ai_usage(school_with_work, db):
     """The platform owner pays for it and decides about it, so they still see
     it. Removing it from the school report was about who it is shown to."""
     assert "AI questions" in _text(build_super_ai_report(db, "Owner", "N.")[0])
+
+
+# --------------------------------------------------------------------------- #
+# Finding your way around it
+# --------------------------------------------------------------------------- #
+def _outline(buf: io.BytesIO) -> list[tuple[str, str]]:
+    """The headings Word will show in its navigation pane."""
+    document = docx.Document(io.BytesIO(buf.getvalue()))
+    return [
+        (p.style.name, p.text.strip())
+        for p in document.paragraphs
+        if p.style.name.startswith("Heading") and p.text.strip()
+    ]
+
+
+def test_the_progress_table_is_split_by_grade(school_with_work, db):
+    """One table per grade instead of one long one. A school with nine grades
+    produced hundreds of rows ordered by urgency, so a grade was not even
+    contiguous and finding Grade 4 meant reading the whole thing."""
+    buf, _ = build_school_ai_report(
+        db, school_with_work["school"].id, school_with_work["admin"].name, "N."
+    )
+
+    grades = [text for style, text in _outline(buf) if text.startswith("Grade ")]
+    assert grades == ["Grade 6", "Grade 7"], "in curriculum order, one each"
+
+
+def test_headings_carry_a_real_word_style(school_with_work, db):
+    """The style is what puts them in the navigation pane. Styled-by-hand bold
+    text looks the same and cannot be jumped to, which is what they were."""
+    buf, _ = build_school_ai_report(
+        db, school_with_work["school"].id, school_with_work["admin"].name, "N."
+    )
+    outline = _outline(buf)
+
+    assert ("Heading 1", "Teacher progress") in outline
+    # Grades nest under it, so the pane shows a tree rather than a flat list.
+    assert ("Heading 2", "Grade 6") in outline
+    assert ("Heading 2", "Grade 7") in outline

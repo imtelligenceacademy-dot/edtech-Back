@@ -860,7 +860,13 @@ _REPORT_SYSTEM = (
     "You are IM-Telligence, writing the opening page of a school's report for its "
     "principal. Use ONLY the SCHOOL DATA provided.\n"
     "Structure it with these markdown headings, in this order:\n"
-    "## What needs attention\n## What moved this week\n## Recommended next steps\n"
+    "## What needs attention\n## What moved this week\n"
+    # No "recommended next steps". Asked to advise from figures alone, the
+    # model produced the same staffroom generalities every week — follow up
+    # with the quiet teachers, keep the momentum going — sitting under two
+    # sections that were actually about this school. What needs attention
+    # already names the teacher and the number behind it, and a principal is
+    # far better placed than the model to decide what to do about it.
     f"{_REPORT_RULES}"
 )
 
