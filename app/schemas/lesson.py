@@ -172,6 +172,29 @@ class TeacherAccessOut(CamelModel):
     tracks: list[TeacherAccessTrack] = Field(default_factory=list)
 
 
+class ProgressResetRequest(CamelModel):
+    """Which of a teacher's records to put back to never-opened.
+
+    Both fields narrow the scope, and omitting one widens it: no lesson means
+    every lesson, no class means every class. The wide case is the one a school
+    needs after training on the platform, when the whole curriculum is sitting
+    there marked as taught.
+    """
+
+    lesson_id: str | None = None
+    section: str | None = None
+
+
+class ProgressResetResult(CamelModel):
+    """What the reset cleared, counted after the fact."""
+
+    lessons: int = 0
+    completed_cleared: int = 0
+    started_cleared: int = 0
+    overrides_cleared: int = 0
+    classes: int = 0
+
+
 class OverrideRequest(CamelModel):
     unlocked: bool
     # Which class to unlock the lesson for. Omitted means the teacher's first

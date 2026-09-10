@@ -8,7 +8,7 @@ Scoping:
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from app.database import get_db
 from app.deps import assert_school_scope, get_current_user, require_capability, require_roles
 from app.models import AccessRequest, Lesson, LessonAssignment, Progress, Slide, UploadedFile, User
-from app.models.enums import LessonStatus, Role, UserStatus
+from app.models.enums import LessonStatus, Role, SecurityEvent, SecurityStatus, UserStatus
 from app.services.file_storage import resolve_stored_file
 from app.schemas.lesson import (
     AssignmentRequest,
@@ -29,6 +29,8 @@ from app.schemas.lesson import (
     LessonCreate,
     LessonOut,
     OverrideRequest,
+    ProgressResetRequest,
+    ProgressResetResult,
     SlideOut,
     TeacherAccessOut,
     TeacherAccessTrack,
@@ -41,6 +43,8 @@ from app.services.lesson_access import (
     lesson_order_key,
     section_access,
 )
+from app.audit import record_event
+from app.services.progress_reset import reset_progress
 from app.services.sections import (
     all_sections,
     ensure_progress_rows,
@@ -48,7 +52,7 @@ from app.services.sections import (
     resolve_section,
     sections_for,
 )
-from app.utils import new_id
+from app.utils import client_ip, new_id, user_agent
 
 router = APIRouter(prefix="/api/lessons", tags=["lessons"])
 
@@ -759,6 +763,78 @@ def set_lesson_override(
         percent_complete=progress.percent_complete,
         completed_at=progress.completed_at,
         unlocked_override=progress.unlocked_override,
+    )
+
+
+@router.post("/access/{teacher_id}/reset", response_model=ProgressResetResult)
+def reset_teacher_progress(
+    teacher_id: str,
+    payload: ProgressResetRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_roles(Role.super_admin)),
+) -> ProgressResetResult:
+    """Put a teacher's recorded progress back to never-opened.
+
+    The unlock override reopens a finished lesson while still recording it as
+    finished. This is the other thing an admin needs: after a school trains its
+    teachers on real lessons, or after somebody marks one complete by mistake,
+    the record has to say it did not happen.
+
+    Scope comes from the payload — one lesson or all, one class or all. Nothing
+    else about the teacher is touched: their assignments stay, so they keep the
+    lessons they had, and their conversations stay, because those are their own
+    notes rather than a record of progress.
+    """
+    teacher = db.get(User, teacher_id)
+    if teacher is None or teacher.role != Role.teacher:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Teacher not found")
+
+    if payload.lesson_id is not None and db.get(Lesson, payload.lesson_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found")
+
+    if payload.section is not None:
+        allowed = {s for token in (teacher.grades or []) for s in sections_for(teacher, token)}
+        if payload.section not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="That class isn’t one of this teacher’s.",
+            )
+
+    result = reset_progress(
+        db,
+        teacher,
+        lesson_id=payload.lesson_id,
+        section=payload.section,
+        note=f"Reset by {admin.name}",
+    )
+
+    # Written down because it cannot be undone: what a teacher had recorded is
+    # gone, and the only remaining account of it is this line.
+    scope = "every lesson" if payload.lesson_id is None else f"lesson {payload.lesson_id}"
+    where = "every class" if payload.section is None else f"class {payload.section}"
+    record_event(
+        db,
+        event=SecurityEvent.progress_reset,
+        status=SecurityStatus.warning,
+        user=admin,
+        user_name=admin.name,
+        ip=client_ip(request),
+        device=user_agent(request),
+        detail=(
+            f"Reset {result.lessons} progress record(s) for {teacher.name} "
+            f"({scope}, {where}): {result.completed_cleared} completed and "
+            f"{result.started_cleared} in progress cleared."
+        ),
+    )
+
+    db.commit()
+    return ProgressResetResult(
+        lessons=result.lessons,
+        completed_cleared=result.completed_cleared,
+        started_cleared=result.started_cleared,
+        overrides_cleared=result.overrides_cleared,
+        classes=result.classes,
     )
 
 
