@@ -155,7 +155,9 @@ def test_super_admin_sees_every_school_and_can_filter_to_one(db):
     _section(db, b, "B section", ["G1"])
     owner = _user(db, Role.super_admin)
 
-    every = list_sections(db=db, current=owner)
+    # Passed explicitly: called as a plain function the alias default is a Query
+    # object, and "no filter" is the thing being asserted, so it should say so.
+    every = list_sections(school_id=None, db=db, current=owner)
     assert {s.school_id for s in every} >= {a.id, b.id}
 
     just_a = list_sections(school_id=a.id, db=db, current=owner)

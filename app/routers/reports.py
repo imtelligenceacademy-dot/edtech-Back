@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -44,7 +44,10 @@ def download_school_report(
 
 @router.get("/super/download")
 def download_super_report(
-    school_id: str | None = None,
+    # As in fair.py: the client sends ?schoolId=, and without the alias this
+    # is always None — so asking for one school’s report quietly returned the
+    # platform-wide one instead.
+    school_id: str | None = Query(default=None, alias="schoolId"),
     db: Session = Depends(get_db),
     current: User = Depends(require_roles(Role.super_admin)),
 ) -> StreamingResponse:

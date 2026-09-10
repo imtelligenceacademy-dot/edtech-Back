@@ -19,7 +19,17 @@ list means nothing if the file behind it still opens.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -79,7 +89,11 @@ def _serialize(section: FairSection, school_names: dict[str, str]) -> FairSectio
 
 @router.get("/sections", response_model=list[FairSectionOut])
 def list_sections(
-    school_id: str | None = None,
+    # alias, because the client sends camelCase. Without it FastAPI looks for
+    # a query parameter literally called "school_id", never finds one, and the
+    # filter below silently does nothing — which is how a super-admin picking
+    # one school came to be shown every school’s sections.
+    school_id: str | None = Query(default=None, alias="schoolId"),
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
 ) -> list[FairSectionOut]:
