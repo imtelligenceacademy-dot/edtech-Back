@@ -5,6 +5,10 @@ No LLM involved: the filenames follow a strict convention
 lesson number reliably. The lesson is named exactly as the PDF (minus the
 extension), and assigned to every active teacher whose grades include that
 grade and whose language matches the uploaded file.
+
+Kindergarten names itself rather than counting ("KG1 MTiny lesson 03
+Colors.pdf"), which is how the curriculum is written and how the files arrive,
+so the grade half of the name is an alternation rather than a wider number.
 """
 
 from __future__ import annotations
@@ -17,24 +21,45 @@ from sqlalchemy.orm import Session
 
 from app.models import Lesson, LessonAssignment, Progress, UploadedFile, User
 from app.models.enums import LessonStatus, Role, UserStatus
+from app.services.grades import grade_number, grade_token
 from app.services.sections import ensure_progress_for_lessons
 from app.utils import new_id
 
-# "Grade 7 python lesson 04 Variables.pdf"  -> grade=7, course="python",   lesson_no=4
-# "Grade 7 micro:bit lesson 04 Buzzer.pdf"  -> grade=7, course="microbit", lesson_no=4
-# "Grade 7 Lesson 04 Light Sensor.pdf"      -> grade=7, course=None (legacy), lesson_no=4
-# The course keyword (python / micro:bit) is optional and sits between the grade
-# and "lesson"; when absent the lesson belongs to a single default course.
+# "Grade 7 python lesson 04 Variables.pdf"  -> G7,  course="python",   lesson_no=4
+# "Grade 7 micro:bit lesson 04 Buzzer.pdf"  -> G7,  course="microbit", lesson_no=4
+# "Grade 7 Lesson 04 Light Sensor.pdf"      -> G7,  course=None (legacy), lesson_no=4
+# "KG1 MTiny lesson 03 Colors.pdf"          -> KG1, course="mtiny",    lesson_no=3
+# The grade is either "Grade N" or a kindergarten token, which names itself
+# rather than counting. The course keyword (python / micro:bit / MTiny) is
+# optional and sits between the grade and "lesson"; when absent the lesson
+# belongs to a single default course.
 _FILENAME_RE = re.compile(
-    r"^\s*Grade\s+(\d{1,2})\s+(?:(python|micro:?bit)\s+)?lesson\s+(\d{1,3})\b\s*(.*)$",
+    r"^\s*(?:Grade\s+(\d{1,2})|(KG\s?[123]))"
+    r"\s+(?:(python|micro:?bit|m\s?tiny)\s+)?lesson\s+(\d{1,3})\b\s*(.*)$",
     re.IGNORECASE,
 )
+
+
+def _course_keyword(raw: str | None) -> str | None:
+    """The stored course name for the keyword as it was typed.
+
+    Spelling varies in the filenames that arrive — "micro:bit" and "microbit",
+    "MTiny" and "M Tiny" — and all of them mean one course.
+    """
+    if not raw:
+        return None
+    text = raw.replace(" ", "").replace(":", "").lower()
+    if text.startswith("micro"):
+        return "microbit"
+    if text == "mtiny":
+        return "mtiny"
+    return "python"
 
 
 @dataclass
 class ParsedName:
     grade: int
-    grade_token: str  # e.g. "G7"
+    grade_token: str  # e.g. "G7", "KG1"
     lesson_no: int
     title: str  # full filename without extension
     course: str | None = None  # "python" | "microbit" | None
@@ -58,20 +83,18 @@ def parse_lesson_filename(filename: str) -> ParsedName | None:
     m = _FILENAME_RE.match(base)
     if not m:
         return None
-    grade = int(m.group(1))
-    course_raw = m.group(2)
-    lesson_no = int(m.group(3))
-    if not (1 <= grade <= 12):
+    # Exactly one of the two grade spellings matched; normalise both to a token
+    # and let the grade vocabulary decide whether it names a real grade.
+    raw_grade = m.group(2) or f"G{m.group(1)}"
+    grade = grade_number(raw_grade.replace(" ", ""))
+    if grade is None:
         return None
-    course = None
-    if course_raw:
-        course = "microbit" if "micro" in course_raw.lower() else "python"
     return ParsedName(
         grade=grade,
-        grade_token=f"G{grade}",
-        lesson_no=lesson_no,
+        grade_token=grade_token(grade),
+        lesson_no=int(m.group(4)),
         title=base.strip(),
-        course=course,
+        course=_course_keyword(m.group(3)),
     )
 
 
@@ -93,7 +116,7 @@ def _lesson_matches_teacher(lesson: Lesson, teacher: User) -> bool:
     teacher (grade in their grades, language matches, and the lesson belongs to
     their school's current curriculum year)."""
     return (
-        f"G{lesson.grade}" in set(teacher.grades or [])
+        grade_token(lesson.grade) in set(teacher.grades or [])
         and _language_matches(teacher.language, lesson.language)
         and _year_matches(teacher, lesson)
     )

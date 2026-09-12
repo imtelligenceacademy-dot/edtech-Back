@@ -5,9 +5,10 @@ from datetime import datetime
 from pydantic import Field, field_validator
 
 from app.schemas.base import CamelModel
+from app.services.grades import ALL_GRADE_TOKENS
 
 # Grade tokens, matching `lib/grades.ts` and `schemas/user.py`.
-GRADE_CODES = ["KG1", "KG2", *[f"G{i}" for i in range(1, 13)]]
+GRADE_CODES = list(ALL_GRADE_TOKENS)
 
 
 def _clean_grades(value: list[str]) -> list[str]:

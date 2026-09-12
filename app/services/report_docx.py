@@ -16,6 +16,7 @@ from app.models.enums import LessonStatus, Role, UserStatus
 # many questions their teachers asked: it reads as monitoring rather than
 # support, and it is not theirs to act on.
 from app.services.ai_usage import usage_total_for_school
+from app.services.grades import grade_label
 from app.services.report_metrics import (
     QUIET_AFTER_DAYS,
     movement,
@@ -49,7 +50,7 @@ def _grade_title(grade: int) -> str:
     """The grade as a school says it. 0 is the fallback for a progress row whose
     lesson has since been deleted — it still belongs somewhere in the table
     rather than vanishing from a count the reader is checking."""
-    return f"Grade {grade}" if grade else "Ungraded"
+    return grade_label(grade) if grade else "Ungraded"
 
 
 def _meta_line(doc: Document, text: str) -> None:

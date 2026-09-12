@@ -16,7 +16,7 @@ from app.cookies import ACCESS_COOKIE_NAME
 from app.database import get_db
 from app.models import User
 from app.models.enums import Role, UserStatus
-from app.permissions import Capability, can
+from app.permissions import Capability, user_can
 from app.security import decode_access_token
 
 _CREDENTIALS_EXC = HTTPException(
@@ -73,7 +73,7 @@ def require_roles(*roles: Role) -> Callable[[User], User]:
 
 def require_capability(capability: Capability) -> Callable[[User], User]:
     def dependency(user: User = Depends(get_current_user)) -> User:
-        if not can(user.role, capability):
+        if not user_can(user, capability):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Missing capability: {capability}",

@@ -28,6 +28,7 @@ from app.config import settings
 from app.database import Base, IS_SQLITE, engine
 from app.models import User
 from app.models.base import utcnow
+from app.services.grades import grade_token, is_kindergarten
 
 logger = logging.getLogger("app.backup")
 
@@ -187,11 +188,16 @@ def _lesson_folder(lesson) -> str:
     and one was renamed to `file_<id>_<name>`, which reads as a corrupted
     duplicate rather than as the French copy of the English one next to it.
 
-    The grade is zero-padded so a file browser sorts grade-02 before grade-10
-    rather than after it.
+    A numbered grade is zero-padded so a file browser sorts grade-02 before
+    grade-10 rather than after it. Kindergarten is named instead: it is stored
+    as a negative number, which would pad to "grade--3" and sort nowhere
+    sensible, and "grade-KG1" is what the admin unzipping this is looking for.
     """
     language = LANGUAGE_FOLDERS.get((lesson.language or "").lower(), "language-not-set")
-    grade = f"{lesson.grade:02d}" if isinstance(lesson.grade, int) else str(lesson.grade)
+    if isinstance(lesson.grade, int) and not is_kindergarten(lesson.grade):
+        grade = f"{lesson.grade:02d}"
+    else:
+        grade = grade_token(lesson.grade)
     return f"year-{lesson.year}/{language}/grade-{grade}"
 
 

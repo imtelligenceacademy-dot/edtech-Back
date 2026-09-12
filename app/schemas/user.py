@@ -6,13 +6,12 @@ from pydantic import EmailStr, Field, field_validator
 
 from app.models.enums import Language, Role, UserStatus
 from app.schemas.base import CamelModel
+from app.services.grades import ALL_GRADE_TOKENS
 
-# Canonical grade tokens a teacher may be assigned, in display order.
-VALID_GRADES: tuple[str, ...] = (
-    "KG1",
-    "KG2",
-    *(f"G{i}" for i in range(1, 13)),
-)
+# Canonical grade tokens a teacher may be assigned, in display order. The list
+# lives in services/grades because the upload parser and the report headings
+# have to agree with it, not merely resemble it.
+VALID_GRADES: tuple[str, ...] = ALL_GRADE_TOKENS
 
 
 def _clean_grades(value: list[str] | None) -> list[str]:

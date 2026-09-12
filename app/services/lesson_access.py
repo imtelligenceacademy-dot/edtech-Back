@@ -55,7 +55,11 @@ class LessonAccess:
 # Relative order of courses within a track. Lower = earlier: a teacher works
 # through the whole "python" course before any "microbit" lesson opens. Unknown
 # / null courses (Year-1 and legacy content) share order 0 as a single course.
-COURSE_ORDER: dict[str, int] = {"python": 1, "microbit": 2}
+# MTiny shares a number with python because it never shares a track with it:
+# kindergarten is its own grade, so an MTiny track is ordered by lesson number
+# alone. It is listed rather than left to fall through to the default so that a
+# course nobody registered stays distinguishable from one that was.
+COURSE_ORDER: dict[str, int] = {"python": 1, "mtiny": 1, "microbit": 2}
 
 
 def _wait() -> timedelta:

@@ -20,6 +20,10 @@ class Lesson(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     title: Mapped[str] = mapped_column(String, nullable=False)
+    # 1-12 as written, and kindergarten below zero — KG1 is -3, KG2 -2, KG3 -1,
+    # so ordering by this column puts kindergarten first. The mapping and the
+    # conversion to tokens both live in services/grades; nothing reads the sign
+    # of this value directly.
     grade: Mapped[int] = mapped_column(Integer, nullable=False)
     subject: Mapped[str] = mapped_column(String, nullable=False)
 
@@ -33,9 +37,10 @@ class Lesson(Base, TimestampMixin):
     # Curriculum year this lesson belongs to (1 or 2). Year 1 and Year 2 are
     # entirely separate curricula; a school only receives its current year's set.
     year: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
-    # Course/module within a year, e.g. "python" | "microbit". Null = a single
-    # default course (used for Year-1 content and legacy lessons). Ordering
-    # between courses lives in lesson_access.COURSE_ORDER.
+    # Course/module within a year, e.g. "python" | "microbit" | "mtiny" (the
+    # kindergarten course). Null = a single default course (used for Year-1
+    # content and legacy lessons). Ordering between courses lives in
+    # lesson_access.COURSE_ORDER.
     course: Mapped[Optional[str]] = mapped_column(String(16), nullable=True, index=True)
     # Parsed lesson number from the source filename (e.g. 4), for dedup.
     lesson_no: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)

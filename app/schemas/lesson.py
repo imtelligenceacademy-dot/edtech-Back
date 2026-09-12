@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from app.schemas.base import CamelModel
+from app.services.grades import ALL_GRADE_TOKENS, grade_token
 
 
 class SlideOut(CamelModel):
@@ -45,11 +46,22 @@ class SlideCreate(CamelModel):
 
 class LessonCreate(CamelModel):
     title: str = Field(min_length=2, max_length=200)
-    grade: int = Field(ge=1, le=12)
+    # Checked against the grade vocabulary rather than a numeric range:
+    # kindergarten is stored below zero (see services/grades), so ge=1 refused
+    # it outright and any range wide enough to admit it also admits 0, which is
+    # the "lesson has since been deleted" fallback and not a grade.
+    grade: int
     subject: str = Field(min_length=1, max_length=80)
     school_id: str
     due_date: date | None = None
     slides: list[SlideCreate] = Field(default_factory=list)
+
+    @field_validator("grade")
+    @classmethod
+    def _known_grade(cls, v: int) -> int:
+        if grade_token(v) not in ALL_GRADE_TOKENS:
+            raise ValueError("Not a grade this curriculum has")
+        return v
 
 
 class AssignmentRequest(CamelModel):

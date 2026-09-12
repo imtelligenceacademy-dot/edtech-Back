@@ -24,6 +24,8 @@ from sqlalchemy.orm import Session
 
 from app.models import AccessRequest, ChatMessage, Lesson, Progress, User
 from app.models.enums import LessonStatus, Role, WatchdogStatus
+from app.services.grades import grade_number
+from app.services.grades import grade_token as _token
 from app.utils import new_id
 
 # The section of a grade that has only one class. Empty rather than NULL: both
@@ -38,8 +40,8 @@ MAX_LABEL_LENGTH = 16
 
 
 def grade_token(grade: int | str) -> str:
-    """The token form of a grade ("G6"), matching ``User.grades``."""
-    return grade if isinstance(grade, str) else f"G{grade}"
+    """The token form of a grade ("G6", "KG1"), matching ``User.grades``."""
+    return _token(grade)
 
 
 def normalize_sections(
@@ -208,7 +210,11 @@ def rename_section(
     if old == new or not old and not new:
         return 0
 
-    grade_int = grade if isinstance(grade, int) else int(str(grade).lstrip("G") or 0)
+    # A kindergarten token has no leading "G" to strip, so this went through
+    # int("KG1") and raised before the rename could start.
+    grade_int = grade if isinstance(grade, int) else grade_number(grade)
+    if grade_int is None:
+        return 0
     lesson_ids = select(Lesson.id).where(Lesson.grade == grade_int)
 
     moved = 0

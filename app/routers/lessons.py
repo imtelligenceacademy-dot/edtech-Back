@@ -45,6 +45,7 @@ from app.services.lesson_access import (
 )
 from app.audit import record_event
 from app.services.progress_reset import reset_progress
+from app.services.grades import grade_token
 from app.services.sections import (
     all_sections,
     ensure_progress_rows,
@@ -591,7 +592,7 @@ def replace_assignments(
 # mistaken for a lesson id (segment counts differ, but order keeps it clear).
 # --------------------------------------------------------------------------- #
 def _grade_label(grade: int) -> str:
-    return f"G{grade}"
+    return grade_token(grade)
 
 
 @router.get("/access/{teacher_id}", response_model=TeacherAccessOut)
