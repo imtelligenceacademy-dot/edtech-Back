@@ -360,7 +360,20 @@ def _platform_body(db: Session, doc: Document) -> None:
     """
     schools = list(db.scalars(select(School).order_by(School.name)))
     teachers = list(db.scalars(select(User).where(User.role == Role.teacher)))
-    lesson_count = db.scalar(select(func.count(Lesson.id))) or 0
+    # Rows, which is one per language: a bilingual curriculum has two for the
+    # same lesson. The dashboard de-duplicates them, so the two figures differed
+    # by about double under the same word. Counted the same way here.
+    lesson_rows = db.execute(
+        select(Lesson.id, Lesson.grade, Lesson.lesson_no, Lesson.course, Lesson.year)
+    ).all()
+    lesson_count = len(
+        {
+            (grade, lesson_no, course, year)
+            if lesson_no is not None
+            else ("legacy", lesson_id)
+            for lesson_id, grade, lesson_no, course, year in lesson_rows
+        }
+    )
     all_ids = [t.id for t in teachers]
 
     all_progress = (

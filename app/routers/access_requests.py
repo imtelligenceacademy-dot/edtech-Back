@@ -23,6 +23,7 @@ from app.models.enums import Role
 from app.schemas.access_request import AccessRequestCreate, AccessRequestOut
 from app.services.access_requests import list_pending, to_out
 from app.services.backup import send_email
+from app.services.grades import grade_label
 from app.services.lesson_access import is_lesson_available
 from app.services.sections import find_progress, has_named_sections, resolve_section
 from app.utils import new_id
@@ -60,7 +61,7 @@ def _notify_access_request(
     subject = f"IM-Telligence — lesson access request from {teacher.name}"
     # Name the class only when the teacher has more than one; for everyone
     # else a section would be noise about a distinction they don't have.
-    where = f"Grade {lesson.grade}" + (f" — {section}" if section else "")
+    where = grade_label(lesson.grade) + (f" — {section}" if section else "")
     text = (
         f"{teacher.name} ({teacher.email}) has requested access to a locked lesson:\n\n"
         f"  {lesson.title} ({where})\n\n"

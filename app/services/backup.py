@@ -17,6 +17,7 @@ import sqlite3
 import tempfile
 import uuid
 from datetime import date, datetime, time, timezone
+from pathlib import PurePosixPath
 from email.message import EmailMessage
 from typing import Any, Collection
 
@@ -201,6 +202,19 @@ def _lesson_folder(lesson) -> str:
     return f"year-{lesson.year}/{language}/grade-{grade}"
 
 
+def _safe_entry_name(filename: str) -> str:
+    """A filename reduced to something that cannot escape the archive.
+
+    The multipart parser stores what the client sent, verbatim — including
+    separators and "..". Used as a zip entry path that reaches outside the
+    folder it claims to be in, and any extractor that does not defend against
+    that writes wherever the name points. Only a bare name is ever written.
+    """
+    bare = PurePosixPath(filename.replace("\\", "/")).name
+    bare = bare.strip().lstrip(".")
+    return bare or "unnamed.pdf"
+
+
 def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, int, int]:
     """Zip stored PDFs plus a manifest.json describing them.
 
@@ -247,7 +261,7 @@ def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, i
                     folder = _lesson_folder(lesson)
                 else:
                     folder = "unsorted"
-                arcname = f"{folder}/{up.filename}"
+                arcname = f"{folder}/{_safe_entry_name(up.filename)}"
 
                 entry: dict[str, Any] = {
                     "file_id": up.id,

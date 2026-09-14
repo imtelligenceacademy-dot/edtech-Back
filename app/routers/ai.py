@@ -318,7 +318,14 @@ def _vision_note(image_data_url: str | None, attempted: bool, slide: int | None)
 def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptBundle:
     """Resolve access, lesson context and (optionally) the slide image, then
     assemble the robotics-assistant prompt."""
-    lesson = _accessible_lesson(db, current, payload.lesson_id) if payload.lesson_id else None
+    # One document at a time. Nothing rejected both ids being sent, and the two
+    # halves of the prompt disagreed about which to use: the material and the
+    # title came from the project while the slide image came from the lesson, so
+    # the model was shown a page of one and told it belonged to the other. The
+    # exchange was then filed under the lesson — which the teacher may not even
+    # be allowed to open. A project is the more specific ask, so it wins.
+    lesson_id = None if payload.fair_project_id else payload.lesson_id
+    lesson = _accessible_lesson(db, current, lesson_id) if lesson_id else None
     project = (
         _accessible_fair_project(db, current, payload.fair_project_id)
         if payload.fair_project_id
@@ -468,9 +475,11 @@ def _rebuild_without_image(user_id: str, payload: AIChatRequest) -> str:
         current = db.get(User, user_id)
         if current is None:
             raise LookupError("user vanished mid-stream")
-        lesson = (
-            _accessible_lesson(db, current, payload.lesson_id) if payload.lesson_id else None
-        )
+        # Same rule as `_build_prompt`: one document, and a project wins. This
+        # rebuild is the prompt handed to a model that cannot see, so it must
+        # describe the same thing the first one did.
+        lesson_id = None if payload.fair_project_id else payload.lesson_id
+        lesson = _accessible_lesson(db, current, lesson_id) if lesson_id else None
         project = (
             _accessible_fair_project(db, current, payload.fair_project_id)
             if payload.fair_project_id
@@ -704,7 +713,16 @@ def chat_stream(
 
     # Held for the generator, which runs after this request's session is closed.
     teacher_id = current.id
-    lesson_id = payload.lesson_id if bundle.grounded else None
+    # The lesson the answer was actually grounded in. A fair project has no
+    # lesson thread, and a lesson id sent alongside one is ignored above — so
+    # filing the exchange under it would store the conversation against a
+    # lesson the assistant never read, and possibly one this teacher cannot
+    # open.
+    lesson_id = (
+        payload.lesson_id
+        if bundle.grounded and not payload.fair_project_id
+        else None
+    )
     question = payload.message
     # Which class this was asked in, so the thread comes back to the right room.
     # An unrecognised class falls back to the teacher's first rather than

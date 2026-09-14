@@ -406,3 +406,34 @@ def test_classes_can_be_relabelled_around_each_other(db):
     # Each class kept its own history rather than merging into one label.
     assert find_progress(db, teacher.id, lesson.id, "C").percent_complete == 80
     assert find_progress(db, teacher.id, lesson.id, "A").percent_complete == 20
+
+
+# --------------------------------------------------------------------------- #
+# A 401 that says "signed out" has to actually sign the browser out
+# --------------------------------------------------------------------------- #
+def test_a_refused_refresh_clears_the_cookies_it_refused(db):
+    """Setting cookies on the injected Response and then raising does nothing.
+
+    Those headers are merged onto the real response only when the handler
+    returns, so a dead refresh token came back as a bare 401 and the browser
+    went on presenting it — on every 401, for the rest of its seven-day life.
+    """
+    from fastapi.testclient import TestClient
+    from app.database import get_db
+    from app.main import app
+
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        with TestClient(app) as client:
+            response = client.post("/api/auth/refresh")
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 401
+    cleared = [
+        value.decode()
+        for key, value in response.headers.raw
+        if key.lower() == b"set-cookie"
+    ]
+    assert len(cleared) == 2, "both the access and the refresh cookie"
+    assert all('=""' in c or "=;" in c or "Max-Age=0" in c for c in cleared), cleared

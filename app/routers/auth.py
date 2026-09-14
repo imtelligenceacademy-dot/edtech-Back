@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -53,6 +54,23 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 _INVALID_CREDENTIALS = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password"
 )
+
+
+def _rejected_and_signed_out() -> JSONResponse:
+    """401 that actually clears the cookies.
+
+    Setting them on the injected Response and then raising did nothing: those
+    headers are merged onto the real response only when the handler *returns*,
+    so a dead refresh token was answered with a 401 carrying no Set-Cookie at
+    all. The browser kept presenting it on every 401 for the rest of its
+    seven-day life.
+    """
+    rejected = JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"detail": "Invalid email or password"},
+    )
+    clear_auth_cookies(rejected)
+    return rejected
 
 # A throwaway Argon2 hash verified when the email is unknown, so a failed login
 # for a non-existent account costs the same time as one for a real account.
@@ -196,20 +214,15 @@ def login(
     # Lockout check (constant-ish path; still verify a dummy hash to reduce timing signal).
     now = datetime.now(timezone.utc)
     _enforce_ip_throttle(db, ip, now)
-    if user and user.locked_until and _aware(user.locked_until) > now:
-        # Was logged as "blocked second device", which it never was — there is
-        # no second-device rule; this is the failed-login lockout.
-        minutes = max(1, round((_aware(user.locked_until) - now).total_seconds() / 60))
-        record_event(
-            db, event=SecurityEvent.account_locked, status=SecurityStatus.blocked,
-            ip=ip, device=device, user=user,
-            detail=f"Sign-in attempted while locked out; {minutes} min remaining",
-        )
-        db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Account temporarily locked. Try again later.",
-        )
+    # Whether this account is locked is decided here but answered further down,
+    # after the password has been checked. Answering it first made the lockout
+    # an oracle: a distinct 429 for a real address and a 401 for an unknown one
+    # told an attacker which of the two they had, from any address. It also
+    # returned before the failure could be counted against the network, so
+    # attempts on an account already locked were free — and each one still
+    # committed a security-log row, at request rate, for as long as they cared
+    # to keep it locked.
+    locked = bool(user and user.locked_until and _aware(user.locked_until) > now)
 
     # Always run one Argon2 verify (against a dummy hash for unknown emails) so
     # the timing doesn't reveal whether the account exists.
@@ -249,6 +262,21 @@ def login(
         db.commit()
         raise _INVALID_CREDENTIALS
 
+    # Right password, locked account: now it is safe to say so, because only
+    # the account holder can have got this far.
+    if locked:
+        minutes = max(1, round((_aware(user.locked_until) - now).total_seconds() / 60))
+        record_event(
+            db, event=SecurityEvent.account_locked, status=SecurityStatus.blocked,
+            ip=ip, device=device, user=user,
+            detail=f"Correct password while locked out; {minutes} min remaining",
+        )
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Account temporarily locked. Try again later.",
+        )
+
     if user.status == UserStatus.pending:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account pending approval")
     if user.status != UserStatus.active:
@@ -287,20 +315,20 @@ def login(
 
 
 @router.post("/refresh", response_model=MessageResponse)
-def refresh(request: Request, response: Response, db: Session = Depends(get_db)) -> MessageResponse:
+def refresh(
+    request: Request, response: Response, db: Session = Depends(get_db)
+) -> MessageResponse | JSONResponse:
     raw = request.cookies.get(REFRESH_COOKIE_NAME)
     if not raw:
-        raise _INVALID_CREDENTIALS
+        return _rejected_and_signed_out()
 
     record = db.scalar(select(RefreshToken).where(RefreshToken.token_hash == hash_token(raw)))
     if record is None or record.revoked or _aware(record.expires_at) <= datetime.now(timezone.utc):
-        clear_auth_cookies(response)
-        raise _INVALID_CREDENTIALS
+        return _rejected_and_signed_out()
 
     user = db.get(User, record.user_id)
     if user is None or user.status != UserStatus.active:
-        clear_auth_cookies(response)
-        raise _INVALID_CREDENTIALS
+        return _rejected_and_signed_out()
 
     # Rotate: revoke the presented token, issue a new pair.
     record.revoked = True
