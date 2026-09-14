@@ -158,18 +158,35 @@ def my_classes(
     # Group by class, then walk each in teaching order so "next" is the next
     # lesson that class actually reaches, not merely the first unfinished one
     # in the database.
-    by_class: dict[tuple[int, str], list[Lesson]] = {}
+    #
+    # Keyed by language as well, because that is how lessons are sequenced: a
+    # bilingual teacher has two tracks through one grade, each with its own
+    # position. Merging them reported "2 of 6" across two separate curricula
+    # and pointed at the wrong next lesson.
+    by_class: dict[tuple[int, str, str | None], list[Lesson]] = {}
     for (lesson_id, section) in access:
         lesson = lessons.get(lesson_id)
         if lesson is not None:
-            by_class.setdefault((lesson.grade, section), []).append(lesson)
+            by_class.setdefault((lesson.grade, section, lesson.language), []).append(lesson)
+
+    # Only worth naming when there is more than one to tell apart.
+    languages_per_class: dict[tuple[int, str], set[str | None]] = {}
+    for (grade, section, language) in by_class:
+        languages_per_class.setdefault((grade, section), set()).add(language)
 
     out: list[ClassSummary] = []
-    for (grade, section), group in sorted(by_class.items()):
+    for (grade, section, language), group in sorted(
+        by_class.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or "")
+    ):
         group.sort(key=lesson_order_key)
         row = ClassSummary(
             grade=grade,
             section=section,
+            language=(
+                language
+                if len(languages_per_class.get((grade, section), set())) > 1
+                else None
+            ),
             total=len(group),
             completed=sum(
                 1

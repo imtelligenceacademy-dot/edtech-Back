@@ -131,6 +131,12 @@ class ClassSummary(CamelModel):
     # "" when the grade has a single unnamed class, in which case the teacher is
     # never shown a class at all and this is one row for the whole grade.
     section: str = ""
+    # The curriculum this row counts. Lessons are sequenced per language, so a
+    # teacher of both walks two independent tracks through one grade and has
+    # two of these: merging them doubled the totals and named a "next" lesson
+    # from whichever curriculum happened to sort first. Null for a teacher with
+    # one language, who never sees it.
+    language: str | None = None
     total: int = 0
     completed: int = 0
     next_lesson_id: str | None = None

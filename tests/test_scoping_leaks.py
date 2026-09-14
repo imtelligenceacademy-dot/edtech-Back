@@ -341,3 +341,68 @@ def test_an_account_below_super_admin_needs_a_school(db):
         db=db, _=None,
     )
     assert made.school_id is None
+
+
+def test_classes_can_be_relabelled_around_each_other(db):
+    """A to C and B to A is a relabel, not a contradiction.
+
+    Each rename used to be checked against the finished list on its own, so the
+    "A" that B had just become looked like the "A" that was supposed to be gone
+    — and the whole edit was refused, name and grades with it. Each class's
+    history has to land under its own new label, not merge.
+    """
+    from app.models import Lesson, LessonAssignment, Progress
+    from app.models.enums import LessonStatus
+    from app.routers import users as users_router
+    from app.schemas.user import SectionRename, UserUpdate
+    from app.services.sections import ensure_progress_for_lessons, find_progress
+
+    school = School(id=new_id("sch"), name="S", program_year=2)
+    db.add(school)
+    admin = User(
+        id=new_id("u"), name="Admin", email=f"{new_id('e')}@x.com", password_hash="x",
+        role=Role.super_admin, status=UserStatus.active,
+    )
+    db.add(admin)
+    teacher = User(
+        id=new_id("u"), name="T", email=f"{new_id('e')}@x.com", password_hash="x",
+        role=Role.teacher, status=UserStatus.active, school_id=school.id,
+        grades=["G6"], language="en", sections={"G6": ["A", "B"]},
+    )
+    db.add(teacher)
+    db.flush()
+    lesson = Lesson(
+        id=new_id("les"), title="Grade 6 python lesson 01", grade=6, subject="STEAM",
+        language="en", year=2, course="python", lesson_no=1,
+    )
+    db.add(lesson)
+    db.flush()
+    db.add(LessonAssignment(
+        id=new_id("la"), lesson_id=lesson.id, teacher_id=teacher.id, source="rule"
+    ))
+    ensure_progress_for_lessons(db, teacher, [lesson], "seed")
+    db.commit()
+
+    # Tell the two classes apart by how far each has got.
+    find_progress(db, teacher.id, lesson.id, "A").percent_complete = 80
+    find_progress(db, teacher.id, lesson.id, "B").percent_complete = 20
+    db.commit()
+
+    users_router.update_user(
+        teacher.id,
+        UserUpdate(
+            sections={"G6": ["C", "A"]},
+            section_renames=[
+                SectionRename(grade="G6", from_section="A", to_section="C"),
+                SectionRename(grade="G6", from_section="B", to_section="A"),
+            ],
+        ),
+        db,
+        admin,
+    )
+    db.refresh(teacher)
+
+    assert teacher.sections == {"G6": ["C", "A"]}
+    # Each class kept its own history rather than merging into one label.
+    assert find_progress(db, teacher.id, lesson.id, "C").percent_complete == 80
+    assert find_progress(db, teacher.id, lesson.id, "A").percent_complete == 20

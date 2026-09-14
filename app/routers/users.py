@@ -208,6 +208,7 @@ def _apply_section_renames(
 
     after = user.sections or {}
     rewritten = {token: list(labels) for token, labels in before.items()}
+    planned: list = []
 
     for rename in payload.section_renames:
         final = after.get(rename.grade, [])
@@ -217,7 +218,14 @@ def _apply_section_renames(
         # history somewhere nobody asked for.
         if rename.from_section == rename.to_section:
             continue
-        if rename.to_section not in final or rename.from_section in final:
+        # The new name has to be one the edit actually ended with.
+        #
+        # The old name is checked against the running picture rather than the
+        # final one. Requiring it to be *absent* at the end refused a straight
+        # relabel — A to C and B to A leaves an "A", so the whole edit was
+        # rejected, name and grades and all, with a message about a class the
+        # admin had just renamed.
+        if rename.to_section not in final:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
@@ -230,12 +238,29 @@ def _apply_section_renames(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"This teacher has no class {rename.from_section} to rename.",
             )
-
-        rename_section(db, user, rename.grade, rename.from_section, rename.to_section)
+        planned.append(rename)
         rewritten[rename.grade] = [
             rename.to_section if label == rename.from_section else label
             for label in rewritten[rename.grade]
         ]
+
+    # Applied in two passes, through labels nothing else can be using. Done in
+    # one pass, a relabel that reuses a name — A to C, B to A — would move B's
+    # history onto A while A's was still there, and the next step would carry
+    # both to C. Two passes make any rearrangement safe regardless of the order
+    # the admin happened to click in.
+    staged: list[tuple[str, str, str]] = []
+    for i, rename in enumerate(planned):
+        holding = f"~mv{i}~"
+        rename_section(db, user, rename.grade, rename.from_section, holding)
+        staged.append((rename.grade, holding, rename.to_section))
+    # Written out before the second pass reads them back: the session does not
+    # autoflush, so the queries below would otherwise still see the old labels
+    # and move nothing at all.
+    db.flush()
+    for grade, holding, final_label in staged:
+        rename_section(db, user, grade, holding, final_label)
+    db.flush()
 
     return rewritten
 
