@@ -89,11 +89,24 @@ def _enforce_ip_throttle(db: Session, ip: str, now: datetime) -> None:
     throttle = db.get(LoginThrottle, ip)
     if throttle is None:
         return
-    if throttle.blocked_at is not None:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="This network is blocked from signing in.",
-        )
+    blocked_at = _aware(throttle.blocked_at)
+    if blocked_at is not None:
+        # A ban that outlived its window is lifted here rather than needing a
+        # hand-edited database. Nothing else clears it, and a network holding a
+        # permanent block locks out every teacher behind it.
+        if now - blocked_at >= timedelta(hours=settings.login_ip_block_hours):
+            throttle.blocked_at = None
+            throttle.cycle_count = 0
+            throttle.failed_count = 0
+            throttle.window_started_at = None
+            throttle.locked_until = None
+            # NOT NULL with an empty-string default — not None.
+            throttle.reason = ""
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="This network is blocked from signing in.",
+            )
     locked_until = _aware(throttle.locked_until)
     if locked_until and locked_until > now:
         raise HTTPException(

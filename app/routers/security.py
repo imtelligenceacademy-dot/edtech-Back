@@ -129,16 +129,21 @@ def security_log_detail(
 
     history = IpHistory()
     if log.ip:
+        # Scoped exactly like the list this row came from. Unscoped, the
+        # "who else used this address" panel handed a teacher the names and
+        # sign-in counts of every account on the platform that shares their
+        # ISP — the one place in this router that read outside its lane.
         rows = list(
             db.execute(
-                select(
-                    SecurityLog.event,
-                    func.count(SecurityLog.id),
-                    func.min(SecurityLog.timestamp),
-                    func.max(SecurityLog.timestamp),
-                )
-                .where(SecurityLog.ip == log.ip)
-                .group_by(SecurityLog.event)
+                _scope(
+                    select(
+                        SecurityLog.event,
+                        func.count(SecurityLog.id),
+                        func.min(SecurityLog.timestamp),
+                        func.max(SecurityLog.timestamp),
+                    ).where(SecurityLog.ip == log.ip),
+                    current,
+                ).group_by(SecurityLog.event)
             ).all()
         )
         firsts = [r[2] for r in rows if r[2] is not None]
@@ -154,7 +159,12 @@ def security_log_detail(
                 {
                     name
                     for name in db.scalars(
-                        select(SecurityLog.user_name).where(SecurityLog.ip == log.ip)
+                        _scope(
+                            select(SecurityLog.user_name).where(
+                                SecurityLog.ip == log.ip
+                            ),
+                            current,
+                        )
                     )
                     if name
                 }

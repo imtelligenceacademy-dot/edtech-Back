@@ -94,6 +94,32 @@ def visible_sections(
     ]
 
 
+def visible_project(db: Session, user: User, project_id: str) -> FairProject | None:
+    """The project, if this user may see it — otherwise None.
+
+    Same rule as the list and the same rule as the PDF, applied through the
+    project's own section. The AI grounding path used to fetch the project
+    directly and check only ``ict_fair_access``, so the assistant would read a
+    project out of another school (or an unfiled one) to any teacher holding
+    its id — the very hole :func:`can_open_fair_file` was written to close on
+    the download route, reopened one endpoint along.
+    """
+    project = db.get(FairProject, project_id)
+    if project is None:
+        return None
+    if not can_see_fair(user):
+        return None
+    if user.role == Role.super_admin:
+        return project
+    if project.section_id is None:
+        # Unfiled belongs to nobody but a super-admin, handled above.
+        return None
+    section = db.get(FairSection, project.section_id)
+    if section is None or not section_visible_to(user, section):
+        return None
+    return project
+
+
 def can_open_fair_file(db: Session, user: User, file_id: str) -> bool:
     """Whether this user may open the PDF behind a fair project.
 

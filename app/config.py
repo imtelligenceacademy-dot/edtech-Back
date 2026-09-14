@@ -48,6 +48,30 @@ class Settings(BaseSettings):
     login_ip_max_failures: int = 5
     login_ip_window_minutes: int = 15
     login_ip_ban_cycles: int = 2
+    # How long a network ban lasts. It used to last forever: `blocked_at` was
+    # written in one place and cleared in none, so a ban could only be undone
+    # by editing the database by hand — and with a spoofable client address
+    # (see TRUSTED_PROXY_HOPS) it could be aimed at a school's real address by
+    # anyone. A day is long enough to stop an attack and short enough that a
+    # mistake ends by itself.
+    login_ip_block_hours: int = 24
+    # How many proxies sit in front of this app and may be believed about who
+    # the client is. Left as None it follows the environment: one in
+    # production, which is what this deploys behind, and none in development,
+    # where there is no proxy and the socket peer is the truth.
+    #
+    # A client can put anything in X-Forwarded-For, and each proxy *appends*
+    # the address it saw — so only the entries your own proxies added mean
+    # anything, and those are at the END. Set this to the number of proxies in
+    # front, and the address that many places from the right is the one that
+    # was actually observed.
+    #
+    # Getting this too LOW behind a proxy is its own outage: every request then
+    # looks like it came from the proxy, so one address carries the whole
+    # platform's failures and the network ban locks out everybody. Too high and
+    # the header is believed further left than it should be, which is the
+    # spoofing this exists to stop. It has to match the deployment.
+    trusted_proxy_hops: int | None = None
 
     # --- Teacher chat history ---------------------------------------------- #
     # How long a teacher's conversations are kept. Raising it is free; lowering
@@ -185,6 +209,13 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.environment == "production"
+
+    @property
+    def proxy_hops(self) -> int:
+        """Proxies in front of us, defaulted from the environment."""
+        if self.trusted_proxy_hops is not None:
+            return max(0, self.trusted_proxy_hops)
+        return 1 if self.is_production else 0
 
     @property
     def cors_origin_list(self) -> list[str]:

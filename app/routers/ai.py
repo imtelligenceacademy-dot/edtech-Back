@@ -42,6 +42,7 @@ from app.services.ai_usage import (
     usage_stats,
 )
 from app.services.chat_history import save_exchange
+from app.services.fair_access import visible_project
 from app.services.lesson_access import is_lesson_available
 from app.services.sections import resolve_section, sections_for
 from app.services.file_storage import resolve_stored_file
@@ -215,9 +216,13 @@ def _accessible_lesson(db: Session, teacher: User, lesson_id: str) -> Lesson | N
 
 
 def _accessible_fair_project(db: Session, teacher: User, project_id: str) -> FairProject | None:
-    if teacher.role == Role.teacher and not teacher.ict_fair_access:
-        return None
-    return db.get(FairProject, project_id)
+    """The fair project this question may be grounded in, or None.
+
+    Scoped through the shared service rather than re-checked here, so what the
+    assistant will read aloud is exactly what the teacher could have opened
+    themselves — same school, same grades, and nothing unfiled.
+    """
+    return visible_project(db, teacher, project_id)
 
 
 @dataclass

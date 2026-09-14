@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.models import (
+    FairProject,
+    FairSection,
     Lesson,
     LessonAssignment,
     Progress,
@@ -112,18 +114,34 @@ def test_locked_lesson_never_renders_a_slide(db, world, monkeypatch):
     assert called == [], "renderer must not run for a locked lesson"
 
 
-def test_fair_project_requires_the_access_flag(db, world):
-    from app.models import FairProject
-
+def _fair_project(db, owner, title, section=None):
     uploaded = UploadedFile(
         id=new_id("file"), filename="p.pdf", content_type="application/pdf",
-        size_bytes=1, storage_path="missing.pdf", uploaded_by=world["teacher"].id,
+        size_bytes=1, storage_path="missing.pdf", uploaded_by=owner.id,
     )
     db.add(uploaded)
     db.flush()
-    project = FairProject(id=new_id("fair"), title="Robot arm", file_id=uploaded.id)
+    project = FairProject(
+        id=new_id("fair"), title=title, file_id=uploaded.id,
+        section_id=section.id if section is not None else None,
+    )
     db.add(project)
     db.commit()
+    return project
+
+
+def _fair_section(db, school_id, grades):
+    section = FairSection(
+        id=new_id("fsec"), school_id=school_id, title="Fair", grades=grades
+    )
+    db.add(section)
+    db.commit()
+    return section
+
+
+def test_fair_project_requires_the_access_flag(db, world):
+    section = _fair_section(db, world["teacher"].school_id, ["G7"])
+    project = _fair_project(db, world["teacher"], "Robot arm", section)
 
     # Teacher without the flag: refused.
     world["teacher"].ict_fair_access = False
@@ -133,7 +151,7 @@ def test_fair_project_requires_the_access_flag(db, world):
     )
     assert bundle.grounded is False
 
-    # With the flag: grounded on the project.
+    # With the flag, on a section for a grade they teach: grounded.
     world["teacher"].ict_fair_access = True
     db.commit()
     bundle = ai._build_prompt(
@@ -141,6 +159,37 @@ def test_fair_project_requires_the_access_flag(db, world):
     )
     assert bundle.grounded is True
     assert bundle.source_ref == "Robot arm"
+
+
+def test_the_assistant_will_not_read_a_fair_project_out_of_scope(db, world):
+    """The flag alone is not access.
+
+    The list and the PDF are both scoped by school and by grade; grounding was
+    not, so the assistant would read a project aloud that the teacher could
+    neither see nor open — including one nobody has filed yet.
+    """
+    teacher = world["teacher"]
+    teacher.ict_fair_access = True
+    db.commit()
+
+    unfiled = _fair_project(db, teacher, "Unfiled")
+    other_school = School(id=new_id("sch"), name="Elsewhere", program_year=2)
+    db.add(other_school)
+    db.commit()
+    foreign = _fair_project(
+        db, teacher, "Theirs", _fair_section(db, other_school.id, ["G7"])
+    )
+    wrong_grade = _fair_project(
+        db, teacher, "Grade 1 work",
+        _fair_section(db, teacher.school_id, ["G1"]),
+    )
+
+    for project in (unfiled, foreign, wrong_grade):
+        bundle = ai._build_prompt(
+            db, teacher, AIChatRequest(message="hi", fairProjectId=project.id)
+        )
+        assert bundle.grounded is False, project.title
+        assert bundle.source_ref is None, project.title
 
 
 # --------------------------------------------------------------------------- #

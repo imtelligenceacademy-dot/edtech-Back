@@ -316,3 +316,26 @@ def sync_progress_sections(
         for row in rows:
             if row.lesson_id not in taken:
                 row.section = new
+
+        # Progress is not the only thing keyed to a class. A teacher's
+        # conversations and her pending access requests carry the same label,
+        # and moving only her progress left both behind under a section nobody
+        # is keyed to any more: her chat history for the grade vanished, and
+        # granting one of those requests unlocked nothing — the grant looked at
+        # the class she is now in, found no row, and wrote a fresh overridden
+        # one against the old label while she stayed blocked.
+        grade_int = grade_number(token)
+        if grade_int is None:
+            continue
+        grade_lessons = select(Lesson.id).where(Lesson.grade == grade_int)
+        for model in SECTION_KEYED_MODELS:
+            if model is Progress:
+                continue  # handled above, with its collision guard
+            for row in db.scalars(
+                select(model).where(
+                    model.teacher_id == teacher.id,
+                    model.section == old,
+                    model.lesson_id.in_(grade_lessons),
+                )
+            ):
+                row.section = new
