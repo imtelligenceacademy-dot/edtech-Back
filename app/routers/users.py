@@ -68,6 +68,7 @@ def create_user(
 ) -> User:
     if db.scalar(select(User).where(User.email == payload.email.lower())):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+    _require_school_below_super_admin(db, payload.role, payload.school_id)
     user = User(
         id=new_id("u"),
         name=payload.name.strip(),
@@ -110,6 +111,11 @@ def update_status(
     if user.id == current.id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot change your own status")
     user.status = payload.status
+    # Reinstating an account clears any lockout with it. Otherwise "active"
+    # was a status the holder still could not sign in under.
+    if payload.status == UserStatus.active:
+        user.locked_until = None
+        user.failed_login_count = 0
     db.commit()
     db.refresh(user)
     return user
@@ -125,6 +131,25 @@ def _apply_email_change(db: Session, user: User, user_id: str, data: dict) -> No
     user.email = new_email
 
 
+def _require_school_below_super_admin(db: Session, role: Role, school_id: str | None) -> None:
+    """Everyone below super-admin belongs to a school.
+
+    Their scoping is written as a SQL comparison, so an account without one
+    does not match nothing — it matches the rows whose school is also null: the
+    super-admins' security events, and the whole global curriculum. Refusing
+    the account is how the scope keeps meaning what it says.
+    """
+    if role == Role.super_admin:
+        return
+    if not school_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A school admin or teacher must belong to a school.",
+        )
+    if db.get(School, school_id) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="School not found")
+
+
 def _apply_role_and_school(db: Session, user: User, data: dict) -> Role:
     """Apply a role change (if any) and reconcile the school link, returning the
     effective role. Super-admins never have a school; other roles may set one."""
@@ -137,6 +162,7 @@ def _apply_role_and_school(db: Session, user: User, data: dict) -> Role:
         if data["school_id"] is not None and db.get(School, data["school_id"]) is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="School not found")
         user.school_id = data["school_id"]
+    _require_school_below_super_admin(db, effective_role, user.school_id)
     return effective_role
 
 
@@ -277,6 +303,12 @@ def reset_password(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     user.password_hash = hash_password(payload.password)
+    # Clear the lockout too. This is the only remedy an admin has, and without
+    # this it was not one: the lock is checked before the password is verified,
+    # so a teacher given a new password still met "Account temporarily locked"
+    # for up to a day and rang back to say the reset had not worked.
+    user.locked_until = None
+    user.failed_login_count = 0
     ended = sum(1 for token in user.refresh_tokens if not token.revoked)
     for token in user.refresh_tokens:
         token.revoked = True

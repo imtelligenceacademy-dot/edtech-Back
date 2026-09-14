@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from pydantic import Field
+
 from app.models.enums import LessonStatus, WatchdogStatus
 from app.schemas.base import CamelModel
 
@@ -27,8 +29,16 @@ class ProgressOut(CamelModel):
 class ProgressUpdate(CamelModel):
     """Teacher self-reports where they stopped, or marks the lesson complete."""
 
-    slide: int | None = None  # 1-based slide they reached
-    total: int | None = None  # total slides (from the viewer), if known
+    # Bounded. `total` is copied onto the shared curriculum lesson, so an
+    # unbounded value from one teacher's client redefined the denominator for
+    # every teacher in every school on that lesson — a negative one made every
+    # colleague's percentage zero for good.
+    # ge=0, not ge=1: the handler already reads 0 as "not known yet", which is
+    # what the presenting bar sends before the projector has reported its page
+    # count — rejecting it would refuse a legitimate "Mark complete". What is
+    # refused is the negative and the absurd.
+    slide: int | None = Field(default=None, ge=0, le=5000)
+    total: int | None = Field(default=None, ge=0, le=5000)
     complete: bool = False
     # The class being taught. Omitted by single-class teachers (and by any
     # client predating sections), in which case the server uses their only one.

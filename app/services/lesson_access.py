@@ -189,9 +189,16 @@ def compute_access(db: Session, teacher: User) -> dict[tuple[str, str], LessonAc
                 )
             # This lesson consumes the gate; nothing further in the track opens
             # until it is completed and its own wait elapses.
-            gate_open = False
-            pending_unlock_at = None
+            #
+            # An overridden one does not. An override is an extra door an admin
+            # opened, not a place in the queue — and consuming the gate with it
+            # took access *away*: reopening a lesson finished last month locked
+            # the lesson the teacher was forty per cent through, and the server
+            # then refused to save her place in it. Adding access must not
+            # remove any.
             if not override:
+                gate_open = False
+                pending_unlock_at = None
                 sequence_blocked = True
 
     return out

@@ -153,3 +153,36 @@ def test_with_no_keys_at_all_the_mock_answers(monkeypatch):
     monkeypatch.setattr(settings, "ai_provider", "openai")
 
     assert get_provider().name == "mock"
+
+
+def test_a_reply_with_no_text_moves_to_the_next_provider(monkeypatch):
+    """A turn can carry no text at all — a content filter, a refusal, a tool
+    call — and `content` comes back null.
+
+    Calling .strip() on it raised AttributeError, which is not the LLMError the
+    chain catches, so the whole request died with healthy providers untried:
+    the exact failure this layer exists to prevent, arriving through the one
+    door it did not watch.
+    """
+    import httpx
+    from app.services.llm import OpenAICompatProvider
+
+    provider = OpenAICompatProvider(
+        name="primary", api_key="k", base_url="https://example.invalid", model="m",
+    )
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"choices": [{"message": {"content": None, "refusal": "no"}}]}
+
+    monkeypatch.setattr(httpx, "post", lambda *a, **k: _Resp())
+    with pytest.raises(LLMError) as excinfo:
+        provider.chat("sys", [{"role": "user", "content": "hi"}])
+    assert excinfo.value.kind == "unavailable"
+
+    # And in a chain, that is something the next provider gets to answer.
+    chain = ProviderChain([provider, FakeProvider("groq")])
+    assert chain.chat("sys", [{"role": "user", "content": "hi"}]) == "answer from groq"

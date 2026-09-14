@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import require_roles
-from app.models import AccessRequest, Lesson, Progress, School, SecurityLog, UploadedFile, User
+from app.models import AccessRequest, FairProject, Lesson, Progress, School, SecurityLog, UploadedFile, User
 from app.models.enums import LessonStatus, Role, SecurityStatus, UserStatus
 from app.schemas.dashboard import StalledTeacher, SuperAdminOverview
 from app.services.access_requests import PENDING, list_pending
@@ -142,19 +142,26 @@ def super_admin_overview(
     )
     stalled = stalled_teachers(db)
     # PDFs whose filename didn't parse: stored, but assigned to nobody.
+    #
+    # An ICT Fair PDF has no lesson by design, so counting it here put every
+    # fair project into "needs attention" as a name that failed to parse — a
+    # backlog the admin could never clear, since the Files page deliberately
+    # hides those same files. Excluded the way the file list excludes them.
+    fair_file_ids = select(FairProject.file_id).where(FairProject.file_id.isnot(None))
+    unsorted_only = (
+        UploadedFile.linked_lesson_id.is_(None),
+        UploadedFile.id.notin_(fair_file_ids),
+    )
     unsorted = list(
         db.scalars(
             select(UploadedFile)
-            .where(UploadedFile.linked_lesson_id.is_(None))
+            .where(*unsorted_only)
             .order_by(UploadedFile.created_at.desc())
             .limit(ATTENTION_LIMIT)
         )
     )
     unsorted_count = (
-        db.scalar(
-            select(func.count(UploadedFile.id)).where(UploadedFile.linked_lesson_id.is_(None))
-        )
-        or 0
+        db.scalar(select(func.count(UploadedFile.id)).where(*unsorted_only)) or 0
     )
 
     return SuperAdminOverview(

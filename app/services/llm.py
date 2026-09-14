@@ -214,12 +214,21 @@ class OpenAICompatProvider:
                 timeout=settings.ai_timeout_seconds,
             )
             _raise_for_status(resp.status_code)
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            # `content` is null whenever the turn carried no text — a content
+            # filter, a refusal, a tool call. `None.strip()` is an
+            # AttributeError, which is neither LLMError nor httpx.HTTPError, so
+            # it escaped the fallback chain uncaught and the request died with
+            # three healthy providers untried. Anything unreadable is an
+            # LLMError, which is what the chain moves on from.
+            content = resp.json()["choices"][0]["message"]["content"]
+            if not isinstance(content, str) or not content.strip():
+                raise LLMError("unavailable", "provider sent an empty reply")
+            return content.strip()
         except LLMError:
             raise
         except httpx.HTTPError as exc:
             raise _transport_error(exc) from exc
-        except (KeyError, IndexError, ValueError) as exc:
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError("unavailable", "provider sent an unreadable reply") from exc
 
     def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
@@ -249,7 +258,7 @@ class OpenAICompatProvider:
                     break
                 try:
                     delta = json.loads(data)["choices"][0]["delta"].get("content")
-                except (json.JSONDecodeError, KeyError, IndexError):
+                except (AttributeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
                     continue
                 if delta:
                     yield delta
@@ -287,14 +296,22 @@ class AnthropicProvider:
                 timeout=settings.ai_timeout_seconds,
             )
             _raise_for_status(resp.status_code)
-            return "".join(
-                block.get("text", "") for block in resp.json()["content"]
+            blocks = resp.json()["content"]
+            if not isinstance(blocks, list):
+                raise LLMError("unavailable", "provider sent an unreadable reply")
+            text = "".join(
+                block.get("text", "")
+                for block in blocks
+                if isinstance(block, dict)
             ).strip()
+            if not text:
+                raise LLMError("unavailable", "provider sent an empty reply")
+            return text
         except LLMError:
             raise
         except httpx.HTTPError as exc:
             raise _transport_error(exc) from exc
-        except (KeyError, IndexError, ValueError) as exc:
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError("unavailable", "provider sent an unreadable reply") from exc
 
     def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:

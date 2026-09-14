@@ -287,8 +287,14 @@ def bulk_delete(
     ids = _selected_ids(payload)
     files, lesson_ids, _missing = _expand_selection(db, ids)
 
+    # The rows go first and the bytes second. Unlinking inside the loop put an
+    # irreversible disk write ahead of the transaction meant to make this
+    # all-or-nothing: a failed commit rolled the rows back and left the PDFs
+    # gone, so every lesson still on screen 404'd while the admin was told the
+    # delete had failed. This way a failure mid-commit costs nothing, and a
+    # failure afterwards leaves an unreferenced file rather than a broken one.
+    doomed_paths = [f.storage_path for f in files]
     for uploaded in files:
-        _delete_file_bytes(uploaded)
         db.delete(uploaded)
     # Deleting the Lesson cascades its assignments, progress, chat, access
     # requests and slides.
@@ -300,6 +306,8 @@ def bulk_delete(
             deleted_lessons += 1
 
     db.commit()
+    for stored in doomed_paths:
+        _unlink_stored(stored)
     return BulkDeleteResult(deleted_files=len(files), deleted_lessons=deleted_lessons)
 
 
@@ -421,10 +429,22 @@ def link_file_to_lesson(
 
 def _delete_file_bytes(uploaded: UploadedFile) -> None:
     """Remove the stored PDF bytes from disk, ignoring if already gone."""
-    if uploaded.storage_path:
-        path = resolve_stored_file(uploaded.storage_path)
-        if path is not None:
-            path.unlink(missing_ok=True)
+    _unlink_stored(uploaded.storage_path)
+
+
+def _unlink_stored(storage_path: str | None) -> None:
+    """Delete stored bytes by path.
+
+    Takes the path rather than the row because the callers below read it while
+    the row is still live and unlink only after the commit — reaching back into
+    a deleted ORM instance for it would be a quiet way to end up never
+    deleting anything.
+    """
+    if not storage_path:
+        return
+    path = resolve_stored_file(storage_path)
+    if path is not None:
+        path.unlink(missing_ok=True)
 
 
 @router.delete("/{file_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
@@ -447,16 +467,19 @@ def delete_file(
             db.scalars(select(UploadedFile).where(UploadedFile.linked_lesson_id == lesson_id))
         )
         for f in siblings:
-            _delete_file_bytes(f)
             db.delete(f)
         lesson = db.get(Lesson, lesson_id)
         if lesson is not None:
             db.delete(lesson)
+        doomed_paths = [f.storage_path for f in siblings]
     else:
         # Unlinked file (e.g. an ICT Fair file is handled elsewhere; unsorted
         # uploads) — just remove the file itself.
-        _delete_file_bytes(uploaded)
+        doomed_paths = [uploaded.storage_path]
         db.delete(uploaded)
 
+    # Bytes after the commit, for the reason given in `bulk_delete`.
     db.commit()
+    for stored in doomed_paths:
+        _unlink_stored(stored)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

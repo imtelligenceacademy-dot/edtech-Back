@@ -38,6 +38,7 @@ from app.services.ai_usage import (
     enforce_ai_limit,
     quota_for,
     record_ai_usage,
+    refund_ai_usage,
     teacher_usage_report,
     usage_stats,
 )
@@ -641,7 +642,7 @@ def chat(
         enforce_ai_limit(db, current, "teacher")
     except AILimitExceeded as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message) from exc
-    record_ai_usage(db, current, "teacher")
+    usage_id = record_ai_usage(db, current, "teacher")
     provider = get_provider()
     try:
         # This endpoint never attaches the image — `chat()` has no vision path —
@@ -651,6 +652,8 @@ def chat(
         system = _without_image(bundle) if bundle.image_data_url else bundle.system
         content = provider.chat(system, bundle.messages)
     except Exception as exc:
+        # Nothing was said, so nothing is charged for.
+        refund_ai_usage(db, usage_id)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=_error_text(exc),
@@ -697,7 +700,7 @@ def chat_stream(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    record_ai_usage(db, current, "teacher")
+    usage_id = record_ai_usage(db, current, "teacher")
 
     # Held for the generator, which runs after this request's session is closed.
     teacher_id = current.id
@@ -740,6 +743,11 @@ def chat_stream(
                 answer="".join(answer),
                 source_ref=bundle.source_ref,
             )
+            # A reply that never produced a word cost the teacher a question
+            # and told her nothing. A partial one is an answer and stands.
+            if not answer:
+                with SessionLocal() as refund_db:
+                    refund_ai_usage(refund_db, usage_id)
 
     return StreamingResponse(
         event_stream(),

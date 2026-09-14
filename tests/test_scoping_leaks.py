@@ -239,3 +239,105 @@ def test_the_proxy_count_follows_the_deployment(monkeypatch):
     assert dev.proxy_hops == 0
     assert prod.proxy_hops == 1
     assert explicit.proxy_hops == 2
+
+
+# --------------------------------------------------------------------------- #
+# Granting access must add access, never remove it
+# --------------------------------------------------------------------------- #
+def test_reopening_a_finished_lesson_leaves_the_current_one_open(db):
+    """An override is an extra door, not a place in the queue.
+
+    Reopening a lesson finished last month used to lock the lesson the teacher
+    was part-way through — and the progress endpoint then refused her writes,
+    so she could not save her place in the lesson she was actually teaching.
+    """
+    from datetime import datetime, timedelta, timezone
+    from app.models import Lesson, LessonAssignment, Progress
+    from app.models.enums import LessonStatus
+    from app.services.lesson_access import compute_access
+
+    school = School(id=new_id("sch"), name="S", program_year=2)
+    db.add(school)
+    teacher = User(
+        id=new_id("u"), name="T", email=f"{new_id('e')}@x.com", password_hash="x",
+        role=Role.teacher, status=UserStatus.active, school_id=school.id,
+        grades=["G8"], language="en", sections={},
+    )
+    db.add(teacher)
+    db.flush()
+
+    lessons = []
+    for n in (1, 2, 3):
+        les = Lesson(
+            id=new_id("les"), title=f"Grade 8 python lesson 0{n}", grade=8,
+            subject="STEAM", language="en", year=2, course="python", lesson_no=n,
+        )
+        db.add(les)
+        db.flush()
+        db.add(LessonAssignment(
+            id=new_id("la"), lesson_id=les.id, teacher_id=teacher.id, source="rule"
+        ))
+        lessons.append(les)
+
+    long_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    db.add(Progress(
+        id=new_id("pr"), teacher_id=teacher.id, lesson_id=lessons[0].id, section="",
+        status=LessonStatus.completed, percent_complete=100, completed_at=long_ago,
+        unlocked_override=False,
+    ))
+    db.add(Progress(
+        id=new_id("pr"), teacher_id=teacher.id, lesson_id=lessons[1].id, section="",
+        status=LessonStatus.in_progress, percent_complete=40, last_slide=8,
+    ))
+    db.commit()
+
+    before = compute_access(db, teacher)
+    assert before[(lessons[1].id, "")].status == "available"
+
+    # The admin reopens lesson 1 so she can re-teach it.
+    reopened = db.query(Progress).filter(
+        Progress.lesson_id == lessons[0].id, Progress.teacher_id == teacher.id
+    ).one()
+    reopened.unlocked_override = True
+    db.commit()
+
+    after = compute_access(db, teacher)
+    assert after[(lessons[0].id, "")].status == "available", "the reopened lesson"
+    assert after[(lessons[1].id, "")].status == "available", (
+        "granting access to an old lesson must not take it away from the current one"
+    )
+    # And it must not hand out the whole rest of the track either.
+    assert after[(lessons[2].id, "")].status == "locked"
+
+
+def test_an_account_below_super_admin_needs_a_school(db):
+    """A school-less school-admin is not a harmless half-filled form.
+
+    Their scoping renders as `school_id IS NULL`, which selects the
+    super-admins' security events and the entire global curriculum rather than
+    nothing at all. Both the create and the edit path refuse it.
+    """
+    from fastapi import HTTPException
+    from app.routers import users as users_router
+    from app.schemas.user import UserCreate
+
+    with pytest.raises(HTTPException) as excinfo:
+        users_router.create_user(
+            UserCreate(
+                name="No School", email=f"{new_id('e')}@x.com",
+                password="a-long-enough-password", role=Role.school_admin,
+                school_id=None,
+            ),
+            db=db, _=None,
+        )
+    assert excinfo.value.status_code == 400
+
+    # A super-admin legitimately has none.
+    made = users_router.create_user(
+        UserCreate(
+            name="Boss", email=f"{new_id('e')}@x.com",
+            password="a-long-enough-password", role=Role.super_admin,
+        ),
+        db=db, _=None,
+    )
+    assert made.school_id is None

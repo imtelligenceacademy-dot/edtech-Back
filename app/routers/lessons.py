@@ -795,7 +795,18 @@ def reset_teacher_progress(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found")
 
     if payload.section is not None:
-        allowed = {s for token in (teacher.grades or []) for s in sections_for(teacher, token)}
+        # Scoped to the lesson's grade when there is one, which is what the
+        # override endpoint beside this already does. Built from the teacher's
+        # *current* grades, this refused to reset a track for a grade they no
+        # longer hold — a track the same screen was showing, and which Grant
+        # access could still act on.
+        lesson = db.get(Lesson, payload.lesson_id) if payload.lesson_id else None
+        if lesson is not None:
+            allowed = set(sections_for(teacher, lesson.grade))
+        else:
+            allowed = {
+                s for token in (teacher.grades or []) for s in sections_for(teacher, token)
+            }
         if payload.section not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -861,12 +872,15 @@ def unassign_teacher(
     )
     if assignment:
         db.delete(assignment)
-    progress = db.scalar(
+    # Every class's row. `scalar` took one of them, so a teacher who takes the
+    # same grade four times kept three rows with no assignment behind them:
+    # they still counted in reports, and re-assigning the lesson later found
+    # them and resumed those classes as already completed.
+    for progress in db.scalars(
         select(Progress).where(
             Progress.lesson_id == lesson_id, Progress.teacher_id == teacher_id
         )
-    )
-    if progress:
+    ):
         db.delete(progress)
     db.commit()
 

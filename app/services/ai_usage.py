@@ -59,18 +59,42 @@ def enforce_ai_limit(db: Session, user: User, kind: str) -> None:
         )
 
 
-def record_ai_usage(db: Session, user: User, kind: str) -> None:
-    """Log one AI interaction. Commits immediately so the row survives even when
-    the caller returns a streaming response (whose generator runs later)."""
+def record_ai_usage(db: Session, user: User, kind: str) -> str:
+    """Log one AI interaction and return its id, so a caller that ends up with
+    nothing to show can hand the question back.
+
+    Commits immediately so the row survives even when the caller returns a
+    streaming response (whose generator runs later)."""
+    usage_id = new_id("aiu")
     db.add(
         AiUsage(
-            id=new_id("aiu"),
+            id=usage_id,
             user_id=user.id,
             school_id=user.school_id,
             role=user.role,
             kind=kind,
         )
     )
+    db.commit()
+    return usage_id
+
+
+def refund_ai_usage(db: Session, usage_id: str | None) -> None:
+    """Give back a question that was charged for an answer never delivered.
+
+    Usage is recorded before the provider is called, because a streaming reply
+    is written after this request's session has closed and a row added later
+    would not survive. The cost of that order is a question spent on a failure:
+    with the whole chain down a teacher could retry through her entire hourly
+    allowance, receive nothing but error frames, and then be locked out for the
+    hour once it came back. Charged up front, refunded when nothing was said.
+    """
+    if not usage_id:
+        return
+    row = db.get(AiUsage, usage_id)
+    if row is None:
+        return
+    db.delete(row)
     db.commit()
 
 
