@@ -42,6 +42,24 @@ def _may_read(current: User, log: SecurityLog) -> bool:
     return log.user_id == current.id
 
 
+def _may_see_account(current: User, account: User | None) -> bool:
+    """Whether this caller may be shown an account's state as it stands now.
+
+    `_may_read` answers a different question — may they read this one historical
+    row — and the two are not the same question. A row written while a teacher
+    was at one school stays that school's to read for good, but the sessions she
+    has open this minute belong to wherever she is today, and to the admin of
+    that school rather than the previous one.
+    """
+    if account is None:
+        return False
+    if current.role == Role.super_admin:
+        return True
+    if current.role == Role.school_admin:
+        return account.school_id is not None and account.school_id == current.school_id
+    return account.id == current.id
+
+
 def _resolve_locations(db: Session, logs: list[SecurityLog]) -> None:
     """Fill in missing locations and keep the answer on the row.
 
@@ -131,8 +149,13 @@ def security_log_detail(
     if log.ip:
         # Scoped exactly like the list this row came from. Unscoped, the
         # "who else used this address" panel handed a teacher the names and
-        # sign-in counts of every account on the platform that shares their
-        # ISP — the one place in this router that read outside its lane.
+        # sign-in counts of every account on the platform that shares their ISP.
+        #
+        # This used to claim it was the only place in the router reading outside
+        # its lane. It was not — the two panels below it were doing the same
+        # thing — and saying so is most of why they went unnoticed for as long
+        # as they did. Every read on this endpoint is scoped or gated now; if
+        # another panel is added, it needs to be one or the other too.
         rows = list(
             db.execute(
                 _scope(
@@ -174,14 +197,32 @@ def security_log_detail(
     recent: list[SecurityLog] = []
     sessions: list[SessionOut] = []
     if log.user_id:
+        # Scoped like everything else in this router. Reading one row of school
+        # A's does not entitle the reader to the rest of that account's history,
+        # and the two come apart the moment somebody changes school: the row
+        # stays school A's to read, while the events the account has generated
+        # since belong to wherever it is now.
         recent = list(
             db.scalars(
-                select(SecurityLog)
-                .where(SecurityLog.user_id == log.user_id, SecurityLog.id != log.id)
+                _scope(
+                    select(SecurityLog).where(
+                        SecurityLog.user_id == log.user_id, SecurityLog.id != log.id
+                    ),
+                    current,
+                )
                 .order_by(SecurityLog.timestamp.desc())
                 .limit(10)
             )
         )
+
+    # Sessions are the account as it stands now — which address it is signed in
+    # from, on what device, this minute — and a refresh token carries no school
+    # of its own to scope by, so the question has to be asked of the account
+    # instead. Reading a historical row is not the same permission: a teacher
+    # who has moved on takes her live sessions with her, and her old school's
+    # admin should not be watching them.
+    account = db.get(User, log.user_id) if log.user_id else None
+    if _may_see_account(current, account):
         now = datetime.now(timezone.utc)
         for token in db.scalars(
             select(RefreshToken)

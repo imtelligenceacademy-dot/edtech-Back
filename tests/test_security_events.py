@@ -214,6 +214,108 @@ def test_a_school_admin_is_confined_to_their_own_school(db):
     assert err.value.status_code == 403
 
 
+def _move_to(db, user: User, school: School) -> None:
+    """What a super-admin does through the accounts screen. Rows already written
+    keep the school they were written under; new ones carry the new school."""
+    user.school_id = school.id
+    db.commit()
+
+
+def test_an_old_school_cannot_read_the_events_a_teacher_generated_after_leaving(db):
+    """Reading one row is not reading the account.
+
+    The row stays the old school's to open — it was written there, and their
+    admin is entitled to their own history. What does not come with it is
+    everything that account has done since, at a school this admin has nothing
+    to do with. `_may_read` passed and the panel underneath it was unscoped, so
+    it did.
+    """
+    here, elsewhere = _school(db), _school(db)
+    admin = _user(db, here, role=Role.school_admin, name="Admin")
+    teacher = _user(db, here, name="Rita")
+    log = _login(db, teacher, "203.0.113.10")
+
+    _move_to(db, teacher, elsewhere)
+    after_leaving = _login(db, teacher, "203.0.113.11")
+
+    detail = security_log_detail(log_id=log.id, db=db, current=admin)
+
+    seen = {r.id for r in detail.recent_events}
+    assert after_leaving.id not in seen, (
+        "the old school's admin is reading events from the new school"
+    )
+
+
+def test_a_school_keeps_seeing_its_own_history_for_a_teacher_who_left(db):
+    """The other half, so the fix is scoping and not simply switching it off.
+
+    An admin opening an old incident still gets the context around it — the
+    failures that preceded it, at their school, while she worked there.
+    """
+    here, elsewhere = _school(db), _school(db)
+    admin = _user(db, here, role=Role.school_admin, name="Admin")
+    teacher = _user(db, here, name="Rita")
+    earlier = _login(db, teacher, "203.0.113.12")
+    log = _login(db, teacher, "203.0.113.12")
+
+    _move_to(db, teacher, elsewhere)
+
+    detail = security_log_detail(log_id=log.id, db=db, current=admin)
+
+    assert earlier.id in {r.id for r in detail.recent_events}
+
+
+def test_live_sessions_belong_to_the_school_the_teacher_is_at_now(db):
+    """A session is the account this minute, not a row in its past.
+
+    A refresh token carries no school of its own, so there is nothing on it to
+    scope by — the question has to be asked of the account. Unasked, an admin
+    could open a year-old row and read the address and device a teacher is
+    signed in from today, at a school they have no claim on.
+    """
+    here, elsewhere = _school(db), _school(db)
+    admin = _user(db, here, role=Role.school_admin, name="Admin")
+    teacher = _user(db, here, name="Rita")
+    log = _login(db, teacher, "203.0.113.13")
+    db.add(
+        RefreshToken(
+            id=new_id("rt"),
+            user_id=teacher.id,
+            token_hash=new_id("h"),
+            expires_at=datetime.now(timezone.utc) + timedelta(days=7),
+            user_agent=CHROME_WIN,
+            ip="203.0.113.13",
+        )
+    )
+    db.commit()
+
+    # While she is still here, her admin can see them.
+    assert len(security_log_detail(log_id=log.id, db=db, current=admin).active_sessions) == 1
+
+    _move_to(db, teacher, elsewhere)
+
+    detail = security_log_detail(log_id=log.id, db=db, current=admin)
+    assert detail.active_sessions == [], (
+        "her sessions moved with her; the old school should not be watching them"
+    )
+    # The row itself is still theirs to read.
+    assert detail.log.id == log.id
+
+
+def test_a_super_admin_still_sees_the_whole_account(db):
+    """Scoping is per role, and the super-admin's lane is the platform."""
+    here, elsewhere = _school(db), _school(db)
+    boss = _user(db, here, role=Role.super_admin, name="Owner")
+    teacher = _user(db, here, name="Rita")
+    log = _login(db, teacher, "203.0.113.14")
+    _move_to(db, teacher, elsewhere)
+    after_leaving = _login(db, teacher, "203.0.113.15")
+
+    detail = security_log_detail(log_id=log.id, db=db, current=boss)
+
+    assert after_leaving.id in {r.id for r in detail.recent_events}
+
+
 # --- Location -------------------------------------------------------------- #
 
 
