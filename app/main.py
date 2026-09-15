@@ -12,12 +12,15 @@ import contextlib
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import settings
-from app.database import SessionLocal
+from sqlalchemy import text
+
+from app.database import SessionLocal, engine
+from app.migrate import VERSION_TABLE
 from app.migrate import run_migrations
 from app.services.backup import email_backup_now
 from app.services.chat_history import purge_expired
@@ -185,5 +188,55 @@ for r in (auth, users, schools, lessons, progress, reports, security, files, das
 
 
 @app.get("/health", tags=["meta"])
-def health() -> dict[str, str]:
-    return {"status": "ok", "environment": settings.environment}
+def health(response: Response) -> dict[str, str | None]:
+    """Whether this instance can actually serve a request.
+
+    It used to return a constant. That is not a health check — it is a check
+    that the process is running, which the fact of answering already proves.
+    Every way this app really fails leaves it answering perfectly: the database
+    unreachable, the connection pool exhausted, a deploy whose migrations did
+    not run. All of those returned "ok", so a deploy gated on this went green
+    over an application that could not serve a single page, and nothing here
+    ever went red while something was wrong.
+
+    So it asks the database, which is the dependency everything else needs. One
+    trivial query, on the real pool, so an exhausted pool fails it the same way
+    an unreachable host does.
+
+    The revision is reported because a stamped schema is the other thing worth
+    knowing after a deploy and there was no way to see it from outside — this
+    afternoon it took a login attempt against production to infer. It is
+    best-effort: a database that answers but cannot say which migration it is on
+    is a diagnostic gap, not a reason to fail a deploy, so it is reported as
+    null and the status stays on the question that matters.
+
+    Nothing from the exception reaches the caller. This endpoint is public, and
+    a driver error carries the host and user it failed to connect as. It goes to
+    the log instead, which since the logging fix actually arrives somewhere.
+    """
+    revision: str | None = None
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            try:
+                revision = conn.execute(
+                    text(f"SELECT version_num FROM {VERSION_TABLE}")
+                ).scalar()
+            except Exception:
+                logger.warning("health: database is up but has no recorded revision")
+    except Exception:
+        logger.exception("health: the database could not be reached")
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "status": "degraded",
+            "environment": settings.environment,
+            "database": "unreachable",
+            "revision": None,
+        }
+
+    return {
+        "status": "ok",
+        "environment": settings.environment,
+        "database": "ok",
+        "revision": revision,
+    }
