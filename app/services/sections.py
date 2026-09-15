@@ -191,6 +191,33 @@ def ensure_progress_rows(
 SECTION_KEYED_MODELS = (Progress, ChatMessage, AccessRequest)
 
 
+def _lessons_already_keyed(db: Session, teacher: User, section: str, lesson_ids) -> set[str]:
+    """Lessons this teacher already has some history for under `section`.
+
+    Any of the three tables counts, and the answer is one set shared by all of
+    them. A class that has only asked the assistant about a lesson, without ever
+    opening it, is still a class that has that lesson — and folding another
+    class's conversation in on top of it is exactly what must not happen.
+
+    Deciding this per table instead lets one class's record of a lesson end up
+    split across two labels, which is worse than either merging or not moving:
+    the progress stays put while the conversation and the pending request walk
+    off to a class that never asked for them.
+    """
+    taken: set[str] = set()
+    for model in SECTION_KEYED_MODELS:
+        taken.update(
+            db.scalars(
+                select(model.lesson_id).where(
+                    model.teacher_id == teacher.id,
+                    model.section == section,
+                    model.lesson_id.in_(lesson_ids),
+                )
+            )
+        )
+    return taken
+
+
 def rename_section(
     db: Session, teacher: User, grade: int | str, old: str, new: str
 ) -> int:
@@ -217,32 +244,22 @@ def rename_section(
         return 0
     lesson_ids = select(Lesson.id).where(Lesson.grade == grade_int)
 
+    # Never merge two classes: a lesson the new label already holds any history
+    # for keeps the old label's rows where they are, rather than colliding with
+    # it or silently folding two rooms' records together. Decided once, for the
+    # lesson, so that a lesson either moves wholesale or does not move at all.
+    taken = _lessons_already_keyed(db, teacher, new, lesson_ids)
+
     moved = 0
     for model in SECTION_KEYED_MODELS:
-        rows = list(
-            db.scalars(
-                select(model).where(
-                    model.teacher_id == teacher.id,
-                    model.section == old,
-                    model.lesson_id.in_(lesson_ids),
-                )
+        for row in db.scalars(
+            select(model).where(
+                model.teacher_id == teacher.id,
+                model.section == old,
+                model.lesson_id.in_(lesson_ids),
             )
-        )
-        # Never merge two classes: if the new label already has a row for this
-        # lesson, the old one stays where it is rather than colliding with it or
-        # silently folding two rooms' histories together.
-        taken = {
-            row.lesson_id
-            for row in db.scalars(
-                select(model).where(
-                    model.teacher_id == teacher.id,
-                    model.section == new,
-                    model.lesson_id.in_(lesson_ids),
-                )
-            )
-        }
-        for row in rows:
-            if model is Progress and row.lesson_id in taken:
+        ):
+            if row.lesson_id in taken:
                 continue
             row.section = new
             moved += 1
@@ -274,48 +291,28 @@ def sync_progress_sections(
     if teacher.role != Role.teacher:
         return
 
-    grade_of_lesson = {
-        lesson_id: grade
-        for lesson_id, grade in db.execute(
-            select(Progress.lesson_id, Lesson.grade)
-            .join(Lesson, Lesson.id == Progress.lesson_id)
-            .where(Progress.teacher_id == teacher.id)
-            .distinct()
-        )
-    }
-
     for token in set(before) | set(after) | set(teacher.grades or []):
         old = (before.get(token) or [NO_SECTION])[0]
         new = (after.get(token) or [NO_SECTION])[0]
         if old == new:
             continue
 
-        rows = [
-            p
-            for p in db.scalars(
-                select(Progress).where(
-                    Progress.teacher_id == teacher.id, Progress.section == old
-                )
-            )
-            if grade_token(grade_of_lesson.get(p.lesson_id, -1)) == token
-        ]
-        if not rows:
+        grade_int = grade_number(token)
+        if grade_int is None:
             continue
+        grade_lessons = select(Lesson.id).where(Lesson.grade == grade_int)
 
-        # Never re-key onto a lesson that already has a row for the new section:
-        # that would collide on (teacher, lesson, section) and, worse, silently
-        # merge two classes' histories into one.
-        taken = {
-            p.lesson_id
-            for p in db.scalars(
-                select(Progress).where(
-                    Progress.teacher_id == teacher.id, Progress.section == new
-                )
-            )
-        }
-        for row in rows:
-            if row.lesson_id not in taken:
-                row.section = new
+        # Never merge two classes: a lesson the new label already holds any
+        # history for keeps the old label's rows where they are.
+        #
+        # One decision, applied to progress, conversations and pending requests
+        # alike. Progress used to be guarded on its own and the other two moved
+        # unconditionally underneath it, so the case where the guard fired was
+        # the case that did the damage: the progress correctly stayed put while
+        # that class's conversation and its pending request were re-keyed onto
+        # a class that had never asked for them. Granting such a request then
+        # unlocked a lesson for the wrong room.
+        taken = _lessons_already_keyed(db, teacher, new, grade_lessons)
 
         # Progress is not the only thing keyed to a class. A teacher's
         # conversations and her pending access requests carry the same label,
@@ -324,13 +321,7 @@ def sync_progress_sections(
         # granting one of those requests unlocked nothing — the grant looked at
         # the class she is now in, found no row, and wrote a fresh overridden
         # one against the old label while she stayed blocked.
-        grade_int = grade_number(token)
-        if grade_int is None:
-            continue
-        grade_lessons = select(Lesson.id).where(Lesson.grade == grade_int)
         for model in SECTION_KEYED_MODELS:
-            if model is Progress:
-                continue  # handled above, with its collision guard
             for row in db.scalars(
                 select(model).where(
                     model.teacher_id == teacher.id,
@@ -338,4 +329,6 @@ def sync_progress_sections(
                     model.lesson_id.in_(grade_lessons),
                 )
             ):
+                if row.lesson_id in taken:
+                    continue
                 row.section = new

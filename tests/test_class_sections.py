@@ -589,6 +589,90 @@ def test_a_rename_never_merges_two_classes(db, world):
     assert find_progress(db, teacher.id, l1.id, "B").status != LessonStatus.completed
 
 
+def test_a_refused_move_keeps_the_conversation_with_its_progress(db, world):
+    """A lesson moves wholesale or not at all.
+
+    The guard used to cover progress only, so the case where it fired was the
+    case that did the damage: 6A's row correctly stayed put while 6A's
+    conversation and its pending request were re-keyed onto 6B underneath it.
+    One class's record of a lesson must not end up split across two labels.
+    """
+    teacher, (l1, _, _) = world["teacher"], world["lessons"]
+    _complete(db, teacher, l1, "A")
+    _chat(db, teacher, l1, "A", "asked in 6A")
+    _chat(db, teacher, l1, "B", "asked in 6B")
+    _request(db, teacher, l1, "A")
+
+    rename_section(db, teacher, 6, "A", "B")
+    db.commit()
+
+    assert find_progress(db, teacher.id, l1.id, "A") is not None
+    by_section = {m.section: m.content for m in _all(db, ChatMessage, teacher)}
+    assert by_section == {"A": "asked in 6A", "B": "asked in 6B"}, (
+        "6A's conversation followed its progress instead of merging into 6B"
+    )
+    assert [r.section for r in _all(db, AccessRequest, teacher)] == ["A"]
+
+
+def test_removing_a_class_does_not_fold_its_history_into_another(db, world):
+    """The same failure through the account editor rather than a rename.
+
+    Deleting 6A from a teacher who takes 6A and 6B makes the first label 6B, so
+    the sync tries to move A's rows onto B. B already has a row for every
+    lesson, so no progress moves — and nothing else should either. Granting a
+    request that had quietly become 6B's would unlock a lesson for a class that
+    never asked for it.
+    """
+    teacher, (l1, l2, _) = world["teacher"], world["lessons"]
+    _complete(db, teacher, l1, "A")
+    _chat(db, teacher, l1, "A", "asked in 6A")
+    _request(db, teacher, l2, "A")
+
+    before = dict(teacher.sections)
+    teacher.sections = {"G6": ["B"]}
+    sync_progress_sections(db, teacher, before, teacher.sections)
+    db.commit()
+
+    assert find_progress(db, teacher.id, l1.id, "A").status == LessonStatus.completed
+    assert [m.section for m in _all(db, ChatMessage, teacher)] == ["A"]
+    assert [r.section for r in _all(db, AccessRequest, teacher)] == ["A"]
+
+
+def test_removing_a_class_carries_its_history_when_nothing_blocks_it(db):
+    """The other half of the rule, so the guard cannot be satisfied by freezing.
+
+    With no row under the destination for that lesson, the class's progress,
+    conversation and pending request all follow the label together — which is
+    what makes granting the request unlock the lesson she is actually blocked on.
+    """
+    school = School(id=new_id("sch"), name="S-move", program_year=2)
+    db.add(school)
+    db.flush()
+    teacher = _teacher(db, school, ["G6"], {"G6": ["A", "B"]})
+    lessons = _lessons(db, teacher, 6, 2)
+    ensure_progress_for_lessons(db, teacher, lessons)
+    db.flush()  # the rows are not readable back until they are written
+    # Only 6A has ever touched these lessons; 6B's rows are cleared away so the
+    # destination is genuinely empty.
+    for row in _rows(db, teacher):
+        if row.section == "B":
+            db.delete(row)
+    db.flush()
+    _complete(db, teacher, lessons[0], "A")
+    _chat(db, teacher, lessons[0], "A", "asked in 6A")
+    _request(db, teacher, lessons[1], "A")
+
+    before = dict(teacher.sections)
+    teacher.sections = {"G6": ["B"]}
+    sync_progress_sections(db, teacher, before, teacher.sections)
+    db.commit()
+
+    assert find_progress(db, teacher.id, lessons[0].id, "B").status == LessonStatus.completed
+    assert find_progress(db, teacher.id, lessons[0].id, "A") is None
+    assert [m.section for m in _all(db, ChatMessage, teacher)] == ["B"]
+    assert [r.section for r in _all(db, AccessRequest, teacher)] == ["B"]
+
+
 def test_editing_an_account_applies_a_rename(db):
     school = School(id=new_id("sch"), name="S11", program_year=2)
     db.add(school)
