@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.audit import note_unfamiliar_signin, record_event
@@ -90,15 +91,52 @@ def _account_lock_minutes(failed_count: int) -> int:
     return min(minutes, settings.max_lockout_minutes)
 
 
+def _locked_for_update(db: Session, model, primary_key):
+    """Re-read a row with it locked, and with the loaded copy refreshed from it.
+
+    The counters this module keeps are read-modify-write in Python — read the
+    number, add one, decide whether that crossed a threshold — and each request
+    gets its own snapshot of the database. Twenty attempts fired at once
+    therefore all read the same number, all computed the same "one more", and
+    the row finished at one. Both limits could be walked straight past by
+    sending the guesses in parallel rather than in series, which costs an
+    attacker nothing at all: the account lockout never armed, and neither did
+    the per-network throttle.
+
+    `populate_existing` is the half that is easy to leave out. Without it the
+    session hands back the instance it already has, with the stale number still
+    on it, and the lock protects a value that was read before it was taken.
+
+    SQLite ignores FOR UPDATE, and can: it takes a database-wide write lock for
+    the duration of a write transaction, so the serialisation is already there.
+    """
+    return db.get(
+        model, primary_key, with_for_update=True, populate_existing=True
+    )
+
+
 def _get_ip_throttle(db: Session, ip: str) -> LoginThrottle | None:
     if not ip:
         return None
-    throttle = db.get(LoginThrottle, ip)
-    if throttle is None:
+    throttle = _locked_for_update(db, LoginThrottle, ip)
+    if throttle is not None:
+        return throttle
+
+    # The first failure from an address has no row to lock yet, and two of them
+    # can arrive together. Attempting the insert and letting the loser re-read
+    # is the only version of this that is safe: checking first and then
+    # inserting raced, and the loser's IntegrityError came out of flush() as an
+    # unhandled 500 — which also rolled back the failure it was in the middle of
+    # recording, so the attempt was never counted against anybody.
+    savepoint = db.begin_nested()
+    try:
         throttle = LoginThrottle(ip=ip)
         db.add(throttle)
-        db.flush()
-    return throttle
+        savepoint.commit()
+        return throttle
+    except IntegrityError:
+        savepoint.rollback()
+        return _locked_for_update(db, LoginThrottle, ip)
 
 
 def _enforce_ip_throttle(db: Session, ip: str, now: datetime) -> None:
@@ -233,8 +271,17 @@ def login(
         valid = False
 
     if not valid:
-        _record_ip_failure(db, ip, now)
         if user:
+            # Re-read the row with it locked, and take the count from *that*
+            # rather than from the copy loaded before the password was checked.
+            # Everything below is read-modify-write in Python, and the account
+            # is the one row several requests contend for at exactly the moment
+            # it matters. See `_locked_for_update`.
+            user = _locked_for_update(db, User, user.id)
+            already_locked = bool(
+                user.locked_until and _aware(user.locked_until) > now
+            )
+
             # An attempt against an account that is already locked counts
             # against the network and nothing else. It used to re-arm the
             # lockout every time, which meant the lock never actually expired
@@ -244,50 +291,54 @@ def login(
             # reset bought only until the next attempt. It also wrote a second
             # security-log row each time, flooding the screen an admin would go
             # to in order to understand why.
-            if locked:
+            if already_locked:
                 record_event(
                     db, event=SecurityEvent.failed_login, status=SecurityStatus.warning,
                     ip=ip, device=device, user=user,
                     detail="Wrong password while already locked out",
                 )
-                db.commit()
-                raise _INVALID_CREDENTIALS
+            else:
+                # A run of failures that has gone quiet for longer than the
+                # window is over, and the next one starts a new run. Without
+                # this the count only ever climbed, so the escalation below
+                # described the account's whole history rather than the burst in
+                # front of it.
+                window_started = _aware(user.failed_login_window_started_at)
+                if window_started is None or window_started <= now - timedelta(
+                    minutes=settings.failed_login_window_minutes
+                ):
+                    user.failed_login_count = 0
+                    user.failed_login_window_started_at = now
 
-            # A run of failures that has gone quiet for longer than the window
-            # is over, and the next one starts a new run. Without this the count
-            # only ever climbed, so the escalation below described the account's
-            # whole history rather than the burst in front of it.
-            window_started = _aware(user.failed_login_window_started_at)
-            if window_started is None or window_started <= now - timedelta(
-                minutes=settings.failed_login_window_minutes
-            ):
-                user.failed_login_count = 0
-                user.failed_login_window_started_at = now
-
-            user.failed_login_count += 1
-            locked_for = 0
-            if user.failed_login_count >= settings.max_failed_logins:
-                locked_for = _account_lock_minutes(user.failed_login_count)
-                user.locked_until = now + timedelta(minutes=locked_for)
-            # A wrong password was logged as "new-ip", so the screen reported an
-            # address change that had not happened. It says what it is now.
-            record_event(
-                db, event=SecurityEvent.failed_login, status=SecurityStatus.warning,
-                ip=ip, device=device, user=user,
-                detail=(
-                    f"Wrong password (attempt {user.failed_login_count} of "
-                    f"{settings.max_failed_logins})"
-                ),
-            )
-            if locked_for:
+                user.failed_login_count += 1
+                locked_for = 0
+                if user.failed_login_count >= settings.max_failed_logins:
+                    locked_for = _account_lock_minutes(user.failed_login_count)
+                    user.locked_until = now + timedelta(minutes=locked_for)
+                # A wrong password was logged as "new-ip", so the screen reported
+                # an address change that had not happened. It says what it is now.
                 record_event(
-                    db, event=SecurityEvent.account_locked, status=SecurityStatus.blocked,
+                    db, event=SecurityEvent.failed_login, status=SecurityStatus.warning,
                     ip=ip, device=device, user=user,
                     detail=(
-                        f"Locked for {locked_for} min after "
-                        f"{user.failed_login_count} failed attempts"
+                        f"Wrong password (attempt {user.failed_login_count} of "
+                        f"{settings.max_failed_logins})"
                     ),
                 )
+                if locked_for:
+                    record_event(
+                        db, event=SecurityEvent.account_locked, status=SecurityStatus.blocked,
+                        ip=ip, device=device, user=user,
+                        detail=(
+                            f"Locked for {locked_for} min after "
+                            f"{user.failed_login_count} failed attempts"
+                        ),
+                    )
+
+        # After the account, always: the two rows are taken in this order on
+        # every path that touches both, so two requests cannot each hold the one
+        # the other is waiting for.
+        _record_ip_failure(db, ip, now)
         db.commit()
         raise _INVALID_CREDENTIALS
 
@@ -312,6 +363,12 @@ def login(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active")
 
     # Success: reset lockout, upgrade hash if needed, stamp login, issue session.
+    # The account is locked first here too. Nothing below it needs the row's
+    # current contents — every write is unconditional — but a signing-in request
+    # and a failing one both touch these same two rows, and taking them in the
+    # same order on both paths is what stops each holding the one the other is
+    # waiting for.
+    user = _locked_for_update(db, User, user.id)
     user.clear_lockout()
     _clear_ip_failures(db, ip)
     user.last_login_at = now

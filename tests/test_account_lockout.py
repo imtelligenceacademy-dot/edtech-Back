@@ -23,10 +23,11 @@ from fastapi.testclient import TestClient
 from sqlalchemy import delete, select
 
 from app.config import settings
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.main import app
 from app.models import LoginThrottle, SecurityLog, User
 from app.models.enums import Role, SecurityEvent, UserStatus
+from app.routers.auth import _get_ip_throttle, _locked_for_update
 from app.security import hash_password
 from app.utils import new_id
 
@@ -212,3 +213,76 @@ def test_signing_in_clears_the_record(client, db, teacher):
     assert teacher.failed_login_window_started_at is None, (
         "a stale window would make the next typo count as part of the old run"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Counting in parallel
+# --------------------------------------------------------------------------- #
+def test_a_failure_is_counted_against_the_row_as_it_stands_now(db, teacher):
+    """The count is read again, under the lock, before it is added to.
+
+    Every increment here is read-modify-write in Python, and each request has
+    its own view of the database. Attempts fired at once therefore all read the
+    same number, all wrote the same "one more", and the account finished at one
+    — so the lockout and the network throttle could both be stepped straight
+    past by sending the guesses together instead of in turn, which costs an
+    attacker nothing.
+
+    `populate_existing` is the half that is easy to miss. Without it the session
+    hands back the copy it already holds, and the lock is guarding a number that
+    was read before it was taken.
+    """
+    assert teacher.failed_login_count == 0
+
+    # Another request gets there first and commits.
+    other = SessionLocal()
+    try:
+        theirs = other.get(User, teacher.id)
+        theirs.failed_login_count = 3
+        other.commit()
+    finally:
+        other.close()
+
+    # This session is still holding what it loaded, which no longer matches.
+    assert teacher.failed_login_count == 0, "precondition: the loaded copy is stale"
+
+    fresh = _locked_for_update(db, User, teacher.id)
+
+    assert fresh is teacher, "the same instance, refreshed in place"
+    assert fresh.failed_login_count == 3, (
+        "the increment has to start from what the row says, not from what this "
+        "request read before the lock"
+    )
+
+
+def test_two_first_failures_from_one_address_do_not_collide(db, monkeypatch):
+    """The first failure from an address has no row to lock yet.
+
+    Two of them can arrive together, and the old check-then-insert let both
+    decide to insert. The loser's IntegrityError came out of flush() as an
+    unhandled 500 and took its own transaction with it, so the attempt it was
+    recording was never counted against anybody — a way to fail at an account
+    for free, from a fresh address, as often as you liked.
+
+    The race is forced here rather than raced for: the lookup is made to miss
+    once, against a row that does exist, which is the state the loser is in.
+    """
+    ip = f"198.51.100.{new_id('x')[-2:]}"
+    db.add(LoginThrottle(ip=ip))
+    db.commit()
+
+    real_get = db.get
+    missed_once = {"done": False}
+
+    def _miss_once(model, ident, **kwargs):
+        if model is LoginThrottle and not missed_once["done"]:
+            missed_once["done"] = True
+            return None
+        return real_get(model, ident, **kwargs)
+
+    monkeypatch.setattr(db, "get", _miss_once)
+
+    throttle = _get_ip_throttle(db, ip)
+
+    assert throttle is not None, "the loser has to end up with the winner's row"
+    assert throttle.ip == ip
