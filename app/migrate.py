@@ -72,6 +72,7 @@ _SCHEMA_MARKERS: tuple[tuple[str, str, str | None], ...] = (
     ("9b3d71c8a4e5", "progress", "section"),
     ("c47f0a6e21b8", "chat_messages", "section"),
     ("f3a91c47b2e5", "users", "failed_login_window_started_at"),
+    ("c5d82b1e4f07", "login_throttles", "cycle_started_at"),
 )
 
 

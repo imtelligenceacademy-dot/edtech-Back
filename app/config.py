@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     login_ip_max_failures: int = 5
     login_ip_window_minutes: int = 15
     login_ip_ban_cycles: int = 2
+    # How long a run of completed cycles stays on an address's record. Cycles
+    # are the only route to the 24-hour ban and they used to be cleared by a
+    # successful sign-in and nothing else, which is both too easy — one success
+    # from anyone behind a shared address wiped them — and too hard, since an
+    # address nobody ever signs in from kept them forever. Two hours is long
+    # enough to join up a sustained attack and short enough that a bad morning
+    # does not join up with a bad afternoon.
+    login_ip_cycle_window_minutes: int = 120
     # How long a network ban lasts. It used to last forever: `blocked_at` was
     # written in one place and cleared in none, so a ban could only be undone
     # by editing the database by hand — and with a spoofable client address

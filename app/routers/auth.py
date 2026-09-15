@@ -109,7 +109,17 @@ def _locked_for_update(db: Session, model, primary_key):
 
     SQLite ignores FOR UPDATE, and can: it takes a database-wide write lock for
     the duration of a write transaction, so the serialisation is already there.
+
+    The flush is not optional and not tidiness. This session runs with
+    `autoflush=False`, and `populate_existing` overwrites the instance from what
+    the SELECT returns — so anything changed on this row and not yet written is
+    simply discarded. `_enforce_ip_throttle` runs before this on every request
+    and does change the throttle: it lifts a ban that has served its time, and
+    clears the counters behind an expired lock. Both were being thrown away
+    here, which put the ban back and carried the old count into the next
+    failure. Writing first means the row this reads back includes our own work.
     """
+    db.flush()
     return db.get(
         model, primary_key, with_for_update=True, populate_existing=True
     )
@@ -153,6 +163,11 @@ def _enforce_ip_throttle(db: Session, ip: str, now: datetime) -> None:
         if now - blocked_at >= timedelta(hours=settings.login_ip_block_hours):
             throttle.blocked_at = None
             throttle.cycle_count = 0
+            # Cleared with the count it anchors. Leaving it would be harmless —
+            # a stale one is older than the window and resets the count anyway —
+            # but the two belong together and only one of them being true is the
+            # kind of thing that reads as a bug later.
+            throttle.cycle_started_at = None
             throttle.failed_count = 0
             throttle.window_started_at = None
             throttle.locked_until = None
@@ -190,29 +205,71 @@ def _record_ip_failure(db: Session, ip: str, now: datetime) -> None:
         throttle.failed_count = 0
 
     throttle.failed_count += 1
-    if throttle.failed_count >= settings.login_ip_max_failures:
-        throttle.cycle_count += 1
-        throttle.failed_count = 0
-        throttle.window_started_at = None
-        if throttle.cycle_count >= settings.login_ip_ban_cycles:
-            throttle.blocked_at = now
-            throttle.locked_until = None
-            throttle.reason = "Repeated failed login cycles"
-        else:
-            throttle.locked_until = now + timedelta(minutes=settings.lockout_minutes)
+    if throttle.failed_count < settings.login_ip_max_failures:
+        return
+
+    # A whole window spent failing is one cycle. A run of cycles ages out on its
+    # own: an address that produced two of them last term is not mid-attack now,
+    # and before this nothing but a successful sign-in ever brought the count
+    # down, so it was kept forever on an address nobody signs in from.
+    cycle_started = _aware(throttle.cycle_started_at)
+    if cycle_started is None or cycle_started <= now - timedelta(
+        minutes=settings.login_ip_cycle_window_minutes
+    ):
+        throttle.cycle_count = 0
+        throttle.cycle_started_at = now
+        cycle_started = now
+
+    throttle.cycle_count += 1
+    throttle.failed_count = 0
+    throttle.window_started_at = None
+
+    # An address that has signed somebody in during this run is carrying real
+    # traffic — a school behind one NAT, where every teacher shares the address
+    # — and banning it for a day would shut out the whole staff room over
+    # somebody else's failures. It still locks, it just never bans.
+    #
+    # Note what this deliberately does not do: forgive the cycles. That is what
+    # used to happen, and it made the ban unreachable on exactly the shared
+    # addresses it was written for, while the fifteen-minute lock that hurts
+    # those same teachers went on firing.
+    last_success = _aware(throttle.last_success_at)
+    signed_someone_in = last_success is not None and last_success >= cycle_started
+
+    if throttle.cycle_count >= settings.login_ip_ban_cycles and not signed_someone_in:
+        throttle.blocked_at = now
+        throttle.locked_until = None
+        throttle.reason = "Repeated failed login cycles"
+    else:
+        throttle.locked_until = now + timedelta(minutes=settings.lockout_minutes)
 
 
-def _clear_ip_failures(db: Session, ip: str) -> None:
+def _clear_ip_failures(db: Session, ip: str, now: datetime) -> None:
+    """Somebody signed in from this address. Forgive the run in progress.
+
+    The mistyping is over, so the count towards the next lock goes, along with
+    any lock already standing. What does *not* go is `cycle_count`: a completed
+    cycle is a window this address spent doing nothing but failing, and one
+    person getting in afterwards does not unsay it. Clearing it here meant the
+    ban needed two cycles with no success anywhere in between, which on a school
+    NAT — every teacher sharing one address, somebody signing in every few
+    minutes all day — is a condition that never holds. The ban existed for
+    shared addresses and was reachable on every kind except those.
+
+    The success is recorded instead, and read at the moment a ban would be
+    decided, where it can say "this address is a staff room" without also
+    erasing what happened.
+    """
     if not ip:
         return
     throttle = db.get(LoginThrottle, ip)
     if throttle is None or throttle.blocked_at is not None:
         return
     throttle.failed_count = 0
-    throttle.cycle_count = 0
     throttle.window_started_at = None
     throttle.locked_until = None
     throttle.reason = ""
+    throttle.last_success_at = now
 
 
 def _issue_session(db: Session, response: Response, user: User, request: Request) -> str:
@@ -370,7 +427,7 @@ def login(
     # waiting for.
     user = _locked_for_update(db, User, user.id)
     user.clear_lockout()
-    _clear_ip_failures(db, ip)
+    _clear_ip_failures(db, ip, now)
     user.last_login_at = now
     if needs_rehash(user.password_hash):
         user.password_hash = hash_password(payload.password)
