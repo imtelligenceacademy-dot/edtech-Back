@@ -19,7 +19,15 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Lesson, LessonAssignment, Progress, School, UploadedFile, User
+from app.models import (
+    AccessRequest,
+    Lesson,
+    LessonAssignment,
+    Progress,
+    School,
+    UploadedFile,
+    User,
+)
 from app.models.enums import LessonStatus, Role, UserStatus
 from app.services.grades import grade_number, grade_token
 from app.services.sections import ensure_progress_for_lessons
@@ -210,6 +218,29 @@ def prune_teacher_assignments(db: Session, teacher: User) -> int:
         db.delete(a)
         for row in rows:
             db.delete(row)
+
+        # A request to unlock a lesson this teacher no longer holds is not a
+        # decision anybody can usefully make, and leaving it `pending` kept it
+        # in the super-admin's inbox and on the Lesson Unlock page as though it
+        # were. Granting it then found no progress row, wrote a fresh one with
+        # `unlocked_override` set, and reported success while the teacher saw
+        # nothing change at all — `compute_access` only walks lessons she is
+        # assigned. And if the grade came back to her later,
+        # `ensure_progress_for_lessons` skipped that lesson because a row now
+        # existed, leaving it unlocked out of sequence for good.
+        #
+        # Pending ones only. A granted or denied request records a decision
+        # somebody actually made, and clearing history is not this function's
+        # job — it is deliberately conservative about progress for the same
+        # reason two lines above.
+        for request in db.scalars(
+            select(AccessRequest).where(
+                AccessRequest.teacher_id == teacher.id,
+                AccessRequest.lesson_id == a.lesson_id,
+                AccessRequest.status == "pending",
+            )
+        ):
+            db.delete(request)
         removed += 1
     return removed
 

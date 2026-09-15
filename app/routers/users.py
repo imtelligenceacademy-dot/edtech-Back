@@ -115,6 +115,18 @@ def update_status(
     # was a status the holder still could not sign in under.
     if payload.status == UserStatus.active:
         user.clear_lockout()
+        # Both auto-assign paths skip an account that is not active, so every
+        # lesson uploaded while this one was suspended passed it by. Coming back
+        # "active" restored the ability to sign in and nothing else: the
+        # teacher's track stopped at whatever was current on the day they were
+        # suspended, `compute_access` sequences only what she is assigned so it
+        # simply ended there, and nothing on any screen said why. The repair was
+        # a separate no-op edit-and-save of the same account, which is not
+        # something anyone would think to try.
+        if user.role == Role.teacher:
+            db.flush()
+            sync_teacher_assignments(db, user)
+            prune_teacher_assignments(db, user)
     db.commit()
     db.refresh(user)
     return user
