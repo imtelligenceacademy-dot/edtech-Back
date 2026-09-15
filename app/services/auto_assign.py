@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Lesson, LessonAssignment, Progress, UploadedFile, User
+from app.models import Lesson, LessonAssignment, Progress, School, UploadedFile, User
 from app.models.enums import LessonStatus, Role, UserStatus
 from app.services.grades import grade_number, grade_token
 from app.services.sections import ensure_progress_for_lessons
@@ -212,6 +212,32 @@ def prune_teacher_assignments(db: Session, teacher: User) -> int:
             db.delete(row)
         removed += 1
     return removed
+
+
+def resync_school_teachers(db: Session, school: School) -> tuple[int, int]:
+    """Re-apply the assignment rule to every teacher at one school.
+
+    The rule reads the school's `program_year` (`_year_matches`), so changing
+    that changes which lessons every teacher there should hold — but the rule
+    only ever ran when a *teacher* was created or edited, never when the school
+    was. A school promoted to Year 2 therefore kept the whole of Year 1 and
+    received none of Year 2, and the only repair was opening and re-saving each
+    teacher in turn.
+
+    The same smart-strip rules apply as anywhere else: a lesson a class has
+    actually started is kept, and manual overrides are never touched. So a
+    teacher part-way through a Year 1 lesson keeps it, and only the untouched
+    remainder of the old year goes.
+
+    Returns (assigned, removed).
+    """
+    assigned = removed = 0
+    for teacher in db.scalars(
+        select(User).where(User.school_id == school.id, User.role == Role.teacher)
+    ):
+        assigned += sync_teacher_assignments(db, teacher)
+        removed += prune_teacher_assignments(db, teacher)
+    return assigned, removed
 
 
 def assign_uploaded_file(

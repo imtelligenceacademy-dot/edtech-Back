@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -9,7 +11,10 @@ from app.deps import get_current_user, require_capability
 from app.models import Lesson, School, User
 from app.models.enums import Role
 from app.schemas.school import SchoolCreate, SchoolOut, SchoolUpdate
+from app.services.auto_assign import resync_school_teachers
 from app.utils import new_id
+
+logger = logging.getLogger("app.schools")
 
 router = APIRouter(prefix="/api/schools", tags=["schools"])
 
@@ -83,8 +88,28 @@ def update_school(
         school.country = data["country"]
     if "city" in data and data["city"] is not None:
         school.city = data["city"]
-    if "program_year" in data and data["program_year"] is not None:
+
+    # Checked before the write, and only when the value actually moves: renaming
+    # a school must not churn a year of curriculum across all of its teachers.
+    year_changed = (
+        data.get("program_year") is not None
+        and data["program_year"] != school.program_year
+    )
+    if year_changed:
         school.program_year = data["program_year"]
+        # The field's own help text promises this: "Determines which year's
+        # lessons this school's teachers receive". Nothing was re-running the
+        # rule, so the promotion changed the label and nothing else — the
+        # teachers kept the year they were leaving and never saw the new one.
+        db.flush()
+        assigned, removed = resync_school_teachers(db, school)
+        logger.info(
+            "School %s moved to year %s - %s assignment(s) added, %s removed",
+            school.id,
+            school.program_year,
+            assigned,
+            removed,
+        )
 
     db.commit()
     db.refresh(school)
