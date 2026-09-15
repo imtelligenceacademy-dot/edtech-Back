@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.deps import get_current_user, require_capability
-from app.models import Lesson, School, User
+from app.models import FairSection, Lesson, School, User
 from app.models.enums import Role
 from app.schemas.school import SchoolCreate, SchoolOut, SchoolUpdate
 from app.services.auto_assign import resync_school_teachers
@@ -126,17 +126,47 @@ def delete_school(
     if school is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="School not found")
 
-    # Guard against silently orphaning users / cascading away lessons.
-    user_count = db.scalar(select(func.count(User.id)).where(User.school_id == school_id)) or 0
-    lesson_count = (
-        db.scalar(select(func.count(Lesson.id)).where(Lesson.school_id == school_id)) or 0
+    # Guard against silently orphaning or cascading away anything the school
+    # owns. Everything counted here is something the database would otherwise
+    # take with it, so the guard has to know about all of it or it is not a
+    # guard, it is a partial one that reads like a complete one.
+    holdings = (
+        ("user", db.scalar(select(func.count(User.id)).where(User.school_id == school_id))),
+        (
+            "lesson",
+            db.scalar(select(func.count(Lesson.id)).where(Lesson.school_id == school_id)),
+        ),
+        # `fair_sections.school_id` is ON DELETE CASCADE and
+        # `fair_projects.section_id` is ON DELETE RESTRICT, so a school with
+        # sections had two ways to go wrong and no way to go right. Empty
+        # sections were taken by the cascade without anybody being told. Sections
+        # with projects under them hit the restrict instead, which refused the
+        # cascade and surfaced as a driver-level 500 — the school then could not
+        # be deleted at all, and the message said nothing about why.
+        (
+            "ICT Fair section",
+            db.scalar(
+                select(func.count(FairSection.id)).where(
+                    FairSection.school_id == school_id
+                )
+            ),
+        ),
     )
-    if user_count or lesson_count:
+    blocking = [
+        f"{count} {noun}{'' if count == 1 else 's'}"
+        for noun, count in holdings
+        if count
+    ]
+    if blocking:
+        # Only what is actually there. The old wording listed both counts
+        # whichever were zero, so a school held up by one lesson was refused
+        # with "0 user(s) and 1 lesson(s)".
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
-                f"Cannot delete: school still has {user_count} user(s) and "
-                f"{lesson_count} lesson(s). Reassign or remove them first."
+                "Cannot delete: school still has "
+                + ", ".join(blocking)
+                + ". Reassign or remove them first."
             ),
         )
 
