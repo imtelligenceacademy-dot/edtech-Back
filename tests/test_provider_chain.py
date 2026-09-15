@@ -20,12 +20,28 @@ class FakeProvider:
 
     supports_vision = False
 
-    def __init__(self, name: str, *, fails: str | None = None, mid_stream: bool = False):
+    def __init__(
+        self,
+        name: str,
+        *,
+        fails: str | None = None,
+        mid_stream: bool = False,
+        silent: bool = False,
+    ):
         self.name = name
         self.model = f"{name}-model"
         self._fails = fails
         self._mid_stream = mid_stream
+        self._silent = silent
         self.calls = 0
+
+    def chat_stream_vision(self, system, messages, image_data_url):
+        self.calls += 1
+        if self._fails:
+            raise LLMError(self._fails, f"{self.name} failed")
+        if self._silent:
+            return
+        yield f"saw it, from {self.name}"
 
     def chat(self, system, messages):
         self.calls += 1
@@ -37,6 +53,9 @@ class FakeProvider:
         self.calls += 1
         if self._fails and not self._mid_stream:
             raise LLMError(self._fails, f"{self.name} failed")
+        if self._silent:
+            # A 200 with no deltas in it. Not an error at any layer.
+            return
         yield f"hello from {self.name}"
         if self._fails and self._mid_stream:
             raise LLMError(self._fails, f"{self.name} died mid-stream")
@@ -186,3 +205,44 @@ def test_a_reply_with_no_text_moves_to_the_next_provider(monkeypatch):
     # And in a chain, that is something the next provider gets to answer.
     chain = ProviderChain([provider, FakeProvider("groq")])
     assert chain.chat("sys", [{"role": "user", "content": "hi"}]) == "answer from groq"
+
+
+def test_an_empty_reply_is_a_failure_and_the_chain_moves_on():
+    """A 200 carrying no content is not an answer.
+
+    A content filter trips, or a refusal arrives as an empty body, and the
+    provider returns success with nothing in it. Credited as a reply, that
+    committed the chain: the teacher read a blank message while three healthy
+    providers sat untried, and because the usage was refunded the only symptom
+    was the assistant saying nothing at all.
+    """
+    silent = FakeProvider("openai", silent=True)
+    backup = FakeProvider("groq")
+
+    chunks = list(ProviderChain([silent, backup]).chat_stream("sys", []))
+
+    assert "".join(chunks) == "hello from groq and goodbye"
+    assert backup.calls == 1, "the backup has to be tried"
+
+
+def test_an_empty_reply_leaves_the_answer_attributed_to_whoever_gave_it():
+    silent = FakeProvider("openai", silent=True)
+    backup = FakeProvider("groq")
+
+    chain = ProviderChain([silent, backup])
+    list(chain.chat_stream("sys", []))
+
+    assert chain.name == "groq", "the silent one did not answer and must not be credited"
+
+
+def test_an_empty_vision_reply_raises_so_the_caller_can_drop_the_image():
+    """The vision path has one provider and no fallback inside the chain.
+
+    Its caller retries through the text path, which loses the picture and keeps
+    the answer — but only on an error. Returning empty was indistinguishable
+    from having answered, so nothing retried.
+    """
+    silent = FakeProvider("openai", silent=True)
+
+    with pytest.raises(LLMError):
+        list(ProviderChain([silent]).chat_stream_vision("sys", [], "data:image/png;base64,AA"))

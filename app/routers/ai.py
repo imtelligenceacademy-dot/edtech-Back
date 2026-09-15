@@ -580,6 +580,13 @@ _ERROR_TEXT = {
     "quota": "The AI assistant has reached its usage quota. Please tell your administrator.",
     "timeout": "The AI assistant took too long to respond. Please try again.",
     "unavailable": "The AI assistant is unavailable right now. Please try again.",
+    # "Please try again" would be a lie here: the request itself was refused, so
+    # sending the same one gets the same answer. Usually it is length — a long
+    # lesson plus a long question — which is something the teacher can act on.
+    "bad_request": (
+        "The AI assistant couldn't handle that request. Try a shorter question, "
+        "and tell your administrator if it keeps happening."
+    ),
 }
 
 

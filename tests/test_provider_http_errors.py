@@ -170,3 +170,41 @@ def test_a_timeout_is_reported_as_a_timeout(monkeypatch):
     with pytest.raises(LLMError) as raised:
         list(_openai().chat_stream("sys", []))
     assert raised.value.kind == "timeout"
+
+
+# --------------------------------------------------------------------------- #
+# Which statuses are worth asking somebody else about
+# --------------------------------------------------------------------------- #
+def test_a_400_is_the_requests_own_fault_and_stops_the_chain(failing_transport):
+    """`RETRYABLE_KINDS` has always excluded `bad_request`, on the grounds that a
+    malformed request fails identically everywhere and walking the chain to find
+    that out spends four timeouts of a lesson. No status produced that kind:
+    every 4xx landed on `unavailable`, which is retryable, so the exclusion
+    described a case that could not arise and the test for it built the error by
+    hand. This one comes off the wire.
+    """
+    failing_transport(400)
+    backup = _Working()
+    chain = ProviderChain([_openai(), backup])
+
+    with pytest.raises(LLMError) as err:
+        chain.chat("sys", [])
+
+    assert err.value.kind == "bad_request"
+    assert chain.name != "groq", "the backup must not have been asked"
+
+
+@pytest.mark.parametrize("status", [404, 413, 418])
+def test_the_rest_of_the_4xx_range_still_falls_through(failing_transport, status):
+    """Only a request that says it is malformed is treated as malformed.
+
+    404 in particular: the model named in the configuration is missing at *this*
+    provider, and the next one is configured with a different model that may
+    well exist. That is the chain doing its job, not a request to refuse — and
+    it is the shape of the `/chat/completions` failure still under
+    investigation, which would have gone from falling through to fatal.
+    """
+    failing_transport(status)
+    chain = ProviderChain([_openai(), _Working()])
+
+    assert chain.chat("sys", []) == "answer from groq"

@@ -31,17 +31,37 @@ class LLMError(RuntimeError):
 
     def __init__(self, kind: str, message: str = "") -> None:
         super().__init__(message or kind)
-        self.kind = kind  # auth | rate_limit | quota | timeout | unavailable
+        # auth | rate_limit | quota | timeout | unavailable | bad_request
+        self.kind = kind
 
 
 def _raise_for_status(status_code: int) -> None:
-    """Map a provider HTTP status onto our own error kinds."""
+    """Map a provider HTTP status onto our own error kinds.
+
+    The only status treated as the request's own fault is one that says so.
+    `RETRYABLE_KINDS` excludes `bad_request` because a malformed request fails
+    identically at the next provider, and walking the chain to find that out
+    spends four timeouts of a teacher's lesson — but until now no status
+    produced that kind at all. Every 4xx landed on `unavailable`, which is
+    retryable, so the exclusion described a case that could not occur.
+
+    What is deliberately *not* in it:
+
+    - 404. The model named in the configuration is missing at this provider;
+      the next one has a different model and may well have it. Falling through
+      is the whole point of the chain.
+    - 413. Too large for this provider's window, not for every provider's.
+    - Anything else in the 4xx range, which is treated as retryable because
+      falling through costs a little time and refusing costs the answer.
+    """
     if status_code in (401, 403):
         raise LLMError("auth", "provider rejected the API key")
     if status_code == 429:
         raise LLMError("rate_limit", "provider rate limit or quota reached")
     if status_code >= 500:
         raise LLMError("unavailable", f"provider returned {status_code}")
+    if status_code in (400, 422):
+        raise LLMError("bad_request", f"provider returned {status_code}")
     if status_code >= 400:
         raise LLMError("unavailable", f"provider returned {status_code}")
 
@@ -414,6 +434,15 @@ class ProviderChain:
             try:
                 stream = provider.chat_stream(system, messages)
                 first = next(stream, None)
+                if first is None:
+                    # A 200 carrying no content at all. It happens — a filter
+                    # trips, or a refusal arrives as an empty body — and it is a
+                    # failure, not an answer. Treated as one, the chain moves on;
+                    # untreated, this provider was credited with having replied
+                    # and the teacher got a blank message with three healthy
+                    # providers untried behind it. The non-streaming path has
+                    # guarded exactly this since it was written.
+                    raise LLMError("unavailable", "provider sent an empty reply")
             except LLMError as exc:
                 if exc.kind not in RETRYABLE_KINDS:
                     raise
@@ -438,9 +467,16 @@ class ProviderChain:
         primary = self._providers[0]
         stream = primary.chat_stream_vision(system, messages, image_data_url)
         first = next(stream, None)
+        if first is None:
+            # An image the model declines to describe comes back as a 200 with
+            # nothing in it, which is common enough on slide photographs. The
+            # caller only rebuilds without the image on an LLMError, so saying
+            # nothing here meant saying nothing at all: the Gemini reader had
+            # already transcribed the slide and any text-only provider could
+            # have answered from it.
+            raise LLMError("unavailable", "provider sent an empty reply")
         self.last_used = primary
-        if first is not None:
-            yield first
+        yield first
         yield from stream
 
 

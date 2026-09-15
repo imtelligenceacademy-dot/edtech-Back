@@ -13,7 +13,7 @@ import pytest
 
 from app.routers import ai
 from app.routers.ai import PromptBundle, _stream_answer, _without_image
-from app.services.llm import LLMError
+from app.services.llm import LLMError, ProviderChain
 
 
 class SeeingProvider:
@@ -23,9 +23,16 @@ class SeeingProvider:
     model = "gpt-5.6-luna"
     supports_vision = True
 
-    def __init__(self, *, vision_fails: str | None = "rate_limit", emit_first: bool = False):
+    def __init__(
+        self,
+        *,
+        vision_fails: str | None = "rate_limit",
+        emit_first: bool = False,
+        emits_nothing: bool = False,
+    ):
         self._vision_fails = vision_fails
         self._emit_first = emit_first
+        self._emits_nothing = emits_nothing
         self.text_system: str | None = None
 
     def chat_stream_vision(self, system, messages, image_data_url):
@@ -33,6 +40,10 @@ class SeeingProvider:
             yield "half an answer"
         if self._vision_fails:
             raise LLMError(self._vision_fails, "vision unavailable")
+        if self._emits_nothing:
+            # A 200 that carries no content. Not an error anywhere in the
+            # protocol, and not an answer either.
+            return
         yield "saw the slide"
 
     def chat_stream(self, system, messages):
@@ -127,3 +138,30 @@ def test_safety_steps_and_code_are_exempt_from_the_length_limit():
     assert "never shorten" in text
     for protected in ("wiring procedure", "safety warning", "check before powering on", "code"):
         assert protected in text, f"{protected} must be exempt from the limit"
+
+
+def test_an_empty_vision_reply_falls_back_to_the_reader(monkeypatch):
+    """A 200 carrying no content is not an answer.
+
+    An image the model declines to describe comes back empty rather than as an
+    error, which is common enough on photographs of slides. `_stream_answer`
+    rebuilds without the image only when the vision call *raises*, so an empty
+    one ended the request in silence — with the slide already transcribed by the
+    Gemini reader, and every text-only provider in the chain able to answer from
+    that transcription.
+
+    Driven through a real `ProviderChain`, because the chain is what production
+    hands to `_stream_answer` and the chain is where the emptiness is caught.
+    """
+    silent = SeeingProvider(vision_fails=None, emits_nothing=True)
+    chain = ProviderChain([silent])
+    monkeypatch.setattr(ai, "get_provider", lambda: chain)
+    bundle = _bundle(silent, text_fallback=lambda: "SYSTEM WITH SLIDE READING")
+
+    out = "".join(_stream_answer(bundle))
+
+    assert out == "answered from text", "the teacher gets an answer, not silence"
+    assert silent.text_system == "SYSTEM WITH SLIDE READING", (
+        "and it is answered from the slide reading, not from a prompt that "
+        "still claims an image is attached"
+    )
