@@ -16,11 +16,24 @@ import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.orm import Session
 
 from app.database import Base
 from app.migrate import VERSION_TABLE, alembic_config, current_revision, run_migrations
 import app.models  # noqa: F401  (registers every table on Base.metadata)
+from app.models.enums import LessonStatus, Role, WatchdogStatus
+from app.models.lesson import Lesson
+from app.models.progress import Progress
+from app.models.school import School
+from app.models.user import User
+
+# Spelled out rather than imported from app.migrate: these tests exist to say
+# what the right revision is, so they must not follow the source if it changes.
+INITIAL_REVISION = "ecdcb1245c53"
+BEFORE_RETIRE_LATE = "c47f0a6e21b8"
+RETIRE_LATE = "d8b21c60fa73"
 
 
 @pytest.fixture()
@@ -33,8 +46,29 @@ def _engine(url: str):
 
 
 def _upgrade(engine) -> None:
+    _upgrade_to(engine, "head")
+
+
+def _upgrade_to(engine, revision: str) -> None:
     with engine.begin() as conn:
-        command.upgrade(alembic_config(conn), "head")
+        command.upgrade(alembic_config(conn), revision)
+
+
+def _head_revision() -> str:
+    return ScriptDirectory.from_config(alembic_config()).get_current_head()
+
+
+def _pre_alembic(engine, revision: str = INITIAL_REVISION) -> None:
+    """A database in the state case 2 describes.
+
+    Built by the old `create_all` path, so it carries *that era's* schema and no
+    `alembic_version` table — not today's schema, which is what makes the
+    difference between stamping the levelled revision and stamping head visible
+    at all.
+    """
+    _upgrade_to(engine, revision)
+    with engine.begin() as conn:
+        conn.execute(text(f"DROP TABLE {VERSION_TABLE}"))
 
 
 def _tables(engine) -> set[str]:
@@ -43,6 +77,25 @@ def _tables(engine) -> set[str]:
 
 def _columns(engine, table: str) -> set[str]:
     return {c["name"] for c in inspect(engine).get_columns(table)}
+
+
+def _seed_one_progress_row(engine) -> None:
+    """The smallest graph a `progress` row needs to exist."""
+    with Session(engine) as session:
+        session.add(School(id="sch_1", name="Test School"))
+        session.add(
+            User(
+                id="usr_1",
+                name="A Teacher",
+                email="teacher@example.com",
+                password_hash="not-a-real-hash",
+                role=Role.teacher,
+            )
+        )
+        session.add(Lesson(id="les_1", title="Loops", grade=7, subject="python"))
+        session.flush()
+        session.add(Progress(id="prg_1", teacher_id="usr_1", lesson_id="les_1"))
+        session.commit()
 
 
 def test_migrations_match_the_models(sqlite_url):
@@ -109,7 +162,7 @@ def test_database_predating_alembic_is_stamped_not_rebuilt(sqlite_url):
     that already exist, so it is stamped instead — and the data has to survive.
     """
     engine = _engine(sqlite_url)
-    Base.metadata.create_all(bind=engine)
+    _pre_alembic(engine)
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -130,6 +183,40 @@ def test_database_predating_alembic_is_stamped_not_rebuilt(sqlite_url):
     assert rows == ["Existing School"], "existing data must survive the bootstrap"
 
 
+def test_pre_alembic_database_still_receives_the_later_migrations(sqlite_url):
+    """Case 2 has to finish at head, not at the revision it was levelled to.
+
+    Levelling only ever reaches the initial schema, so a stamp at head there
+    records four migrations as applied without running them and their columns
+    never arrive. Nothing fails at the time: the app boots, every later startup
+    is a no-op upgrade, and the break surfaces on the first query against a
+    column that was supposed to have been added.
+    """
+    engine = _engine(sqlite_url)
+    _pre_alembic(engine)
+
+    assert "fair_sections" not in _tables(engine), "precondition: pre-sections schema"
+    assert "section" not in _columns(engine, "progress"), "precondition"
+
+    run_migrations(engine)
+
+    assert current_revision(engine) == _head_revision(), (
+        "a levelled database must be carried all the way to head"
+    )
+    assert "fair_sections" in _tables(engine)
+    for table, column in (
+        ("progress", "section"),
+        ("users", "sections"),
+        ("chat_messages", "section"),
+        ("access_requests", "section"),
+        ("fair_projects", "section_id"),
+    ):
+        assert column in _columns(engine, table), (
+            f"{table}.{column} is added by a migration after {INITIAL_REVISION};"
+            " levelling cannot produce it, so the upgrade has to run"
+        )
+
+
 def test_older_database_missing_columns_is_levelled_before_stamping(sqlite_url):
     """The bootstrap's one genuinely dangerous case.
 
@@ -139,7 +226,7 @@ def test_older_database_missing_columns_is_levelled_before_stamping(sqlite_url):
     failure that surfaces later, as a query against a column that isn't there.
     """
     engine = _engine(sqlite_url)
-    Base.metadata.create_all(bind=engine)
+    _pre_alembic(engine)
 
     dropped = {
         "users": "ict_fair_access",
@@ -159,3 +246,77 @@ def test_older_database_missing_columns_is_levelled_before_stamping(sqlite_url):
             f"{table}.{column} should have been restored before stamping"
         )
     assert current_revision(engine) is not None
+
+
+def test_create_all_database_is_stamped_where_it_actually_stands(sqlite_url):
+    """Unstamped does not mean old.
+
+    A database built by `create_all` against current models has no version
+    table either, but it is already at head — the test suite makes one on every
+    run, and so does anyone who has ever started the app before Alembic owned
+    the schema. Stamping it at the initial revision sends the upgrade back over
+    migrations it was already built with, and the first CREATE TABLE fails, so
+    the app does not start at all.
+    """
+    engine = _engine(sqlite_url)
+    Base.metadata.create_all(bind=engine)
+    assert current_revision(engine) is None, "precondition: not yet stamped"
+
+    run_migrations(engine)
+
+    assert current_revision(engine) == _head_revision()
+    assert "fair_sections" in _tables(engine)
+
+
+def test_retiring_late_writes_enum_names_not_values(sqlite_url):
+    """A data migration has to write what the ORM reads.
+
+    `Enum(..., native_enum=False)` persists the member's *name*, so writing its
+    value instead leaves a row that cannot be loaded at all — `LookupError`, and
+    with it every screen built on `Progress`. Reading the row back through the
+    model is the only assertion that actually proves the string is right.
+    """
+    engine = _engine(sqlite_url)
+    _upgrade_to(engine, BEFORE_RETIRE_LATE)
+    _seed_one_progress_row(engine)
+
+    # The state the migration exists to clear, spelled as the old code spelled it.
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE progress SET status = 'late', watchdog = 'late'"))
+
+    _upgrade(engine)
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT status, watchdog FROM progress")).one() == (
+            "in_progress",
+            "on_track",
+        )
+    with Session(engine) as session:
+        row = session.get(Progress, "prg_1")
+        assert row.status is LessonStatus.in_progress
+        assert row.watchdog is WatchdogStatus.on_track
+
+
+def test_rows_corrupted_by_the_first_retire_late_are_repaired(sqlite_url):
+    """The databases that already ran the broken version.
+
+    Alembic will not re-run a revision it has recorded, so fixing that migration
+    does nothing for a database that has been through it. A hyphenated string in
+    either column can only have come from there — every application write goes
+    through the ORM — so it is safe to convert on sight.
+    """
+    engine = _engine(sqlite_url)
+    _upgrade_to(engine, RETIRE_LATE)
+    _seed_one_progress_row(engine)
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE progress SET status = 'in-progress', watchdog = 'on-track'")
+        )
+
+    _upgrade(engine)
+
+    with Session(engine) as session:
+        row = session.get(Progress, "prg_1")
+        assert row.status is LessonStatus.in_progress
+        assert row.watchdog is WatchdogStatus.on_track

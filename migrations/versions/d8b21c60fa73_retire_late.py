@@ -8,8 +8,14 @@ failing — but the watchdog compared the lesson's due date against today and pu
 The code no longer produces the value. This clears the rows that already hold
 it, so the word is gone from the product rather than merely from new writes:
 
-- `progress.watchdog` 'late' becomes 'on-track'
-- `progress.status` 'late' becomes 'in-progress'
+- `progress.watchdog` 'late' becomes 'on_track'
+- `progress.status` 'late' becomes 'in_progress'
+
+Those are the enum *names*, not the values the members carry ('on-track',
+'in-progress'). `Enum(..., native_enum=False)` persists the name, so writing a
+value here produces a row the ORM cannot load: it raises LookupError, and every
+screen built on `Progress` fails with it. The first version of this migration
+wrote the values; `b7e4c2915d30` repairs the databases that ran it.
 
 Neither touches `percent_complete`, so what a teacher actually did is unchanged
 — only the verdict attached to it.
@@ -32,8 +38,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute("UPDATE progress SET watchdog = 'on-track' WHERE watchdog = 'late'")
-    op.execute("UPDATE progress SET status = 'in-progress' WHERE status = 'late'")
+    op.execute("UPDATE progress SET watchdog = 'on_track' WHERE watchdog = 'late'")
+    op.execute("UPDATE progress SET status = 'in_progress' WHERE status = 'late'")
 
 
 def downgrade() -> None:

@@ -5,20 +5,28 @@ Alembic existed and there are live databases in each of them:
 
 1. **Empty** — a fresh deployment. Run every migration; the initial one builds
    the whole schema.
-2. **Populated, no `alembic_version`** — a database built by the old
-   `create_all` + `ensure_added_columns` path. Its schema already matches the
-   initial migration, so *running* that migration would fail on tables that
-   already exist. It is brought level by `ensure_added_columns` (which back-
-   fills anything a very old deploy is missing) and then stamped, which records
-   "you are already at this revision" without touching a table.
+2. **Populated, no `alembic_version`** — a database built by a `create_all`
+   path rather than by migrations. *Running* the migrations it already
+   satisfies would fail on tables that already exist, so it is brought level by
+   `ensure_added_columns` (which backfills anything a very old deploy is
+   missing), stamped at the revision its schema actually reaches, and then
+   upgraded like any other database.
 3. **Populated and stamped** — the normal path from here on. Run whatever is
    newer than the recorded revision.
 
-Getting case 2 wrong is what makes a first Alembic deployment dangerous: a
-stamp on a database that is *not* actually at the initial schema silently skips
-the columns it is missing. So `ensure_added_columns` runs first and stays
-around for exactly that reason, even though new work should now go in a
-migration rather than in that dict.
+Getting case 2 wrong is what makes a first Alembic deployment dangerous, and it
+can be got wrong in both directions. Stamp too low and the upgrade re-runs a
+CREATE TABLE against a table that is already there, so the app does not boot.
+Stamp too high — at head, say — and every later migration is recorded as
+applied without running, so the columns it adds never arrive; nothing fails at
+the time, and the break surfaces much later as a query against a column that
+was supposed to exist.
+
+Neither guess is safe because "unstamped" says nothing about how old a database
+is: one built by `create_all` against current models is unstamped and already
+at head, while one that predates Alembic is unstamped and sits at the initial
+schema. So the revision is read off the schema itself (`levelled_revision`),
+and case 2 then ends where case 3 does: at `upgrade`.
 """
 
 from __future__ import annotations
@@ -42,6 +50,49 @@ _ALEMBIC_INI = _BACKEND_ROOT / "alembic.ini"
 _MIGRATIONS_DIR = _BACKEND_ROOT / "migrations"
 
 VERSION_TABLE = "alembic_version"
+
+# Every schema-changing revision, paired with something that exists in the
+# database if and only if it has been applied.
+#
+# A case-2 database has no version table, so its own schema is the only evidence
+# of how far it has come, and both ways of guessing are harmful: too high skips
+# migrations and the columns never arrive, too low re-runs a CREATE TABLE and
+# the app will not boot. An unstamped database is not necessarily an *old* one —
+# anything built by `create_all` against current models is unstamped and already
+# at head — so the revision has to be read off the schema rather than assumed.
+#
+# Data-only revisions are deliberately absent from the end of this list. They
+# are safe to re-run (their WHERE clauses match nothing the second time), so
+# leaving them off means a levelled database always receives them.
+_SCHEMA_MARKERS: tuple[tuple[str, str, str | None], ...] = (
+    ("ecdcb1245c53", "users", None),
+    ("42958f0e7fe1", "fair_sections", None),
+    ("9b3d71c8a4e5", "progress", "section"),
+    ("c47f0a6e21b8", "chat_messages", "section"),
+)
+
+
+def levelled_revision(target_engine: Engine) -> str:
+    """The newest revision this database's schema already satisfies.
+
+    Walks the markers in order and stops at the first thing that is missing:
+    the revision before that gap is the last one fully applied. The initial
+    revision is the floor, because `ensure_added_columns` has just guaranteed
+    at least that much.
+    """
+    inspector = inspect(target_engine)
+    tables = set(inspector.get_table_names())
+
+    reached = _SCHEMA_MARKERS[0][0]
+    for revision, table, column in _SCHEMA_MARKERS:
+        if table not in tables:
+            break
+        if column is not None and column not in {
+            c["name"] for c in inspector.get_columns(table)
+        }:
+            break
+        reached = revision
+    return reached
 
 
 def alembic_config(connection=None) -> Config:
@@ -75,15 +126,20 @@ def run_migrations(target_engine: Engine | None = None) -> None:
         cfg = alembic_config(connection)
 
         if has_tables and not is_stamped:
-            # Case 2. Level the schema first, then record where it stands.
-            logger.info(
-                "Database predates Alembic — levelling schema and stamping head."
-            )
+            # Case 2. Level the schema, record the revision it is *actually* at,
+            # and then fall through to the upgrade that carries it the rest of
+            # the way. Stamping head here would strand an old database at the
+            # initial schema; stamping the initial revision would make a
+            # create_all database re-run migrations it has already been built
+            # with. Only the schema itself can say which of the two this is.
             ensure_added_columns(target_engine)
-            command.stamp(cfg, "head")
-            return
-
-        if not has_tables:
+            reached = levelled_revision(target_engine)
+            logger.info(
+                "Database has no version table — levelled schema, stamping %s.",
+                reached,
+            )
+            command.stamp(cfg, reached)
+        elif not has_tables:
             logger.info("Empty database — creating schema from migrations.")
 
         command.upgrade(cfg, "head")
