@@ -292,7 +292,15 @@ def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, i
                     # ended up prefixed with its file id — unreadable, and it
                     # looked like a duplicate rather than the French copy.
                     if arcname in zf.namelist():
-                        arcname = f"{folder}/{up.id}_{up.filename}"
+                        # Through `_safe_entry_name` like every other entry. The
+                        # raw filename went in here, which is the one string in
+                        # this archive the client chose: the multipart parser
+                        # stores what was sent, separators and ".." included, so
+                        # a second upload named to collide could place an entry
+                        # outside the folder it claims to be in — and any
+                        # extractor that does not defend against that writes
+                        # wherever the name points.
+                        arcname = f"{folder}/{up.id}_{_safe_entry_name(up.filename)}"
                         entry["archive_path"] = arcname
                     zf.write(path, arcname)
                     entry["status"] = "ok"

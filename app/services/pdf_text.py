@@ -5,6 +5,8 @@ the prompt stays within a sane size.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from app.config import settings
 from app.models import Lesson, UploadedFile
 from app.services.file_storage import resolve_stored_file
@@ -13,6 +15,20 @@ from app.services.file_storage import resolve_stored_file
 def _pdf_to_text(path: Path) -> str:
     """Extract text with each PDF page labelled as a slide, so the assistant can
     map "slide N" to the actual Nth page of the deck.
+
+    A page with no text layer — a scan, or a slide exported as one flat image —
+    contributes nothing, and a deck where that is true of every page comes back
+    empty rather than as a list of headings.
+
+    That distinction is the whole point of this function's return value. Every
+    caller asks it one question: did we get the lesson's text? Labelling empty
+    pages answered yes for a deck that had produced nothing at all, because the
+    labels themselves are not whitespace. `lesson_context` then never fell back
+    to the stored slide titles, and the prompt took the branch that says "the
+    lesson material below is your primary source" over an empty block — so the
+    model was told it was holding the lesson, shown nothing, and asked what
+    slide 4 said. The honest branch, which tells it the text could not be
+    extracted and to say so, was unreachable.
     """
     try:
         from pypdf import PdfReader
@@ -21,6 +37,8 @@ def _pdf_to_text(path: Path) -> str:
         parts: list[str] = []
         for i, page in enumerate(reader.pages, start=1):
             body = (page.extract_text() or "").strip()
+            if not body:
+                continue
             parts.append(f"--- Slide {i} ---\n{body}")
         return "\n\n".join(parts)
     except Exception:

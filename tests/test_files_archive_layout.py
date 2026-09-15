@@ -9,6 +9,7 @@ files it had not.
 
 from __future__ import annotations
 
+import re
 import zipfile
 
 import pytest
@@ -122,3 +123,40 @@ def test_both_languages_keep_their_real_filename(db, tmp_path):
     assert not any(n.split("/")[-1].startswith("file_") for n in names), (
         "no file should need the id-prefixed fallback name"
     )
+
+
+def test_a_colliding_name_cannot_climb_out_of_its_folder(db, tmp_path):
+    """The one string in this archive the client chose.
+
+    The multipart parser stores the filename exactly as it was sent, separators
+    and ".." included, which is why every entry goes through `_safe_entry_name`.
+    The collision fallback did not — it interpolated the raw name — so a second
+    upload named to collide with a first wrote its entry somewhere else
+    entirely, and any extractor that does not defend against that puts the file
+    wherever the name points.
+
+    What this asserts is the shape of every path, not the absence of "..":
+    zipfile resolves the parent references while writing, so the escape arrives
+    already tidied up. `year-2/etc/cron.d/payload.pdf` has no ".." left in it
+    and is still three directories from where it said it was going.
+
+    Both names are hostile deliberately. Only the second file written takes the
+    fallback branch, and nothing fixes which of the two that is.
+    """
+    payload = "../../../../etc/cron.d/payload.pdf"
+    _lesson(db, grade=7, year=2, language="en", no=91, filename=payload)
+    _lesson(db, grade=7, year=2, language="en", no=91, filename=payload)
+
+    path, _included, _missing = build_files_archive()
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+    finally:
+        import os
+
+        os.remove(path)
+
+    # Every entry sits directly inside a folder this archive actually builds.
+    legit = re.compile(r"^(?:year-\d+/[a-z-]+/grade-[^/]+|unsorted)/[^/]+$")
+    stray = [n for n in names if n != "manifest.json" and not legit.match(n)]
+    assert stray == [], f"entries are not where the archive says they are: {stray}"
