@@ -22,6 +22,7 @@ from app.models.enums import Role, UserStatus
 from app.routers import ai as ai_router
 from app.schemas.ai import AdminChatRequest
 from app.services.llm import LLMError
+from app.services.school_context import build_school_context
 from app.utils import new_id
 
 
@@ -170,3 +171,42 @@ def test_a_report_with_a_narrative_is_charged(db, admin, monkeypatch):
     ai_router.admin_report(db=db, current=admin)
 
     assert _charges(db, admin) == before + 1
+
+
+# --------------------------------------------------------------------------- #
+# An admin with no school
+# --------------------------------------------------------------------------- #
+def test_an_admin_with_no_school_is_refused_rather_than_given_every_school(db, admin, monkeypatch):
+    """"No school" reads as "no filter" to the helpers that assemble the context.
+
+    That is right for the platform report a super-admin gets and catastrophic
+    here: the security section would carry every failed login, lockout and
+    blocked sign-in across every school on the platform, each labelled with the
+    name of the account it belongs to, handed to the model as this admin's own
+    school data. `admin_report` has refused this since it was written. The chat
+    beside it, building the same context, did not.
+    """
+    monkeypatch.setattr(ai_router, "get_provider", lambda: _Answering())
+    admin.school_id = None
+    db.commit()
+    before = _charges(db, admin)
+
+    body = _drain(
+        ai_router.admin_chat_stream(
+            payload=AdminChatRequest(message="Any security problems?"), db=db, current=admin
+        )
+    )
+
+    assert "not linked to a school" in body
+    assert "here is your answer" not in body, "the model must not have been asked"
+    assert _charges(db, admin) == before, "and nothing charged for a refusal"
+
+
+def test_the_context_builder_refuses_a_schoolless_account_on_its_own(db, admin):
+    """The backstop under the route check, so a second caller cannot reintroduce
+    this by forgetting to ask first."""
+    admin.school_id = None
+    db.commit()
+
+    with pytest.raises(ValueError):
+        build_school_context(db, admin)

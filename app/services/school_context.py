@@ -26,8 +26,24 @@ from app.services.report_metrics import (
 
 
 def build_school_context(db: Session, admin: User) -> tuple[str, str]:
-    """Return (context_text, school_name) scoped to the admin's school."""
-    school = db.get(School, admin.school_id) if admin.school_id else None
+    """Return (context_text, school_name) scoped to the admin's school.
+
+    Refuses an admin with no school rather than building something for them.
+    The helpers below treat a falsy `school_id` as "no filter", which is right
+    for the platform-wide report a super-admin gets and catastrophic here: the
+    security section would carry every failed login, lockout and blocked
+    sign-in across every school, each labelled with the name of the account it
+    belongs to, and hand it to the model as this admin's own school data.
+
+    A row like that should not exist — the FK is ON DELETE SET NULL and the
+    guard that stops one being created came later, so legacy or hand-inserted
+    rows can be in this state. This is the backstop; callers check first and
+    say something useful.
+    """
+    if not admin.school_id:
+        raise ValueError("cannot build school context for an account with no school")
+
+    school = db.get(School, admin.school_id)
     school_name = school.name if school else "your school"
 
     teachers = list(

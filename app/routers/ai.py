@@ -837,19 +837,36 @@ def admin_chat_stream(
     db: Session = Depends(get_db),
     current: User = Depends(require_roles(Role.school_admin)),
 ) -> StreamingResponse:
+    def _refuse(message: str) -> StreamingResponse:
+        """Refusals reach this endpoint as a stream, not as a status code. The
+        chat reads an event stream and would show a 400 body as nothing at all."""
+
+        def refusal_stream():
+            yield f"data: {json.dumps({'error': message})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+
+        return StreamingResponse(
+            refusal_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # `admin_report` has refused this since it was written; the chat beside it
+    # did not, and the two build the same context. With no school, the helpers
+    # that assemble it read "no school" as "every school", so the security
+    # section handed the model every failed login, lockout and blocked sign-in
+    # on the platform, each against the name of the account it belongs to.
+    if not current.school_id:
+        return _refuse(
+            "This account is not linked to a school yet, so there is no school "
+            "data to answer from. Please ask your administrator to set one."
+        )
+
     system, messages, school_name = _build_admin_prompt(db, current, payload)
     try:
         enforce_ai_limit(db, current, "admin")
     except AILimitExceeded as exc:
-        def limited_stream():
-            yield f"data: {json.dumps({'error': exc.message})}\n\n"
-            yield f"data: {json.dumps({'done': True})}\n\n"
-
-        return StreamingResponse(
-            limited_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
+        return _refuse(exc.message)
     usage_id = record_ai_usage(db, current, "admin")
     provider = get_provider()
 
