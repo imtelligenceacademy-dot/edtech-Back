@@ -9,6 +9,7 @@ app has live databases in, including the one that predates Alembic entirely.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 
@@ -246,6 +247,46 @@ def test_older_database_missing_columns_is_levelled_before_stamping(sqlite_url):
             f"{table}.{column} should have been restored before stamping"
         )
     assert current_revision(engine) is not None
+
+
+def test_bootstrap_leaves_the_application_loggers_alone(sqlite_url):
+    """Running migrations must not switch off the logging around them.
+
+    `fileConfig` disables every logger its file does not name, and `alembic.ini`
+    names only root, alembic and sqlalchemy.engine. The bootstrap runs inside
+    the app's startup, by which point uvicorn's loggers and the app's own
+    already exist — so the default left the process with no request log, no
+    uvicorn error log, and silence from every `logger.exception` in the
+    codebase. The deliberately-swallowed failures were the ones it hid best:
+    the nightly backup, the chat-retention purge, a chat write that failed.
+    """
+    engine = _engine(sqlite_url)
+    names = ["uvicorn", "uvicorn.error", "uvicorn.access", "app", "app.migrate"]
+    for name in names:
+        logging.getLogger(name).disabled = False
+
+    delivered: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            delivered.append(record.getMessage())
+
+    app_logger = logging.getLogger("app")
+    handler = _Capture()
+    app_logger.addHandler(handler)
+    try:
+        run_migrations(engine)
+        # What app/main.py does when the nightly backup raises.
+        app_logger.error("Daily backup email failed")
+    finally:
+        app_logger.removeHandler(handler)
+
+    assert [n for n in names if logging.getLogger(n).disabled] == [], (
+        "the bootstrap disabled loggers it does not own"
+    )
+    # The flag is the mechanism; this is the thing that actually matters, since
+    # a disabled logger drops the record before any handler sees it.
+    assert delivered == ["Daily backup email failed"]
 
 
 def test_create_all_database_is_stamped_where_it_actually_stands(sqlite_url):

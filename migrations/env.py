@@ -21,7 +21,16 @@ import app.models  # noqa: F401  (registers tables on Base.metadata)
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # `disable_existing_loggers` defaults to True, which would switch off every
+    # logger `alembic.ini` does not name — and it names only root, alembic and
+    # sqlalchemy.engine. This file is imported by the startup bootstrap as well
+    # as by the CLI, and by then uvicorn's loggers and the app's already exist,
+    # so the default silenced all of them for the life of the process: no
+    # request log, no uvicorn error log, and nothing from any `logger.exception`
+    # in the app. The failures that are deliberately swallowed and logged —
+    # the nightly backup, the chat-retention purge, a chat write that could not
+    # be saved — were the ones it hid best.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
