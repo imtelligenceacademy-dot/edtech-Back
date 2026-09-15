@@ -61,14 +61,17 @@ VERSION_TABLE = "alembic_version"
 # anything built by `create_all` against current models is unstamped and already
 # at head — so the revision has to be read off the schema rather than assumed.
 #
-# Data-only revisions are deliberately absent from the end of this list. They
-# are safe to re-run (their WHERE clauses match nothing the second time), so
-# leaving them off means a levelled database always receives them.
+# Only schema-changing revisions belong here, in chain order. A data-only
+# revision has nothing to detect and is safe to re-run anyway — its WHERE clause
+# matches nothing the second time — so it is simply carried by whichever marker
+# follows it. Where none follows, it is left past the end of the list and every
+# levelled database receives it.
 _SCHEMA_MARKERS: tuple[tuple[str, str, str | None], ...] = (
     ("ecdcb1245c53", "users", None),
     ("42958f0e7fe1", "fair_sections", None),
     ("9b3d71c8a4e5", "progress", "section"),
     ("c47f0a6e21b8", "chat_messages", "section"),
+    ("f3a91c47b2e5", "users", "failed_login_window_started_at"),
 )
 
 

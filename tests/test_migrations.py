@@ -24,11 +24,8 @@ from sqlalchemy.orm import Session
 from app.database import Base
 from app.migrate import VERSION_TABLE, alembic_config, current_revision, run_migrations
 import app.models  # noqa: F401  (registers every table on Base.metadata)
-from app.models.enums import LessonStatus, Role, WatchdogStatus
-from app.models.lesson import Lesson
+from app.models.enums import LessonStatus, WatchdogStatus
 from app.models.progress import Progress
-from app.models.school import School
-from app.models.user import User
 
 # Spelled out rather than imported from app.migrate: these tests exist to say
 # what the right revision is, so they must not follow the source if it changes.
@@ -80,23 +77,34 @@ def _columns(engine, table: str) -> set[str]:
     return {c["name"] for c in inspect(engine).get_columns(table)}
 
 
-def _seed_one_progress_row(engine) -> None:
-    """The smallest graph a `progress` row needs to exist."""
-    with Session(engine) as session:
-        session.add(School(id="sch_1", name="Test School"))
-        session.add(
-            User(
-                id="usr_1",
-                name="A Teacher",
-                email="teacher@example.com",
-                password_hash="not-a-real-hash",
-                role=Role.teacher,
-            )
+def _seed_progress_row(engine, *, status: str, watchdog: str) -> None:
+    """One `progress` row holding the values a test wants to see rewritten.
+
+    Written as SQL naming the columns that exist at that revision, not through
+    the ORM. These tests stand at a *historical* revision while the models have
+    moved on, so seeding through the models inserts whatever columns exist today
+    and dies on the first one added since — which is exactly how this helper
+    broke when `users` gained one.
+
+    The teacher and lesson the row points at are not created, and foreign keys
+    are off for the insert: the subject here is a data migration over one table,
+    and the rows it would point at say nothing about whether the rewrite is
+    right.
+    """
+    raw = engine.raw_connection()
+    try:
+        cursor = raw.cursor()
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute(
+            "INSERT INTO progress (id, teacher_id, lesson_id, section, status,"
+            " percent_complete, unlocked_override, watchdog, created_at, updated_at)"
+            " VALUES ('prg_1', 'usr_1', 'les_1', '', ?, 0, 0, ?,"
+            " '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            (status, watchdog),
         )
-        session.add(Lesson(id="les_1", title="Loops", grade=7, subject="python"))
-        session.flush()
-        session.add(Progress(id="prg_1", teacher_id="usr_1", lesson_id="les_1"))
-        session.commit()
+        raw.commit()
+    finally:
+        raw.close()
 
 
 def test_migrations_match_the_models(sqlite_url):
@@ -319,11 +327,8 @@ def test_retiring_late_writes_enum_names_not_values(sqlite_url):
     """
     engine = _engine(sqlite_url)
     _upgrade_to(engine, BEFORE_RETIRE_LATE)
-    _seed_one_progress_row(engine)
-
     # The state the migration exists to clear, spelled as the old code spelled it.
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE progress SET status = 'late', watchdog = 'late'"))
+    _seed_progress_row(engine, status="late", watchdog="late")
 
     _upgrade(engine)
 
@@ -348,12 +353,8 @@ def test_rows_corrupted_by_the_first_retire_late_are_repaired(sqlite_url):
     """
     engine = _engine(sqlite_url)
     _upgrade_to(engine, RETIRE_LATE)
-    _seed_one_progress_row(engine)
-
-    with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE progress SET status = 'in-progress', watchdog = 'on-track'")
-        )
+    # The values the broken first version of that migration wrote.
+    _seed_progress_row(engine, status="in-progress", watchdog="on-track")
 
     _upgrade(engine)
 

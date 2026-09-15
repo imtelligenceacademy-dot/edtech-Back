@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     max_failed_logins: int = 5
     lockout_minutes: int = 15
     max_lockout_minutes: int = 1440
+    # How long a run of failed attempts stays on an account's record. Without a
+    # window the count never decayed, so the escalation below only ever went one
+    # way: roughly forty wrong passwords, at any pace at all, reached the
+    # 24-hour cap and stayed there, and one attempt a day from a stranger who
+    # knew the email held a teacher out indefinitely. An hour is long enough to
+    # recognise a burst and short enough that a bad week does not accumulate.
+    failed_login_window_minutes: int = 60
     login_ip_max_failures: int = 5
     login_ip_window_minutes: int = 15
     login_ip_ban_cycles: int = 2

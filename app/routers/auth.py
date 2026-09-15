@@ -235,6 +235,35 @@ def login(
     if not valid:
         _record_ip_failure(db, ip, now)
         if user:
+            # An attempt against an account that is already locked counts
+            # against the network and nothing else. It used to re-arm the
+            # lockout every time, which meant the lock never actually expired
+            # while anyone kept knocking: four wrong passwords per quarter hour
+            # — too slow to trip the network throttle — held a teacher out for
+            # as long as the attacker cared to continue, and an admin's password
+            # reset bought only until the next attempt. It also wrote a second
+            # security-log row each time, flooding the screen an admin would go
+            # to in order to understand why.
+            if locked:
+                record_event(
+                    db, event=SecurityEvent.failed_login, status=SecurityStatus.warning,
+                    ip=ip, device=device, user=user,
+                    detail="Wrong password while already locked out",
+                )
+                db.commit()
+                raise _INVALID_CREDENTIALS
+
+            # A run of failures that has gone quiet for longer than the window
+            # is over, and the next one starts a new run. Without this the count
+            # only ever climbed, so the escalation below described the account's
+            # whole history rather than the burst in front of it.
+            window_started = _aware(user.failed_login_window_started_at)
+            if window_started is None or window_started <= now - timedelta(
+                minutes=settings.failed_login_window_minutes
+            ):
+                user.failed_login_count = 0
+                user.failed_login_window_started_at = now
+
             user.failed_login_count += 1
             locked_for = 0
             if user.failed_login_count >= settings.max_failed_logins:
@@ -283,8 +312,7 @@ def login(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active")
 
     # Success: reset lockout, upgrade hash if needed, stamp login, issue session.
-    user.failed_login_count = 0
-    user.locked_until = None
+    user.clear_lockout()
     _clear_ip_failures(db, ip)
     user.last_login_at = now
     if needs_rehash(user.password_hash):

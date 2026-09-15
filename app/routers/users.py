@@ -114,8 +114,7 @@ def update_status(
     # Reinstating an account clears any lockout with it. Otherwise "active"
     # was a status the holder still could not sign in under.
     if payload.status == UserStatus.active:
-        user.locked_until = None
-        user.failed_login_count = 0
+        user.clear_lockout()
     db.commit()
     db.refresh(user)
     return user
@@ -332,8 +331,7 @@ def reset_password(
     # this it was not one: the lock is checked before the password is verified,
     # so a teacher given a new password still met "Account temporarily locked"
     # for up to a day and rang back to say the reset had not worked.
-    user.locked_until = None
-    user.failed_login_count = 0
+    user.clear_lockout()
     ended = sum(1 for token in user.refresh_tokens if not token.revoked)
     for token in user.refresh_tokens:
         token.revoked = True

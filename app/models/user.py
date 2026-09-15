@@ -63,8 +63,29 @@ class User(Base, TimestampMixin):
     # Account-lockout bookkeeping.
     failed_login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     locked_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # When the current run of failed attempts began. The count is only
+    # meaningful next to this: without it there was no way to tell five wrong
+    # passwords in a minute from five spread over a term, so the count only ever
+    # climbed and the lockout it produced only ever got longer.
+    failed_login_window_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     school: Mapped[Optional["School"]] = relationship(back_populates="users")
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+
+    def clear_lockout(self) -> None:
+        """Forget every failed attempt recorded against this account.
+
+        Three places need this — a successful sign-in, an admin reinstating a
+        suspended account, and an admin resetting a password — and each one used
+        to spell the fields out itself. Leaving one behind is silent: the count
+        survives, and the next wrong password picks the escalation back up where
+        it left off, so a teacher who has just been given a new password is
+        locked out again by a single typo.
+        """
+        self.failed_login_count = 0
+        self.locked_until = None
+        self.failed_login_window_started_at = None
