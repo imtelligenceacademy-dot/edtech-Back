@@ -234,7 +234,10 @@ def list_fair_projects(
 
 
 @router.post("", response_model=FairProjectOut, status_code=status.HTTP_201_CREATED)
-async def upload_fair_project(
+# Sync for the same reason as the curriculum upload beside it: the disk
+# write and the commit below are blocking, and on the event loop they
+# blocked everybody. Projects arrive in batches dragged onto a section.
+def upload_fair_project(
     file: UploadFile = File(...),
     section_id: str | None = Form(default=None),
     db: Session = Depends(get_db),
@@ -252,12 +255,13 @@ async def upload_fair_project(
             status_code=status.HTTP_404_NOT_FOUND, detail="Section not found"
         )
 
-    content = await file.read()
-    if len(content) > _max_bytes():
+    try:
+        content = read_upload_capped(file.file, _max_bytes())
+    except UploadTooLarge:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File exceeds {settings.max_upload_mb} MB",
-        )
+        ) from None
     if not content.startswith(PDF_MAGIC):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="File is not a valid PDF"

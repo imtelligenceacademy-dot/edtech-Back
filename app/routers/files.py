@@ -41,7 +41,12 @@ from app.schemas.file import (
 )
 from app.services.auto_assign import assign_uploaded_file, preview_uploads
 from app.services.backup import build_files_archive, files_archive_filename
-from app.services.file_storage import resolve_stored_file, upload_root
+from app.services.file_storage import (
+    UploadTooLarge,
+    read_upload_capped,
+    resolve_stored_file,
+    upload_root,
+)
 from app.services.fair_access import can_open_fair_file
 from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
@@ -99,7 +104,16 @@ def preview_upload(
 
 
 @router.post("", response_model=UploadResult, status_code=status.HTTP_201_CREATED)
-async def upload_file(
+# Deliberately not `async`. Everything this does is blocking — a disk
+# write, a full scan of users and lessons to work out who the lesson
+# belongs to, a pypdf parse for the page count, and a commit — and on the
+# event loop all of it ran with nothing else able to make progress. A
+# super-admin uploading the curriculum a few hundred files at a time
+# therefore stalled every concurrent teacher request behind each one,
+# including live assistant streams, which is the whole platform paused by
+# one person doing something entirely ordinary. Declared sync, FastAPI
+# runs it in a worker thread and the loop stays free.
+def upload_file(
     file: UploadFile = File(...),
     language: Literal["en", "fr"] = Form("en"),
     year: int = Form(2),
@@ -117,12 +131,13 @@ async def upload_file(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF files are allowed"
         )
 
-    content = await file.read()
-    if len(content) > _max_bytes():
+    try:
+        content = read_upload_capped(file.file, _max_bytes())
+    except UploadTooLarge:
         raise HTTPException(
             status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
             detail=f"File exceeds {settings.max_upload_mb} MB",
-        )
+        ) from None
     # Defense in depth: verify it is really a PDF, not just a renamed file.
     if not content.startswith(PDF_MAGIC):
         raise HTTPException(
