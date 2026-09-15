@@ -850,17 +850,33 @@ def admin_chat_stream(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    record_ai_usage(db, current, "admin")
+    usage_id = record_ai_usage(db, current, "admin")
     provider = get_provider()
 
     def event_stream():
-        yield f"data: {json.dumps({'sourceRef': school_name})}\n\n"
+        answer: list[str] = []
         try:
-            for delta in provider.chat_stream(system, messages):
-                yield f"data: {json.dumps({'delta': delta})}\n\n"
-        except Exception:
-            yield f"data: {json.dumps({'error': 'AI assistant unavailable'})}\n\n"
-        yield f"data: {json.dumps({'done': True})}\n\n"
+            yield f"data: {json.dumps({'sourceRef': school_name})}\n\n"
+            try:
+                for delta in provider.chat_stream(system, messages):
+                    answer.append(delta)
+                    yield f"data: {json.dumps({'delta': delta})}\n\n"
+            except Exception as exc:
+                logger.warning("admin chat stream failed: %s", type(exc).__name__)
+                # The same text the teacher gets, for the same reason: "busy,
+                # try in a moment" and "not configured, tell your administrator"
+                # ask for different things, and a flat "unavailable" asked for
+                # neither. The admin here often *is* the administrator.
+                yield f"data: {json.dumps({'error': _error_text(exc)})}\n\n"
+            yield f"data: {json.dumps({'done': True})}\n\n"
+        finally:
+            # Charged up front and never given back, unlike the teacher path
+            # beside it. With every provider down, five questions returned five
+            # errors and spent the whole hourly allowance: the admin had been
+            # told nothing and was then refused for an hour for the privilege.
+            if not answer:
+                with SessionLocal() as refund_db:
+                    refund_ai_usage(refund_db, usage_id)
 
     return StreamingResponse(
         event_stream(),
@@ -944,14 +960,21 @@ def admin_report(
         enforce_ai_limit(db, current, "admin")
     except AILimitExceeded as exc:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message) from exc
+    usage_id = record_ai_usage(db, current, "admin")
     try:
         narrative = provider.chat(
             system, [{"role": "user", "content": "Write the school report now."}]
         )
     except Exception:
+        # The report still builds — the tables under the narrative are the point
+        # of it — but a hard-coded apology is not something to charge a question
+        # for. With the chain down, three attempts at a report spent three of
+        # five hourly questions on the same constant string, and the fourth was
+        # refused.
+        logger.warning("school report narrative failed; using the fallback text")
         narrative = _REPORT_FALLBACK
+        refund_ai_usage(db, usage_id)
 
-    record_ai_usage(db, current, "admin")
     buf, filename = build_school_ai_report(db, current.school_id, current.name, narrative)
     disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
@@ -978,14 +1001,16 @@ def super_report(
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message
         ) from exc
+    usage_id = record_ai_usage(db, current, "admin")
     try:
         narrative = provider.chat(
             system, [{"role": "user", "content": "Write the platform report now."}]
         )
     except Exception:
+        logger.warning("platform report narrative failed; using the fallback text")
         narrative = _REPORT_FALLBACK
+        refund_ai_usage(db, usage_id)
 
-    record_ai_usage(db, current, "admin")
     buf, filename = build_super_ai_report(db, current.name, narrative)
     disposition = f"attachment; filename*=UTF-8''{quote(filename)}"
     return StreamingResponse(
