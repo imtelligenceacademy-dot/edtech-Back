@@ -388,6 +388,80 @@ def _restore_sqlite_database(content: bytes) -> list[str]:
             os.unlink(tmp)
 
 
+def _stash_excluded_tables(conn) -> dict[str, str]:
+    """Hold the tables a backup deliberately omits, somewhere a cascade cannot
+    reach them.
+
+    Leaving them out of the delete sweep is not enough. `chat_messages.teacher_id`
+    is ON DELETE CASCADE, so emptying `users` takes every conversation with it
+    through the database — as a side effect of restoring everything else, with
+    nothing in this module doing it. The rows have to be copied out first and
+    put back afterwards.
+
+    A temporary table rather than a Python list, because the reason chats are
+    excluded from a backup in the first place is that a year of them does not
+    belong in this process's memory.
+    """
+    stashes: dict[str, str] = {}
+    for table in Base.metadata.sorted_tables:
+        if table.name not in BACKUP_EXCLUDED_TABLES:
+            continue
+        stash = f"imt_restore_stash_{table.name}"
+        conn.exec_driver_sql(f'DROP TABLE IF EXISTS "{stash}"')
+        conn.exec_driver_sql(
+            f'CREATE TEMPORARY TABLE "{stash}" AS SELECT * FROM "{table.name}"'
+        )
+        stashes[table.name] = stash
+    return stashes
+
+
+def _return_stashed_tables(conn, stashes: dict[str, str]) -> None:
+    """Put the stashed rows back, minus the ones that no longer point anywhere.
+
+    A restore can remove the teacher or the lesson a conversation belongs to —
+    an account created after the backup was taken does not exist in it. Those
+    rows cannot come back without violating the foreign keys that carried them
+    away in the first place, so they are dropped and counted rather than forced.
+    """
+    for table in Base.metadata.sorted_tables:
+        stash = stashes.get(table.name)
+        if stash is None:
+            continue
+
+        names = [column.name for column in table.columns]
+        into = ", ".join(f'"{name}"' for name in names)
+        outof = ", ".join(f's."{name}"' for name in names)
+
+        conditions = []
+        for column in table.columns:
+            for foreign_key in column.foreign_keys:
+                target = foreign_key.column
+                exists = (
+                    f'EXISTS (SELECT 1 FROM "{target.table.name}" p '
+                    f'WHERE p."{target.name}" = s."{column.name}")'
+                )
+                if column.nullable:
+                    exists = f'(s."{column.name}" IS NULL OR {exists})'
+                conditions.append(exists)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        held = conn.exec_driver_sql(f'SELECT COUNT(*) FROM "{stash}"').scalar() or 0
+        conn.exec_driver_sql(
+            f'INSERT INTO "{table.name}" ({into}) SELECT {outof} FROM "{stash}" s{where}'
+        )
+        # The table was emptied by the sweep and is not in the backup, so
+        # whatever is in it now is exactly what came back.
+        kept = conn.exec_driver_sql(f'SELECT COUNT(*) FROM "{table.name}"').scalar() or 0
+        conn.exec_driver_sql(f'DROP TABLE "{stash}"')
+
+        if held:
+            logger.info(
+                "Restore kept %d of %d %s rows (%d dropped: the account or "
+                "lesson they belong to is not in the backup).",
+                kept, held, table.name, held - kept,
+            )
+
+
 def _restore_json_database(content: bytes) -> list[str]:
     try:
         payload = json.loads(content.decode("utf-8"))
@@ -405,6 +479,10 @@ def _restore_json_database(content: bytes) -> list[str]:
 
     restored: list[str] = []
     with engine.begin() as conn:
+        # Before anything is deleted: the excluded tables are not in the payload,
+        # so nothing below would ever put them back.
+        stashes = _stash_excluded_tables(conn)
+
         for table in reversed(Base.metadata.sorted_tables):
             conn.execute(table.delete())
 
@@ -430,6 +508,10 @@ def _restore_json_database(content: bytes) -> list[str]:
             if rows:
                 conn.execute(table.insert(), rows)
             restored.append(table.name)
+
+        # After every parent row is back, so the foreign-key check below has
+        # something to find.
+        _return_stashed_tables(conn, stashes)
     return restored
 
 
