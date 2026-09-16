@@ -546,7 +546,18 @@ def get_provider() -> LLMProvider:
     """
     providers = [p for p in (_build(n) for n in provider_chain_names()) if p is not None]
     if not providers:
-        return MockProvider()
-    if len(providers) == 1:
-        return providers[0]
+        providers = [MockProvider()]
+    # Always a chain, even of one.
+    #
+    # The chain is not only about falling through to the next provider — it is
+    # also where a stream that produces no chunks at all is turned into an error
+    # instead of a blank answer. Returning a bare provider for a single-key
+    # deployment skipped that: the teacher got an empty bubble with no error and
+    # no retry, and on the vision path the slide transcription that a text-only
+    # call would have answered from was discarded with it. A single key is the
+    # ordinary production shape, so the shortcut removed the guard from exactly
+    # the deployments that had no fallback to soften it.
+    #
+    # It costs nothing. ProviderChain forwards name, model and supports_vision
+    # to the provider that answered, so a chain of one behaves as that one did.
     return ProviderChain(providers)
