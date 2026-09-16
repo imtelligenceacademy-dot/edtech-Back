@@ -38,6 +38,26 @@ def enforce_ai_limit(db: Session, user: User, kind: str) -> None:
         daily_limit = settings.ai_admin_daily_limit
         label = "school-admin AI assistant"
 
+    # Serialise this account's quota check against its own concurrent requests.
+    #
+    # Counting and then inserting is a read-then-write with nothing between the
+    # two. A teacher one question below the cap who clicks Send six times —
+    # which a browser will happily do — sent six requests that all read the same
+    # count, all passed the check, and all inserted: twenty questions billed
+    # against a fifteen-question cap. Holding the account row until the usage
+    # row is committed makes the check and the charge a single step, and the
+    # account row is the right one to hold because the cap is per account.
+    #
+    # `populate_existing` after a flush, for the reason spelled out in
+    # `auth._locked_for_update`: without the flush this would discard anything
+    # changed on the user and not yet written, and without `populate_existing`
+    # the lock would protect a value read before it was taken.
+    #
+    # SQLite ignores FOR UPDATE and can — a write transaction takes a
+    # database-wide lock, so the serialisation is already there.
+    db.flush()
+    db.get(User, user.id, with_for_update=True, populate_existing=True)
+
     now = datetime.now(timezone.utc)
     hour_start = now - timedelta(hours=1)
     day_start = now - timedelta(days=1)
