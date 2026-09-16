@@ -6,6 +6,8 @@ Super-admins manage everyone; school-admins are monitoring-only and may only
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -327,7 +329,9 @@ def reset_password(
 ) -> MessageResponse:
     """Set a new password for a user. The previous password is irrecoverable by
     design (stored only as an Argon2id hash). Resetting revokes the user's
-    refresh tokens so existing sessions must re-authenticate.
+    refresh tokens and invalidates any access token already issued, so every
+    existing session must re-authenticate — immediately, not once the current
+    access token happens to expire.
 
     Teachers cannot change their own password, so this is the only way one ever
     changes — and it silently signs the teacher out everywhere. That belongs in
@@ -347,6 +351,11 @@ def reset_password(
     ended = sum(1 for token in user.refresh_tokens if not token.revoked)
     for token in user.refresh_tokens:
         token.revoked = True
+    # And the access token, which no revocation can reach — see
+    # User.sessions_valid_from. Without this the docstring above was only half
+    # true: the account could not get a *new* session, while whoever held the
+    # current one kept it for the rest of its lifetime.
+    user.sessions_valid_from = datetime.now(timezone.utc)
     record_event(
         db,
         event=SecurityEvent.password_reset,

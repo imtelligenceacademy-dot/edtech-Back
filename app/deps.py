@@ -8,6 +8,7 @@ inactive accounts. The role/capability guards build on top of it.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import timezone
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
@@ -52,6 +53,18 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     user = db.get(User, user_id)
     if user is None:
         raise _CREDENTIALS_EXC
+    # A token minted before the account's credentials were replaced is no longer
+    # this account's token. Refresh tokens are rows and were already revoked;
+    # this is the half that no revocation could reach, so without it a stolen
+    # session outlived the reset meant to end it by up to the access-token
+    # lifetime. Null means nothing has ever been invalidated.
+    cutoff = user.sessions_valid_from
+    if cutoff is not None:
+        if cutoff.tzinfo is None:
+            cutoff = cutoff.replace(tzinfo=timezone.utc)
+        issued_at = payload.get("iat")
+        if not isinstance(issued_at, int) or issued_at < int(cutoff.timestamp()):
+            raise _CREDENTIALS_EXC
     if user.status != UserStatus.active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active"

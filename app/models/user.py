@@ -71,6 +71,19 @@ class User(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
 
+    # Access tokens issued before this moment are no longer accepted.
+    #
+    # Refresh tokens are rows and can simply be revoked; the access token is a
+    # signed JWT that no revocation can reach, so a password reset ended the
+    # ability to get a *new* session while the current one kept working for the
+    # rest of its 15 minutes. That is the window an admin is trying to close.
+    #
+    # Null on every existing row, which means "nothing has been invalidated" —
+    # the same answer the check would have given before this existed.
+    sessions_valid_from: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     school: Mapped[Optional["School"]] = relationship(back_populates="users")
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
