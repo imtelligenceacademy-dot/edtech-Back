@@ -36,6 +36,7 @@ from app.schemas.auth import (
     MessageResponse,
     SessionUser,
 )
+from app.services.sessions import end_all_sessions
 from app.services.signin_watch import check_sign_in
 from app.security import (
     create_access_token,
@@ -468,8 +469,19 @@ def refresh(
     if record is None or record.revoked or _aware(record.expires_at) <= datetime.now(timezone.utc):
         return _rejected_and_signed_out()
 
-    user = db.get(User, record.user_id)
+    # Locked for the same reason `end_all_sessions` takes it: that function and
+    # this one both decide the fate of this account's tokens, and interleaved
+    # they can leave a live one behind.
+    user = _locked_for_update(db, User, record.user_id)
     if user is None or user.status != UserStatus.active:
+        return _rejected_and_signed_out()
+
+    # A token minted before the account's sessions were ended is not this
+    # account's token any more, whatever the revocation sweep managed to catch.
+    # Checked here as well as there because this is the endpoint that would turn
+    # a missed row into an indefinitely self-renewing session.
+    cutoff = user.sessions_valid_from
+    if cutoff is not None and _aware(record.created_at) < _aware(cutoff):
         return _rejected_and_signed_out()
 
     # Rotate: revoke the presented token, issue a new pair.
@@ -498,9 +510,7 @@ def logout_all(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> MessageResponse:
-    live = sum(1 for token in user.refresh_tokens if not token.revoked)
-    for token in user.refresh_tokens:
-        token.revoked = True
+    live = end_all_sessions(db, user)
     record_event(
         db, event=SecurityEvent.signed_out_all, status=SecurityStatus.ok,
         ip=client_ip(request), device=user_agent(request), user=user,

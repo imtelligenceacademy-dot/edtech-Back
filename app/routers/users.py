@@ -6,8 +6,6 @@ Super-admins manage everyone; school-admins are monitoring-only and may only
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -27,6 +25,7 @@ from app.schemas.user import (
 )
 from app.security import hash_password
 from app.services.auto_assign import prune_teacher_assignments, sync_teacher_assignments
+from app.services.sessions import end_all_sessions
 from app.services.sections import (
     normalize_sections,
     rename_section,
@@ -348,14 +347,9 @@ def reset_password(
     # so a teacher given a new password still met "Account temporarily locked"
     # for up to a day and rang back to say the reset had not worked.
     user.clear_lockout()
-    ended = sum(1 for token in user.refresh_tokens if not token.revoked)
-    for token in user.refresh_tokens:
-        token.revoked = True
-    # And the access token, which no revocation can reach — see
-    # User.sessions_valid_from. Without this the docstring above was only half
-    # true: the account could not get a *new* session, while whoever held the
-    # current one kept it for the rest of its lifetime.
-    user.sessions_valid_from = datetime.now(timezone.utc)
+    # Refresh tokens and the access token that no revocation reaches, together,
+    # through the one function that knows both halves are needed.
+    ended = end_all_sessions(db, user)
     record_event(
         db,
         event=SecurityEvent.password_reset,
