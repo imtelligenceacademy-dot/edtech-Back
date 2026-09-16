@@ -590,9 +590,28 @@ _ERROR_TEXT = {
 }
 
 
+# Which failures are worth sending the same question again for. The texts above
+# already draw this line in prose — "try again in a moment" against "tell your
+# administrator" — but only the words crossed the wire, so the client had to
+# guess, and it guessed "retryable" for everything. A refused request, a missing
+# key and an exhausted allowance do not become answerable by asking twice.
+_RETRYABLE_KINDS = frozenset({"rate_limit", "timeout", "unavailable"})
+
+
 def _error_text(exc: Exception) -> str:
     kind = getattr(exc, "kind", "unavailable")
     return _ERROR_TEXT.get(kind, _ERROR_TEXT["unavailable"])
+
+
+def _error_frame(message: str, *, retryable: bool) -> str:
+    """One SSE error event, saying both what went wrong and whether asking again
+    could possibly help."""
+    return f"data: {json.dumps({'error': message, 'retryable': retryable})}\n\n"
+
+
+def _provider_error_frame(exc: Exception) -> str:
+    kind = getattr(exc, "kind", "unavailable")
+    return _error_frame(_error_text(exc), retryable=kind in _RETRYABLE_KINDS)
 
 
 def _stream_answer(bundle: PromptBundle):
@@ -707,8 +726,17 @@ def chat_stream(
     try:
         enforce_ai_limit(db, current, "teacher")
     except AILimitExceeded as exc:
+        # Bound here, not read inside the generator. Python unbinds the `as`
+        # name when the except block ends, and this generator runs afterwards —
+        # so reading exc.message from inside it raised NameError mid-stream and
+        # the teacher who hit their hourly cap got a broken connection instead
+        # of the sentence explaining why.
+        limit_message = exc.message
+
         def limited_stream():
-            yield f"data: {json.dumps({'error': exc.message})}\n\n"
+            # The teacher's own hourly or daily allowance is spent. Asking again
+            # cannot succeed until the window moves, and the message says so.
+            yield _error_frame(limit_message, retryable=False)
             yield f"data: {json.dumps({'done': True})}\n\n"
 
         return StreamingResponse(
@@ -755,7 +783,7 @@ def chat_stream(
                     yield f"data: {json.dumps({'delta': delta})}\n\n"
             except Exception as exc:
                 logger.warning("teacher chat stream failed: %s", type(exc).__name__)
-                yield f"data: {json.dumps({'error': _error_text(exc)})}\n\n"
+                yield _provider_error_frame(exc)
             yield f"data: {json.dumps({'done': True})}\n\n"
         finally:
             # Saved even when the teacher closes the tab mid-answer: a partial
@@ -839,10 +867,14 @@ def admin_chat_stream(
 ) -> StreamingResponse:
     def _refuse(message: str) -> StreamingResponse:
         """Refusals reach this endpoint as a stream, not as a status code. The
-        chat reads an event stream and would show a 400 body as nothing at all."""
+        chat reads an event stream and would show a 400 body as nothing at all.
+
+        Never retryable: both callers are conditions the admin cannot ask their
+        way out of — an account with no school attached, and an allowance that
+        is already spent."""
 
         def refusal_stream():
-            yield f"data: {json.dumps({'error': message})}\n\n"
+            yield _error_frame(message, retryable=False)
             yield f"data: {json.dumps({'done': True})}\n\n"
 
         return StreamingResponse(
@@ -884,7 +916,7 @@ def admin_chat_stream(
                 # try in a moment" and "not configured, tell your administrator"
                 # ask for different things, and a flat "unavailable" asked for
                 # neither. The admin here often *is* the administrator.
-                yield f"data: {json.dumps({'error': _error_text(exc)})}\n\n"
+                yield _provider_error_frame(exc)
             yield f"data: {json.dumps({'done': True})}\n\n"
         finally:
             # Charged up front and never given back, unlike the teacher path
