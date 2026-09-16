@@ -131,6 +131,25 @@ def test_behind_one_proxy_the_address_our_proxy_saw_is_the_one_used(db, monkeypa
     assert client_ip(_Req("10.0.0.1")) == "10.0.0.1"
 
 
+def test_a_chain_shorter_than_configured_falls_back_to_the_socket(db, monkeypatch):
+    """The trap laid for the day a second proxy is added.
+
+    With more hops configured than the request actually traversed, the computed
+    index goes negative and the guard fails. That fell back to `parts[0]` — the
+    leftmost, fully client-authored entry, which is precisely the value this
+    function exists to refuse: the attacker would again be choosing the address
+    their failures are throttled against and the one written to the security
+    log. The socket peer is the only address here they did not supply.
+    """
+    monkeypatch.setattr(settings, "trusted_proxy_hops", 3)
+
+    # One appending proxy, three expected: nothing in the header can be placed.
+    assert client_ip(_Req("10.0.0.1", "evil.attacker.value")) == "10.0.0.1"
+    assert client_ip(_Req("10.0.0.1", "9.9.9.9, 8.8.8.8")) == "10.0.0.1"
+    # A chain of exactly the configured length is still read normally.
+    assert client_ip(_Req("10.0.0.1", "9.9.9.9, 8.8.8.8, 203.0.113.7")) == "9.9.9.9"
+
+
 def test_a_network_ban_lets_go_of_the_network(db, monkeypatch):
     """It used to be permanent: written in one place, cleared in none."""
     from app.models import LoginThrottle

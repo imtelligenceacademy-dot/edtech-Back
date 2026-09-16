@@ -39,7 +39,20 @@ def client_ip(request: Request) -> str:
     # The hop-th entry from the right: the address seen by the outermost proxy
     # we trust. A client that pads the header only pads the part we ignore.
     index = len(parts) - hops
-    return parts[index] if 0 <= index < len(parts) else parts[0]
+    if 0 <= index < len(parts):
+        return parts[index]
+    # Fewer entries than hops configured, so the header did not come through the
+    # chain we were told to expect and none of it can be placed. This fell back
+    # to parts[0] — the leftmost, fully client-authored entry, the exact value
+    # the docstring above exists to refuse. An attacker short of the configured
+    # hop count then chose the address their failures were throttled against and
+    # the one written into the security log.
+    #
+    # Unreachable at the current single-hop deployment, where a non-empty header
+    # always yields index 0 or more. It is the day a second proxy is added that
+    # this matters, and on that day the socket peer is the only address here
+    # that was not supplied by the caller.
+    return peer
 
 
 def user_agent(request: Request) -> str:
