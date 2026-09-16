@@ -66,6 +66,31 @@ def _wait() -> timedelta:
     return timedelta(days=settings.lesson_unlock_wait_days)
 
 
+def _gate_after_finished(
+    p, now: datetime, wait: timedelta, sequence_blocked: bool
+) -> tuple[bool, datetime | None]:
+    """Where the sequence stands once a finished lesson has been walked past.
+
+    Returns (gate_open, pending_unlock_at).
+
+    Used in both places a finished lesson is handled: one that is simply
+    completed, and one an admin has reopened. The reopened lesson is still
+    finished and the lessons after it were already past it, so they must land in
+    the same state either way — written once because when it was written twice
+    the two disagreed.
+    """
+    if sequence_blocked:
+        return False, None
+    completed_at = p.completed_at if p else None
+    if completed_at is None:
+        # Completed but no timestamp recorded (legacy row): unlock now.
+        return True, None
+    unlock_at = _as_utc(completed_at) + wait
+    if now >= unlock_at:
+        return True, None
+    return False, unlock_at
+
+
 def _course_order(lesson: Lesson) -> int:
     return COURSE_ORDER.get(lesson.course or "", 0)
 
@@ -155,19 +180,9 @@ def compute_access(db: Session, teacher: User) -> dict[tuple[str, str], LessonAc
                     status=COMPLETED,
                     message="Completed — ask your admin to reopen it.",
                 )
-                if sequence_blocked:
-                    gate_open = False
-                    pending_unlock_at = None
-                else:
-                    completed_at = p.completed_at if p else None
-                    if completed_at is not None:
-                        unlock_at = _as_utc(completed_at) + wait
-                        gate_open = now >= unlock_at
-                        pending_unlock_at = None if gate_open else unlock_at
-                    else:
-                        # Completed but no timestamp recorded (legacy row): unlock now.
-                        gate_open = True
-                        pending_unlock_at = None
+                gate_open, pending_unlock_at = _gate_after_finished(
+                    p, now, wait, sequence_blocked
+                )
                 continue
 
             # The teacher's active lesson: the first not-completed lesson, or a
@@ -187,16 +202,29 @@ def compute_access(db: Session, teacher: User) -> dict[tuple[str, str], LessonAc
                     status=LOCKED,
                     message="Finish the previous lesson first — or ask your admin for access.",
                 )
-            # This lesson consumes the gate; nothing further in the track opens
-            # until it is completed and its own wait elapses.
+            # Where the sequence stands after this lesson.
             #
-            # An overridden one does not. An override is an extra door an admin
-            # opened, not a place in the queue — and consuming the gate with it
-            # took access *away*: reopening a lesson finished last month locked
-            # the lesson the teacher was forty per cent through, and the server
-            # then refused to save her place in it. Adding access must not
-            # remove any.
-            if not override:
+            # An override is an extra door an admin opened, not a place in the
+            # queue, and it must not move the queue in either direction.
+            #
+            # Closing the gate with it took access *away*: reopening a lesson
+            # finished last month locked the lesson the teacher was forty per
+            # cent through, and the server then refused to save her place in it.
+            # So a reopened lesson — overridden and genuinely completed — leaves
+            # the sequence exactly where the completed branch above would have.
+            #
+            # Leaving the gate alone gave access away, which is the other half
+            # and was missed. An override on a lesson that is *not* finished
+            # inherited the previous lesson's open gate, so the lesson after it
+            # opened on the strength of a countdown belonging to a lesson two
+            # places back — and opened without the overridden one ever being
+            # completed. An unfinished lesson blocks what follows it whether or
+            # not somebody unlocked it early.
+            if completed:
+                gate_open, pending_unlock_at = _gate_after_finished(
+                    p, now, wait, sequence_blocked
+                )
+            else:
                 gate_open = False
                 pending_unlock_at = None
                 sequence_blocked = True
