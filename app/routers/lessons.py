@@ -58,7 +58,40 @@ from app.utils import client_ip, new_id, user_agent
 router = APIRouter(prefix="/api/lessons", tags=["lessons"])
 
 
-def _to_out(lesson: Lesson, access: LessonAccess | None = None) -> LessonOut:
+def _visible_teacher_ids(db: Session, current: User) -> set[str] | None:
+    """Which assigned-teacher ids this caller may be shown.
+
+    `None` means all of them, and only a super-admin gets that: the assignment
+    list is the thing they administer.
+
+    Everyone else is scoped, because a curriculum lesson is shared. One Grade 7
+    lesson carries an assignment for every teacher of Grade 7 on the platform,
+    across every school, and serialising that list whole handed a school-admin
+    the user ids of other schools' teachers — and let them count another
+    school's roster, lesson by lesson. A teacher sees only their own id for the
+    same reason.
+    """
+    if current.role == Role.super_admin:
+        return None
+    if current.role == Role.school_admin:
+        return set(
+            db.scalars(select(User.id).where(User.school_id == current.school_id))
+        )
+    return {current.id}
+
+
+def _to_out(
+    lesson: Lesson,
+    access: LessonAccess | None = None,
+    *,
+    visible_teacher_ids: set[str] | None,
+) -> LessonOut:
+    """Serialise a lesson for one caller.
+
+    `visible_teacher_ids` has no default on purpose: it is keyword-only and
+    required so that adding an endpoint means deciding whose assignments it
+    discloses, rather than inheriting the unscoped answer by forgetting to.
+    """
     return LessonOut(
         id=lesson.id,
         title=lesson.title,
@@ -73,7 +106,11 @@ def _to_out(lesson: Lesson, access: LessonAccess | None = None) -> LessonOut:
         created_by=lesson.created_by,
         file_id=lesson.uploaded_files[0].id if lesson.uploaded_files else None,
         slides=[SlideOut.model_validate(s) for s in lesson.slides],
-        assigned_teacher_ids=[a.teacher_id for a in lesson.assignments],
+        assigned_teacher_ids=[
+            a.teacher_id
+            for a in lesson.assignments
+            if visible_teacher_ids is None or a.teacher_id in visible_teacher_ids
+        ],
         access_status=access.status if access else None,
         available_at=access.available_at if access else None,
         access_message=access.message if access else None,
@@ -98,6 +135,7 @@ def list_lessons(
     current: User = Depends(get_current_user),
 ) -> list[LessonOut]:
     stmt = _base_query()
+    visible = _visible_teacher_ids(db, current)
     if current.role == Role.teacher:
         assigned = select(LessonAssignment.lesson_id).where(
             LessonAssignment.teacher_id == current.id
@@ -105,7 +143,7 @@ def list_lessons(
         stmt = stmt.where(Lesson.id.in_(assigned))
         access = section_access(db, current, section)
         return [
-            _to_out(l, access.get(l.id))
+            _to_out(l, access.get(l.id), visible_teacher_ids=visible)
             for l in db.scalars(stmt.order_by(Lesson.created_at.desc()))
         ]
     elif current.role == Role.school_admin:
@@ -118,7 +156,10 @@ def list_lessons(
         stmt = stmt.where(
             (Lesson.school_id == current.school_id) | (Lesson.id.in_(assigned_in_school))
         )
-    return [_to_out(l) for l in db.scalars(stmt.order_by(Lesson.created_at.desc()))]
+    return [
+        _to_out(l, visible_teacher_ids=visible)
+        for l in db.scalars(stmt.order_by(Lesson.created_at.desc()))
+    ]
 
 
 @router.get("/my-classes", response_model=list[ClassSummary])
@@ -233,9 +274,11 @@ def get_lesson(
                 detail=(access.message if access else None)
                 or "This lesson isn't available yet — ask your admin for access.",
             )
-        return _to_out(lesson, access)
+        return _to_out(
+            lesson, access, visible_teacher_ids=_visible_teacher_ids(db, current)
+        )
     assert_school_scope(current, lesson.school_id)
-    return _to_out(lesson)
+    return _to_out(lesson, visible_teacher_ids=_visible_teacher_ids(db, current))
 
 
 @router.post("", response_model=LessonOut, status_code=status.HTTP_201_CREATED)
@@ -266,7 +309,9 @@ def create_lesson(
     db.add(lesson)
     db.commit()
     db.refresh(lesson)
-    return _to_out(lesson)
+    # Super-admin only (upload-files / assign-files): the whole assignment list
+    # is what this endpoint just changed.
+    return _to_out(lesson, visible_teacher_ids=None)
 
 
 @router.delete("/{lesson_id}", status_code=status.HTTP_204_NO_CONTENT, response_class=Response)
@@ -481,7 +526,7 @@ def bulk_assignments(
         lessons_touched=len(touched),
         assignments_added=added,
         assignments_removed=removed,
-        lessons=[_to_out(lesson) for lesson in refreshed],
+        lessons=[_to_out(lesson, visible_teacher_ids=None) for lesson in refreshed],
     )
 
 
@@ -519,7 +564,9 @@ def assign_teacher(
     lesson = db.scalar(
         _base_query().where(Lesson.id == lesson_id).execution_options(populate_existing=True)
     )
-    return _to_out(lesson)
+    # Super-admin only (upload-files / assign-files): the whole assignment list
+    # is what this endpoint just changed.
+    return _to_out(lesson, visible_teacher_ids=None)
 
 
 @router.put("/{lesson_id}/assignments", response_model=LessonOut)
@@ -599,7 +646,9 @@ def replace_assignments(
     lesson = db.scalar(
         _base_query().where(Lesson.id == lesson_id).execution_options(populate_existing=True)
     )
-    return _to_out(lesson)
+    # Super-admin only (upload-files / assign-files): the whole assignment list
+    # is what this endpoint just changed.
+    return _to_out(lesson, visible_teacher_ids=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -904,4 +953,6 @@ def unassign_teacher(
     lesson = db.scalar(
         _base_query().where(Lesson.id == lesson_id).execution_options(populate_existing=True)
     )
-    return _to_out(lesson)
+    # Super-admin only (upload-files / assign-files): the whole assignment list
+    # is what this endpoint just changed.
+    return _to_out(lesson, visible_teacher_ids=None)
