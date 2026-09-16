@@ -218,6 +218,38 @@ def _selected_ids(payload: FileSelection) -> list[str]:
     return ids
 
 
+def _refuse_fair_backed(db: Session, file_ids: list[str]) -> None:
+    """Refuse to delete a PDF that an ICT Fair project is built on.
+
+    `FairProject.file_id` is ON DELETE CASCADE, so removing the file here takes
+    the project row with it: no ORM relationship runs, nothing is written to the
+    security log, and the caller is still answered 204 for a project that no
+    longer exists. `list_files` hides fair-backed PDFs, which is why this was
+    hard to reach by accident — but the file id is on every fair project
+    response, so "not in the list" was never the same as "cannot be deleted".
+
+    Fair projects come off through DELETE /api/fair/projects/{id}, which removes
+    the bytes and the project together and accounts for both.
+    """
+    ids = [file_id for file_id in file_ids if file_id]
+    if not ids:
+        return
+    titles = sorted(
+        db.scalars(select(FairProject.title).where(FairProject.file_id.in_(ids)))
+    )
+    if not titles:
+        return
+    named = ", ".join(f'"{t}"' for t in titles[:3])
+    rest = "" if len(titles) <= 3 else f" and {len(titles) - 3} more"
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            f"Cannot delete: still backing the ICT Fair project(s) {named}{rest}. "
+            "Delete them from the ICT Fair section instead."
+        ),
+    )
+
+
 def _expand_selection(
     db: Session, file_ids: list[str]
 ) -> tuple[list[UploadedFile], set[str], int]:
@@ -301,6 +333,9 @@ def bulk_delete(
     """
     ids = _selected_ids(payload)
     files, lesson_ids, _missing = _expand_selection(db, ids)
+    # Checked on the expanded set, not on what was clicked: selecting one PDF
+    # of a lesson pulls in its siblings, and a sibling can be the fair-backed one.
+    _refuse_fair_backed(db, [f.id for f in files])
 
     # The rows go first and the bytes second. Unlinking inside the loop put an
     # irreversible disk write ahead of the transaction meant to make this
@@ -471,6 +506,8 @@ def delete_file(
     uploaded = db.get(UploadedFile, file_id)
     if uploaded is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
+
+    _refuse_fair_backed(db, [uploaded.id])
 
     lesson_id = uploaded.linked_lesson_id
     if lesson_id:
