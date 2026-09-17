@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
-from app.models import FairProject, FairSection, School, UploadedFile, User
+from app.models import FairProject, FairSection, Lesson, School, UploadedFile, User
 from app.models.enums import Role, UserStatus
 from app.routers.files import bulk_delete, delete_file
 from app.schemas.file import FileSelection
@@ -131,3 +131,37 @@ def test_an_ordinary_unlinked_pdf_still_deletes(db):
     assert response.status_code == 204
     assert db.get(UploadedFile, uploaded.id) is None
     assert not (upload_root() / f"{uploaded.id}.pdf").exists()
+
+
+def test_deleting_a_sibling_pdf_cannot_reach_the_fair_project_sideways(db):
+    """The gap `bulk_delete` was corrected for and this route was not.
+
+    Deleting one PDF of a lesson takes every PDF filed under that lesson. If one
+    of those siblings backs a fair project, guarding only the clicked file let
+    the delete reach the project through the cascade — 204, nothing logged.
+    """
+    lesson = Lesson(
+        id=new_id("les"),
+        title="Grade 7 lesson 01",
+        grade=7,
+        subject="STEAM",
+        language="en",
+        year=2,
+        lesson_no=1,
+    )
+    db.add(lesson)
+    db.flush()
+    plain = _stored_pdf(db, linked_lesson_id=lesson.id)
+    fair_backed = _stored_pdf(db, linked_lesson_id=lesson.id)
+    project = _fair_project(db, fair_backed, title="Weather Station")
+
+    # The admin clicks the *plain* one, which is not itself fair-backed.
+    with pytest.raises(HTTPException) as err:
+        delete_file(file_id=plain.id, db=db, _=_boss(db))
+
+    assert err.value.status_code == 409
+    assert "Weather Station" in err.value.detail
+    db.rollback()
+    assert db.get(FairProject, project.id) is not None
+    assert db.get(Lesson, lesson.id) is not None
+    assert db.get(UploadedFile, plain.id) is not None

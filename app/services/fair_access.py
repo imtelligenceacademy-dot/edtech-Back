@@ -24,6 +24,7 @@ still see it, which is how it gets fixed.
 
 from __future__ import annotations
 
+from fastapi import HTTPException, status
 from sqlalchemy import Select, select
 from sqlalchemy.orm import Session
 
@@ -138,3 +139,39 @@ def can_open_fair_file(db: Session, user: User, file_id: str) -> bool:
         # nobody but a super-admin, who is already allowed above this check.
         return False
     return section_visible_to(user, section)
+
+
+def refuse_fair_backed(db: Session, file_ids: list[str]) -> None:
+    """Refuse to delete a PDF that an ICT Fair project is built on.
+
+    `FairProject.file_id` is ON DELETE CASCADE, so removing the file takes the
+    project row with it: no ORM relationship runs, nothing is written to the
+    security log, and the caller is still answered 204 for a project that no
+    longer exists. `list_files` hides fair-backed PDFs, which is why this is
+    hard to reach by accident — but the file id is on every fair project
+    response, so "not in the list" was never the same as "cannot be deleted".
+
+    Fair projects come off through DELETE /api/fair/projects/{id}, which removes
+    the bytes and the project together and accounts for both.
+
+    It lives here rather than in one router because three delete paths need it —
+    a single file, a bulk selection, and a whole lesson — and when it was a
+    private helper in `files.py` only two of them had it.
+    """
+    ids = [file_id for file_id in file_ids if file_id]
+    if not ids:
+        return
+    titles = sorted(
+        db.scalars(select(FairProject.title).where(FairProject.file_id.in_(ids)))
+    )
+    if not titles:
+        return
+    named = ", ".join(f'"{t}"' for t in titles[:3])
+    rest = "" if len(titles) <= 3 else f" and {len(titles) - 3} more"
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=(
+            f"Cannot delete: still backing the ICT Fair project(s) {named}{rest}. "
+            "Delete them from the ICT Fair section instead."
+        ),
+    )

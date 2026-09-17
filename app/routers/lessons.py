@@ -18,6 +18,7 @@ from app.database import get_db
 from app.deps import assert_school_scope, get_current_user, require_capability, require_roles
 from app.models import AccessRequest, Lesson, LessonAssignment, Progress, Slide, UploadedFile, User
 from app.models.enums import LessonStatus, Role, SecurityEvent, SecurityStatus, UserStatus
+from app.services.fair_access import refuse_fair_backed
 from app.services.file_storage import resolve_stored_file
 from app.schemas.lesson import (
     AssignmentRequest,
@@ -327,14 +328,33 @@ def delete_lesson(
     if lesson is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lesson not found")
 
-    for f in db.scalars(select(UploadedFile).where(UploadedFile.linked_lesson_id == lesson_id)):
-        if f.storage_path:
-            path = resolve_stored_file(f.storage_path)
-            if path is not None:
-                path.unlink(missing_ok=True)
+    doomed = list(
+        db.scalars(select(UploadedFile).where(UploadedFile.linked_lesson_id == lesson_id))
+    )
+    # The same guard the file routes use. Without it, deleting a lesson that
+    # happens to have a fair-backed PDF filed under it removed the fair project
+    # through the database cascade — unlogged, unaccounted, and reported as 204.
+    refuse_fair_backed(db, [f.id for f in doomed])
+
+    # Rows first, bytes second — the reason is spelled out in `files.bulk_delete`
+    # and was not carried across to here. Unlinking inside the loop put an
+    # irreversible disk write ahead of the transaction meant to make this
+    # all-or-nothing: a failed commit rolls the rows back and leaves the PDFs
+    # gone, so every teacher still sees the lesson and every request for it
+    # 404s, unrecoverably. On Postgres a deadlock against a teacher writing
+    # progress for this lesson is enough to cause exactly that.
+    doomed_paths = [f.storage_path for f in doomed]
+    for f in doomed:
         db.delete(f)
     db.delete(lesson)
     db.commit()
+
+    for stored in doomed_paths:
+        if not stored:
+            continue
+        path = resolve_stored_file(stored)
+        if path is not None:
+            path.unlink(missing_ok=True)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

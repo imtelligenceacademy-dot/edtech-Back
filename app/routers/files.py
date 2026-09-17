@@ -47,7 +47,7 @@ from app.services.file_storage import (
     resolve_stored_file,
     upload_root,
 )
-from app.services.fair_access import can_open_fair_file
+from app.services.fair_access import can_open_fair_file, refuse_fair_backed
 from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
 
@@ -218,38 +218,6 @@ def _selected_ids(payload: FileSelection) -> list[str]:
     return ids
 
 
-def _refuse_fair_backed(db: Session, file_ids: list[str]) -> None:
-    """Refuse to delete a PDF that an ICT Fair project is built on.
-
-    `FairProject.file_id` is ON DELETE CASCADE, so removing the file here takes
-    the project row with it: no ORM relationship runs, nothing is written to the
-    security log, and the caller is still answered 204 for a project that no
-    longer exists. `list_files` hides fair-backed PDFs, which is why this was
-    hard to reach by accident — but the file id is on every fair project
-    response, so "not in the list" was never the same as "cannot be deleted".
-
-    Fair projects come off through DELETE /api/fair/projects/{id}, which removes
-    the bytes and the project together and accounts for both.
-    """
-    ids = [file_id for file_id in file_ids if file_id]
-    if not ids:
-        return
-    titles = sorted(
-        db.scalars(select(FairProject.title).where(FairProject.file_id.in_(ids)))
-    )
-    if not titles:
-        return
-    named = ", ".join(f'"{t}"' for t in titles[:3])
-    rest = "" if len(titles) <= 3 else f" and {len(titles) - 3} more"
-    raise HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail=(
-            f"Cannot delete: still backing the ICT Fair project(s) {named}{rest}. "
-            "Delete them from the ICT Fair section instead."
-        ),
-    )
-
-
 def _expand_selection(
     db: Session, file_ids: list[str]
 ) -> tuple[list[UploadedFile], set[str], int]:
@@ -335,7 +303,7 @@ def bulk_delete(
     files, lesson_ids, _missing = _expand_selection(db, ids)
     # Checked on the expanded set, not on what was clicked: selecting one PDF
     # of a lesson pulls in its siblings, and a sibling can be the fair-backed one.
-    _refuse_fair_backed(db, [f.id for f in files])
+    refuse_fair_backed(db, [f.id for f in files])
 
     # The rows go first and the bytes second. Unlinking inside the loop put an
     # irreversible disk write ahead of the transaction meant to make this
@@ -507,28 +475,34 @@ def delete_file(
     if uploaded is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
 
-    _refuse_fair_backed(db, [uploaded.id])
-
     lesson_id = uploaded.linked_lesson_id
     if lesson_id:
         # The file backs a curriculum lesson — delete the whole lesson so it also
         # disappears from teachers and Access Control. Deleting the Lesson cascades
         # its assignments, progress, access requests, and slides (all ondelete=
         # CASCADE). Remove every PDF backing it (this one + any re-uploads) too.
-        siblings = list(
+        doomed = list(
             db.scalars(select(UploadedFile).where(UploadedFile.linked_lesson_id == lesson_id))
         )
-        for f in siblings:
-            db.delete(f)
-        lesson = db.get(Lesson, lesson_id)
-        if lesson is not None:
-            db.delete(lesson)
-        doomed_paths = [f.storage_path for f in siblings]
     else:
         # Unlinked file (e.g. an ICT Fair file is handled elsewhere; unsorted
         # uploads) — just remove the file itself.
-        doomed_paths = [uploaded.storage_path]
-        db.delete(uploaded)
+        doomed = [uploaded]
+
+    # Checked against everything this will actually remove rather than the file
+    # that was clicked. Deleting one PDF of a lesson takes its siblings with it,
+    # and a sibling can be the fair-backed one — so guarding the clicked file
+    # alone let the delete reach a fair project sideways, which is the same gap
+    # `bulk_delete` was corrected for and this path was not.
+    refuse_fair_backed(db, [f.id for f in doomed])
+
+    for f in doomed:
+        db.delete(f)
+    if lesson_id:
+        lesson = db.get(Lesson, lesson_id)
+        if lesson is not None:
+            db.delete(lesson)
+    doomed_paths = [f.storage_path for f in doomed]
 
     # Bytes after the commit, for the reason given in `bulk_delete`.
     db.commit()
