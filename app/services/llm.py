@@ -66,6 +66,34 @@ def _raise_for_status(status_code: int) -> None:
         raise LLMError("unavailable", f"provider returned {status_code}")
 
 
+def _raise_for_stream_error(obj: object) -> None:
+    """Raise when a streamed event is the provider reporting a failure.
+
+    Both streaming APIs can send an error *after* content has already flowed —
+    an overload, a filter, a backend fault. Neither shape looks like a content
+    delta, so both were being skipped along with every other non-delta line, and
+    the generator simply ran out. The half-written answer was then presented, and
+    written to the teacher's chat history, as a complete one.
+
+    The status of the response itself is already handled by `_raise_for_status`;
+    this is the case where the HTTP call succeeded and the failure arrived
+    inside the stream.
+    """
+    if not isinstance(obj, dict):
+        return
+    # OpenAI-compatible: {"error": {"message": ..., "type": ...}}
+    error = obj.get("error")
+    # Anthropic: {"type": "error", "error": {"type": "overloaded_error", ...}}
+    if error is None and obj.get("type") == "error":
+        error = {}
+    if error is None:
+        return
+    detail = ""
+    if isinstance(error, dict):
+        detail = str(error.get("message") or error.get("type") or "")
+    raise LLMError("unavailable", detail or "provider failed mid-stream")
+
+
 def _transport_error(exc: Exception) -> LLMError:
     """A transport failure as one of our own kinds.
 
@@ -277,8 +305,21 @@ class OpenAICompatProvider:
                 if data == "[DONE]":
                     break
                 try:
-                    delta = json.loads(data)["choices"][0]["delta"].get("content")
-                except (AttributeError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                # An error can arrive *mid*-stream, after content has already
+                # flowed. Swallowed with everything else that is not a delta,
+                # the answer simply stopped and was presented — and saved to the
+                # teacher's history — as if it were complete: a wiring procedure
+                # cut off before its numbered steps, its check-before-powering-on
+                # step and its safety warning, with no error frame and nothing to
+                # retry. The Responses API path raises on exactly this, which is
+                # what makes it an omission here rather than a decision.
+                _raise_for_stream_error(obj)
+                try:
+                    delta = obj["choices"][0]["delta"].get("content")
+                except (AttributeError, KeyError, IndexError, TypeError):
                     continue
                 if delta:
                     yield delta
@@ -366,6 +407,8 @@ class AnthropicProvider:
                     obj = json.loads(line[6:].strip())
                 except json.JSONDecodeError:
                     continue
+                # Same mid-stream error, in this API's spelling.
+                _raise_for_stream_error(obj)
                 if obj.get("type") == "content_block_delta":
                     text = obj.get("delta", {}).get("text")
                     if text:

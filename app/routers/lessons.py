@@ -205,20 +205,31 @@ def my_classes(
     # bilingual teacher has two tracks through one grade, each with its own
     # position. Merging them reported "2 of 6" across two separate curricula
     # and pointed at the wrong next lesson.
-    by_class: dict[tuple[int, str, str | None], list[Lesson]] = {}
+    # Year belongs in this key for the same reason language does, and was not
+    # added alongside it. A school promoted from Year 1 to Year 2 keeps the
+    # Year-1 lessons its teachers had already started, so a class holds both
+    # curricula at once — and merged into one group the picker reported "4 of
+    # 16 complete" for a Year-2 track that is twelve lessons and none complete,
+    # then pointed `next` at a retained Year-1 lesson, because a null course
+    # sorts ahead of every Year-2 one. The access layer has always keyed on
+    # year, so the two disagreed.
+    by_class: dict[tuple[int, str, str | None, int | None], list[Lesson]] = {}
     for (lesson_id, section) in access:
         lesson = lessons.get(lesson_id)
         if lesson is not None:
-            by_class.setdefault((lesson.grade, section, lesson.language), []).append(lesson)
+            by_class.setdefault(
+                (lesson.grade, section, lesson.language, lesson.year), []
+            ).append(lesson)
 
     # Only worth naming when there is more than one to tell apart.
     languages_per_class: dict[tuple[int, str], set[str | None]] = {}
-    for (grade, section, language) in by_class:
+    for (grade, section, language, _year) in by_class:
         languages_per_class.setdefault((grade, section), set()).add(language)
 
     out: list[ClassSummary] = []
-    for (grade, section, language), group in sorted(
-        by_class.items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or "")
+    for (grade, section, language, _year), group in sorted(
+        by_class.items(),
+        key=lambda kv: (kv[0][0], kv[0][1], kv[0][2] or "", kv[0][3] or 0),
     ):
         group.sort(key=lesson_order_key)
         row = ClassSummary(

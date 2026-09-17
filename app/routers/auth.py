@@ -415,10 +415,38 @@ def login(
             detail="Account temporarily locked. Try again later.",
         )
 
-    if user.status == UserStatus.pending:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account pending approval")
     if user.status != UserStatus.active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active")
+        # The correct password, on an account that cannot sign in. Every
+        # neighbouring outcome writes a row — a wrong password, a wrong password
+        # while locked, the right password while locked — and this one wrote
+        # nothing at all, so an admin who had suspended an account *because* its
+        # credentials leaked was shown an empty Security Logs screen while the
+        # leaked password was being used against it. The commit also matters:
+        # raising without one discarded the throttle work done earlier in this
+        # request, including lifting a network ban that had served its time.
+        record_event(
+            db,
+            event=SecurityEvent.blocked_second_device
+            if user.status == UserStatus.pending
+            else SecurityEvent.failed_login,
+            status=SecurityStatus.blocked,
+            ip=ip,
+            device=device,
+            user=user,
+            detail=(
+                "Correct password on an account awaiting approval"
+                if user.status == UserStatus.pending
+                else f"Correct password on a {user.status.value} account"
+            ),
+        )
+        db.commit()
+        if user.status == UserStatus.pending:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="Account pending approval"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Account is not active"
+        )
 
     # Success: reset lockout, upgrade hash if needed, stamp login, issue session.
     # The account is locked first here too. Nothing below it needs the row's
