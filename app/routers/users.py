@@ -69,7 +69,7 @@ def create_user(
 ) -> User:
     if db.scalar(select(User).where(User.email == payload.email.lower())):
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    _require_school_below_super_admin(db, payload.role, payload.school_id)
+    school_id = _school_for_role(db, payload.role, payload.school_id)
     user = User(
         id=new_id("u"),
         name=payload.name.strip(),
@@ -77,7 +77,7 @@ def create_user(
         password_hash=hash_password(payload.password),
         role=payload.role,
         status=UserStatus.active,
-        school_id=payload.school_id,
+        school_id=school_id,
         grades=payload.grades if payload.role == Role.teacher else [],
         sections=(
             normalize_sections(payload.sections, payload.grades)
@@ -143,16 +143,26 @@ def _apply_email_change(db: Session, user: User, user_id: str, data: dict) -> No
     user.email = new_email
 
 
-def _require_school_below_super_admin(db: Session, role: Role, school_id: str | None) -> None:
-    """Everyone below super-admin belongs to a school.
+def _school_for_role(db: Session, role: Role, school_id: str | None) -> str | None:
+    """The school this account should be linked to, validated.
 
-    Their scoping is written as a SQL comparison, so an account without one
-    does not match nothing — it matches the rows whose school is also null: the
-    super-admins' security events, and the whole global curriculum. Refusing
-    the account is how the scope keeps meaning what it says.
+    Everyone below super-admin belongs to one. Their scoping is written as a SQL
+    comparison, so an account without a school does not match nothing — it
+    matches the rows whose school is also null: the super-admins' security
+    events, and the whole global curriculum. Refusing the account is how the
+    scope keeps meaning what it says.
+
+    A super-admin never has one, and this returns None rather than merely
+    permitting whatever was sent. The edit path has always cleared it; create
+    stored whatever the payload carried, so a super-admin made through the API
+    could be stamped with a school — and `record_event` copies the account's
+    school onto its sign-in rows, which put the platform administrator's
+    addresses, devices and resolved locations inside that school's Security
+    Logs. Two spellings of one rule, disagreeing in the direction that
+    discloses.
     """
     if role == Role.super_admin:
-        return
+        return None
     if not school_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -160,6 +170,7 @@ def _require_school_below_super_admin(db: Session, role: Role, school_id: str | 
         )
     if db.get(School, school_id) is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="School not found")
+    return school_id
 
 
 def _apply_role_and_school(db: Session, user: User, data: dict) -> Role:
@@ -168,13 +179,8 @@ def _apply_role_and_school(db: Session, user: User, data: dict) -> Role:
     if data.get("role") is not None:
         user.role = data["role"]
     effective_role = data.get("role", user.role)
-    if effective_role == Role.super_admin:
-        user.school_id = None
-    elif "school_id" in data:
-        if data["school_id"] is not None and db.get(School, data["school_id"]) is None:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="School not found")
-        user.school_id = data["school_id"]
-    _require_school_below_super_admin(db, effective_role, user.school_id)
+    proposed = data["school_id"] if "school_id" in data else user.school_id
+    user.school_id = _school_for_role(db, effective_role, proposed)
     return effective_role
 
 

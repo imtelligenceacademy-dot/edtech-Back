@@ -245,8 +245,10 @@ class PromptBundle:
     refusal: str | None = None
     # Rebuilds the prompt for a model that cannot see, routing the slide through
     # the Gemini reader instead of attaching it. Set only when an image was
-    # attached; called only if that provider drops out.
-    text_fallback: Callable[[], str] | None = None
+    # attached; called only if that provider drops out. Returns the prompt and
+    # the source reference that is honest about it — the rebuild may or may not
+    # find a reading, and that decides whether the slide was consulted at all.
+    text_fallback: Callable[[], tuple[str, str | None]] | None = None
 
 
 def _uploaded_for(
@@ -315,9 +317,19 @@ def _vision_note(image_data_url: str | None, attempted: bool, slide: int | None)
     return _VISION_OFF
 
 
-def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptBundle:
+def _build_prompt(
+    db: Session,
+    current: User,
+    payload: AIChatRequest,
+    *,
+    before_work: Callable[[], None] | None = None,
+) -> PromptBundle:
     """Resolve access, lesson context and (optionally) the slide image, then
-    assemble the robotics-assistant prompt."""
+    assemble the robotics-assistant prompt.
+
+    `before_work` runs once the question is known to be answerable and before
+    anything expensive happens — see the call to it below.
+    """
     # One document at a time. Nothing rejected both ids being sent, and the two
     # halves of the prompt disagreed about which to use: the material and the
     # title came from the project while the slide image came from the lesson, so
@@ -352,6 +364,16 @@ def _build_prompt(db: Session, current: User, payload: AIChatRequest) -> PromptB
                 _LESSON_NOT_OPEN_TO_YOU if asked_for_one else _NO_LESSON_OPEN
             ),
         )
+
+    # Everything past this line costs something: a pymupdf render of the page at
+    # zoom 2.0, and for a slide not already transcribed, a billed Gemini call
+    # that commits a row. A teacher over her hourly allowance was having all of
+    # it done for her on every refused send — and an over-quota refusal is
+    # exactly the message that invites another try. The refusal above is free
+    # and stays free; this is the first point at which the question is known to
+    # be answerable, so it is the right place to ask whether it may be asked.
+    if before_work is not None:
+        before_work()
 
     image_data_url, attempted = _slide_image(
         db, lesson=lesson, project=project, current_slide=payload.current_slide
@@ -488,8 +510,7 @@ def _rebuild_without_image(user_id: str, payload: AIChatRequest) -> str:
         # `attempted=True`: an image really was rendered and really was not
         # usable, so if the reader also comes back empty the model is told the
         # visual check failed rather than that there was never one to do.
-        system, _ = _assemble_system(db, current, payload, lesson, project, None, True)
-        return system
+        return _assemble_system(db, current, payload, lesson, project, None, True)
 
 
 @router.get("/health", response_model=AIHealth)
@@ -603,6 +624,11 @@ def _error_text(exc: Exception) -> str:
     return _ERROR_TEXT.get(kind, _ERROR_TEXT["unavailable"])
 
 
+def _done_frame() -> str:
+    """The event that ends every stream."""
+    return f"data: {json.dumps({'done': True})}\n\n"
+
+
 def _error_frame(message: str, *, retryable: bool) -> str:
     """One SSE error event, saying both what went wrong and whether asking again
     could possibly help."""
@@ -652,14 +678,25 @@ def _stream_answer(bundle: PromptBundle):
 def _without_image(bundle: PromptBundle) -> str:
     """The prompt again, for a model that cannot see. Falls back to the original
     if the rebuild fails — a prompt that overstates what the model can see is
-    still better than no answer at all."""
+    still better than no answer at all.
+
+    Also corrects the source reference. It was set on the strength of an image
+    having been *rendered*, which is not the same as one having been read: when
+    the seeing provider drops out and the reader comes back empty, the model is
+    told plainly that it could not check the slide — and the chip beside that
+    sentence still said "slide 12". The caller re-sends the corrected reference,
+    and `save_exchange` stores it, so the thread does not keep the contradiction
+    when it is reopened.
+    """
     if bundle.text_fallback is None:
         return bundle.system
     try:
-        return bundle.text_fallback()
+        system, source_ref = bundle.text_fallback()
     except Exception:
         logger.exception("could not rebuild the prompt without the slide image")
         return bundle.system
+    bundle.source_ref = source_ref
+    return system
 
 
 @router.post("/chat", response_model=AIChatResponse)
@@ -668,15 +705,21 @@ def chat(
     db: Session = Depends(get_db),
     current: User = Depends(require_capability("use-ai-assistant")),
 ) -> AIChatResponse:
-    bundle = _build_prompt(db, current, payload)
+    try:
+        # The quota is checked inside, once the question is known to be
+        # answerable and before the page is rendered — see `_build_prompt`.
+        bundle = _build_prompt(
+            db,
+            current,
+            payload,
+            before_work=lambda: enforce_ai_limit(db, current, "teacher"),
+        )
+    except AILimitExceeded as exc:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message) from exc
     if bundle.refusal:
         return AIChatResponse(
             content=bundle.refusal, source_ref=None, provider="none"
         )
-    try:
-        enforce_ai_limit(db, current, "teacher")
-    except AILimitExceeded as exc:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=exc.message) from exc
     usage_id = record_ai_usage(db, current, "teacher")
     provider = get_provider()
     try:
@@ -706,7 +749,38 @@ def chat_stream(
 ) -> StreamingResponse:
     # Everything DB-bound (and the slide image) is resolved before the generator
     # runs, because the session is closed by the time streaming starts.
-    bundle = _build_prompt(db, current, payload)
+    limited: AILimitExceeded | None = None
+    try:
+        # The quota is checked inside, after the refusal decision and before the
+        # page render and any vision call — see `_build_prompt`.
+        bundle = _build_prompt(
+            db,
+            current,
+            payload,
+            before_work=lambda: enforce_ai_limit(db, current, "teacher"),
+        )
+    except AILimitExceeded as exc:
+        limited = exc
+        bundle = None
+
+    if limited is not None:
+        # Bound outside the generator. Python unbinds an `as` name when its
+        # except block ends, and this generator runs afterwards — reading it
+        # from inside raised NameError mid-stream, so the teacher who hit her
+        # cap got a dropped connection instead of the sentence explaining why.
+        limit_message = limited.message
+
+        def limited_stream():
+            # The teacher's own hourly or daily allowance is spent. Asking again
+            # cannot succeed until the window moves, and the message says so.
+            yield _error_frame(limit_message, retryable=False)
+            yield _done_frame()
+
+        return StreamingResponse(
+            limited_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     # A refusal we already know the answer to: send it as the reply and stop.
     # No provider, no quota, and no way for it to surface as "unavailable".
@@ -723,27 +797,6 @@ def chat_stream(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    try:
-        enforce_ai_limit(db, current, "teacher")
-    except AILimitExceeded as exc:
-        # Bound here, not read inside the generator. Python unbinds the `as`
-        # name when the except block ends, and this generator runs afterwards —
-        # so reading exc.message from inside it raised NameError mid-stream and
-        # the teacher who hit their hourly cap got a broken connection instead
-        # of the sentence explaining why.
-        limit_message = exc.message
-
-        def limited_stream():
-            # The teacher's own hourly or daily allowance is spent. Asking again
-            # cannot succeed until the window moves, and the message says so.
-            yield _error_frame(limit_message, retryable=False)
-            yield f"data: {json.dumps({'done': True})}\n\n"
-
-        return StreamingResponse(
-            limited_stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
     usage_id = record_ai_usage(db, current, "teacher")
 
     # Held for the generator, which runs after this request's session is closed.
@@ -775,8 +828,9 @@ def chat_stream(
     def event_stream():
         answer: list[str] = []
         try:
-            if bundle.source_ref:
-                yield f"data: {json.dumps({'sourceRef': bundle.source_ref})}\n\n"
+            announced = bundle.source_ref
+            if announced:
+                yield f"data: {json.dumps({'sourceRef': announced})}\n\n"
             try:
                 for delta in _stream_answer(bundle):
                     answer.append(delta)
@@ -784,7 +838,16 @@ def chat_stream(
             except Exception as exc:
                 logger.warning("teacher chat stream failed: %s", type(exc).__name__)
                 yield _provider_error_frame(exc)
-            yield f"data: {json.dumps({'done': True})}\n\n"
+            # The reference is announced before any provider work, on the
+            # strength of a slide image having been *rendered*. If the seeing
+            # provider then dropped out and the reader came back empty, the
+            # model was told plainly that it could not check the slide — and the
+            # chip beside that sentence still read "slide 12". `_without_image`
+            # corrects it; the client keeps the last one it is sent, and the
+            # `finally` below stores the same corrected value.
+            if bundle.source_ref != announced:
+                yield f"data: {json.dumps({'sourceRef': bundle.source_ref or ''})}\n\n"
+            yield _done_frame()
         finally:
             # Saved even when the teacher closes the tab mid-answer: a partial
             # reply is still what they read, and worth keeping.

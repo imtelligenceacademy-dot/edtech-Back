@@ -65,7 +65,7 @@ def _bundle(provider, **kw):
 def test_a_rate_limited_vision_call_reruns_the_prompt_through_the_reader(monkeypatch):
     provider = SeeingProvider()
     monkeypatch.setattr(ai, "get_provider", lambda: provider)
-    bundle = _bundle(provider, text_fallback=lambda: "SYSTEM WITH SLIDE READING")
+    bundle = _bundle(provider, text_fallback=lambda: ("SYSTEM WITH SLIDE READING", "Lesson 3 - slide 12"))
 
     out = "".join(_stream_answer(bundle))
 
@@ -80,7 +80,7 @@ def test_the_teacher_never_sees_two_answers_spliced_together(monkeypatch):
     the start of one answer to the middle of another."""
     provider = SeeingProvider(emit_first=True)
     monkeypatch.setattr(ai, "get_provider", lambda: provider)
-    bundle = _bundle(provider, text_fallback=lambda: "SYSTEM WITH SLIDE READING")
+    bundle = _bundle(provider, text_fallback=lambda: ("SYSTEM WITH SLIDE READING", "Lesson 3 - slide 12"))
 
     stream = _stream_answer(bundle)
     assert next(stream) == "half an answer"
@@ -93,7 +93,7 @@ def test_a_working_vision_call_is_left_alone(monkeypatch):
     provider = SeeingProvider(vision_fails=None)
     monkeypatch.setattr(ai, "get_provider", lambda: provider)
 
-    out = "".join(_stream_answer(_bundle(provider, text_fallback=lambda: "UNUSED")))
+    out = "".join(_stream_answer(_bundle(provider, text_fallback=lambda: ("UNUSED", None))))
 
     assert out == "saw the slide"
     assert provider.text_system is None
@@ -156,7 +156,7 @@ def test_an_empty_vision_reply_falls_back_to_the_reader(monkeypatch):
     silent = SeeingProvider(vision_fails=None, emits_nothing=True)
     chain = ProviderChain([silent])
     monkeypatch.setattr(ai, "get_provider", lambda: chain)
-    bundle = _bundle(silent, text_fallback=lambda: "SYSTEM WITH SLIDE READING")
+    bundle = _bundle(silent, text_fallback=lambda: ("SYSTEM WITH SLIDE READING", "Lesson 3 - slide 12"))
 
     out = "".join(_stream_answer(bundle))
 
