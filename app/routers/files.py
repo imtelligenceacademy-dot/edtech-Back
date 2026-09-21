@@ -7,6 +7,7 @@ their scope).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
@@ -402,12 +403,8 @@ def _can_access(db: Session, user: User, uploaded: UploadedFile) -> bool:
     return is_lesson_available(db, user, lesson.id)
 
 
-@router.get("/{file_id}/download")
-def download_file(
-    file_id: str,
-    db: Session = Depends(get_db),
-    current: User = Depends(get_current_user),
-) -> FileResponse:
+def _readable_file(db: Session, current: User, file_id: str) -> tuple[UploadedFile, Path]:
+    """The lookup and both permission checks the two read routes share."""
     uploaded = db.get(UploadedFile, file_id)
     if uploaded is None or not uploaded.storage_path:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
@@ -417,7 +414,40 @@ def download_file(
     path = resolve_stored_file(uploaded.storage_path)
     if path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file missing")
+    return uploaded, path
 
+
+@router.get("/{file_id}/view")
+def view_file(
+    file_id: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> FileResponse:
+    """The same bytes as ``/download``, with nothing on them that says "download".
+
+    Download-manager extensions — IDM is the one that reached us — watch for a
+    URL ending in ``/download`` and for a ``Content-Disposition`` header, and when
+    they see either they claim the request and cancel the page's own. The
+    browser's ``fetch`` then rejects with a bare ``TypeError: Failed to fetch``,
+    and a teacher mid-lesson sees a red icon over an empty reader.
+
+    So the route the reader uses is named for reading and sends no disposition
+    header at all. ``/download`` keeps its filename, because the admin file list
+    offers it as a real download and the saved file should be named properly.
+    """
+    _uploaded, path = _readable_file(db, current, file_id)
+    # No `filename=`: Starlette sends Content-Disposition only when given one,
+    # and that header is half of what the extension matches on. The test pins it.
+    return FileResponse(path, media_type=PDF_CONTENT_TYPE)
+
+
+@router.get("/{file_id}/download")
+def download_file(
+    file_id: str,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+) -> FileResponse:
+    uploaded, path = _readable_file(db, current, file_id)
     return FileResponse(
         path,
         media_type=PDF_CONTENT_TYPE,
