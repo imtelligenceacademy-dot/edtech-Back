@@ -11,6 +11,11 @@ lesson, so every answer it gave would be invented — and the rule is per
 account, not per role, so the tests below also pin the case it must not catch:
 a teacher who takes KG2 *and* Grade 1 still teaches the curriculum the
 assistant is grounded in, and keeps it.
+
+That exception is why one gate is not enough. The account-level one lets her
+through, and she was still getting invented answers whenever the lesson she had
+open was an MTiny one — so there is a second gate on the lesson itself, and both
+are tested here.
 """
 
 from __future__ import annotations
@@ -25,6 +30,8 @@ from app.main import app
 from app.models import Lesson, LessonAssignment, Progress, School, User
 from app.models.enums import Role, UserStatus
 from app.permissions import teaches_only_kindergarten, user_can
+from app.routers import ai
+from app.schemas.ai import AIChatRequest
 from app.schemas.user import VALID_GRADES
 from app.security import hash_password
 from app.services.auto_assign import parse_lesson_filename, sync_teacher_assignments
@@ -35,6 +42,7 @@ from app.services.grades import (
     grade_token,
     is_kindergarten,
 )
+from app.services.lesson_access import is_lesson_available
 from app.services.sections import rename_section
 from app.utils import new_id
 
@@ -296,3 +304,44 @@ def test_the_assistant_still_answers_a_teacher_of_both(client, db, school, path)
 
     response = c.post(path, json={"message": "How do I teach loops?"})
     assert response.status_code != 403
+
+
+@pytest.mark.parametrize("path", ["/api/ai/chat", "/api/ai/chat/stream"])
+def test_the_assistant_refuses_a_kindergarten_lesson(client, db, school, path):
+    """The half that was missing. A teacher of KG2 *and* Grade 1 keeps the
+    capability, so the account-level gate lets her through — and she was getting
+    invented answers about an MTiny lesson the model has never seen. The gate has
+    to look at the lesson that is open, not only at who is asking."""
+    c, holder = client
+    teacher = _teacher(db, school, ["KG2", "G1"])
+    holder["user"] = teacher
+    lesson = _lesson(db, "KG2", 1)
+    sync_teacher_assignments(db, teacher)
+    db.flush()
+
+    response = c.post(path, json={"message": "How do I teach colours?", "lessonId": lesson.id})
+
+    # A 200 is not the marker: a model answer returns 200 too. Nor is "MTiny" --
+    # `_lesson` puts it in every title, so it comes back either way, and this test
+    # stayed green with the gate taken out. Only the canned refusal says this.
+    assert response.status_code == 200
+    assert "haven't been taught" in response.text
+
+
+def test_a_grade_one_lesson_still_reaches_the_model(db, school):
+    """The other side of the same gate. Tested at ``_build_prompt`` because
+    letting this one through means reaching a provider, and what matters here is
+    that the kindergarten refusal is not what comes back."""
+    teacher = _teacher(db, school, ["KG2", "G1"])
+    lesson = _lesson(db, "G1", 1, course="microbit")
+    sync_teacher_assignments(db, teacher)
+    db.flush()
+    # Without this the lesson would be refused as "not open to you" and the test
+    # would pass for the wrong reason, still green with the fix taken out.
+    assert is_lesson_available(db, teacher, lesson.id), "the lesson must be open to her"
+
+    bundle = ai._build_prompt(
+        db, teacher, AIChatRequest(message="How do I teach loops?", lessonId=lesson.id)
+    )
+
+    assert bundle.refusal is None

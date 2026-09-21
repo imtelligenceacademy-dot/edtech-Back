@@ -44,6 +44,7 @@ from app.services.ai_usage import (
 )
 from app.services.chat_history import save_exchange
 from app.services.fair_access import visible_project
+from app.services.grades import is_kindergarten
 from app.services.lesson_access import is_lesson_available
 from app.services.sections import resolve_section, sections_for
 from app.services.file_storage import resolve_stored_file
@@ -193,6 +194,15 @@ _LESSON_NOT_OPEN_TO_YOU = (
     "That lesson isn't open to you right now, so I can't answer from it. Finish "
     "the lesson you are on, or use “Request access” beside it to ask your "
     "admin to unlock it."
+)
+
+# Kindergarten runs MTiny, which the assistant has never read. Refused here and
+# not only hidden in the UI: the composer is gone on a kindergarten page, but a
+# hidden control is not access control, and a teacher who also takes Grade 1
+# holds a session that is allowed to ask — only not about this lesson.
+_KINDERGARTEN_LESSON = (
+    "I can't help with kindergarten lessons — those run on MTiny, which I haven't "
+    "been taught. Open one of your other grades' lessons and I can answer from it."
 )
 
 
@@ -363,6 +373,23 @@ def _build_prompt(
             refusal=(
                 _LESSON_NOT_OPEN_TO_YOU if asked_for_one else _NO_LESSON_OPEN
             ),
+        )
+
+    # The grade of the lesson, not the grades of the teacher. The account-level
+    # rule in `permissions.user_can` already takes the assistant away from a
+    # teacher whose every grade is a kindergarten one; this is the other half,
+    # and it is the half that was missing — a teacher of KG2 *and* Grade 1 keeps
+    # the capability, so her session sailed through `require_capability` and got
+    # an answer about an MTiny lesson invented out of nothing.
+    #
+    # Free, like the refusals above: `before_work` has not run, so being told no
+    # costs her nothing from the hourly allowance.
+    if lesson is not None and is_kindergarten(lesson.grade):
+        return PromptBundle(
+            system="",
+            messages=messages,
+            source_ref=None,
+            refusal=_KINDERGARTEN_LESSON,
         )
 
     # Everything past this line costs something: a pymupdf render of the page at
