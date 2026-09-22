@@ -40,6 +40,7 @@ from app.schemas.file import (
     UploadPreviewRow,
     UploadResult,
 )
+from app.services import pdf_watermark
 from app.services.auto_assign import assign_uploaded_file, preview_uploads
 from app.services.backup import build_files_archive, files_archive_filename
 from app.services.file_storage import (
@@ -403,6 +404,23 @@ def _can_access(db: Session, user: User, uploaded: UploadedFile) -> bool:
     return is_lesson_available(db, user, lesson.id)
 
 
+def _traceable_copy(current: User, uploaded: UploadedFile, path: Path) -> bytes | None:
+    """The stamped bytes for a copy that should be traceable, else None.
+
+    None means "serve the file as it is on disk", and two cases want that. A
+    super-admin is the custodian of these PDFs rather than a recipient of them:
+    stamping the copy they download to re-upload or send on would put one
+    teacher's name onto every later copy of it. And an ICT Fair PDF is a
+    student's project, shown at the fair — a staff name along the foot of it is
+    someone else's name on a child's work.
+    """
+    if current.role == Role.super_admin:
+        return None
+    if uploaded.linked_lesson_id is None:
+        return None
+    return pdf_watermark.stamp(path, pdf_watermark.mark_for(current))
+
+
 def _readable_file(db: Session, current: User, file_id: str) -> tuple[UploadedFile, Path]:
     """The lookup and both permission checks the two read routes share."""
     uploaded = db.get(UploadedFile, file_id)
@@ -435,10 +453,15 @@ def view_file(
     header at all. ``/download`` keeps its filename, because the admin file list
     offers it as a real download and the saved file should be named properly.
     """
-    _uploaded, path = _readable_file(db, current, file_id)
-    # No `filename=`: Starlette sends Content-Disposition only when given one,
-    # and that header is half of what the extension matches on. The test pins it.
-    return FileResponse(path, media_type=PDF_CONTENT_TYPE)
+    uploaded, path = _readable_file(db, current, file_id)
+    traced = _traceable_copy(current, uploaded, path)
+    if traced is None:
+        # No `filename=`: Starlette sends Content-Disposition only when given
+        # one, and that header is half of what the extension matches on. The
+        # test pins it.
+        return FileResponse(path, media_type=PDF_CONTENT_TYPE)
+    # `Response` sends no disposition of its own, so the rule above still holds.
+    return Response(content=traced, media_type=PDF_CONTENT_TYPE)
 
 
 @router.get("/{file_id}/download")
@@ -448,11 +471,22 @@ def download_file(
     current: User = Depends(get_current_user),
 ) -> FileResponse:
     uploaded, path = _readable_file(db, current, file_id)
-    return FileResponse(
-        path,
+    traced = _traceable_copy(current, uploaded, path)
+    if traced is None:
+        return FileResponse(
+            path,
+            media_type=PDF_CONTENT_TYPE,
+            filename=uploaded.filename,
+            content_disposition_type="inline",  # view in the browser, not force-download
+        )
+    return Response(
+        content=traced,
         media_type=PDF_CONTENT_TYPE,
-        filename=uploaded.filename,
-        content_disposition_type="inline",  # view in the browser, not force-download
+        headers={
+            # What `FileResponse(filename=...)` writes for a name with spaces
+            # in it, which every lesson title has.
+            "Content-Disposition": f"inline; filename*=UTF-8''{quote(uploaded.filename)}"
+        },
     )
 
 

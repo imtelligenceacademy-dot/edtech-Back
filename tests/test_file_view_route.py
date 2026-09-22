@@ -17,6 +17,7 @@ has written it.
 
 from __future__ import annotations
 
+from datetime import date
 from urllib.parse import unquote
 
 import pytest
@@ -27,10 +28,37 @@ from app.deps import get_current_user
 from app.main import app
 from app.models import Lesson, School, UploadedFile, User
 from app.models.enums import Role, UserStatus
+from app.services.auto_assign import sync_teacher_assignments
 from app.services.file_storage import upload_root
+from app.services.lesson_access import is_lesson_available
 from app.utils import new_id
 
-PDF_BYTES = b"%PDF-1.4\n%fake pdf used only by the tests\n"
+def _pdf_bytes(pages: int = 1) -> bytes:
+    """A real PDF, not a byte string that merely starts with ``%PDF``.
+
+    The watermark is applied by opening the file and writing to it, so a stub
+    that no parser accepts would be passed through unstamped and every
+    assertion below would pass for the wrong reason.
+    """
+    import pymupdf
+
+    doc = pymupdf.open()
+    try:
+        for n in range(pages):
+            doc.new_page().insert_text((72, 72), f"Lesson page {n + 1}")
+        return doc.tobytes()
+    finally:
+        doc.close()
+
+
+PDF_BYTES = _pdf_bytes()
+
+
+def _text_of(pdf: bytes) -> str:
+    import pymupdf
+
+    with pymupdf.open(stream=pdf, filetype="pdf") as doc:
+        return "\n".join(page.get_text() for page in doc)
 
 
 @pytest.fixture(autouse=True)
@@ -97,7 +125,36 @@ def _unassigned_teacher(db) -> User:
     return user
 
 
-def _lesson_pdf(db) -> UploadedFile:
+def _assigned_teacher(db, lesson: Lesson) -> User:
+    """A teacher this lesson is genuinely open to.
+
+    ``_unassigned_teacher`` above is the 403 case. The stamp only happens past
+    the permission check, so these tests need the other one.
+    """
+    school = School(id=new_id("sch"), name="S", country="Lebanon", city="Beirut", program_year=2)
+    db.add(school)
+    user = User(
+        id=new_id("u"),
+        name="Rania  Haddad",  # the double space is deliberate; see the stamp test
+        email=f"{new_id('e')}@example.com",
+        password_hash="x",
+        role=Role.teacher,
+        status=UserStatus.active,
+        school_id=school.id,
+        grades=["G1"],
+        language="en",
+    )
+    db.add(user)
+    db.flush()
+    sync_teacher_assignments(db, user)
+    db.flush()
+    # Without this a 403 would satisfy "she was not served the original" and
+    # the tests below would stay green with the stamping taken out.
+    assert is_lesson_available(db, user, lesson.id), "the lesson must be open to her"
+    return user
+
+
+def _lesson_pdf(db, pages: int = 1) -> UploadedFile:
     lesson = Lesson(
         id=new_id("les"),
         title="grade 1 microbit lesson 01 name badge",
@@ -113,13 +170,14 @@ def _lesson_pdf(db) -> UploadedFile:
     root = upload_root()
     root.mkdir(parents=True, exist_ok=True)
     file_id = new_id("file")
-    (root / f"{file_id}.pdf").write_bytes(PDF_BYTES)
+    data = PDF_BYTES if pages == 1 else _pdf_bytes(pages)
+    (root / f"{file_id}.pdf").write_bytes(data)
     uploaded = UploadedFile(
         id=file_id,
         # The name IDM offered to save, taken from the screenshot that started this.
         filename="grade 1 microbit lesson 01 name badge",
         content_type="application/pdf",
-        size_bytes=len(PDF_BYTES),
+        size_bytes=len(data),
         storage_path=f"{file_id}.pdf",
         linked_lesson_id=lesson.id,
     )
@@ -183,3 +241,93 @@ def test_the_reader_route_refuses_a_teacher_who_cannot_open_the_file(client, db)
     response = c.get(f"/api/files/{uploaded.id}/view")
 
     assert response.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Whose copy it is
+# --------------------------------------------------------------------------- #
+
+def test_the_teachers_copy_says_whose_copy_it_is(client, db):
+    """The point of the whole thing: a copy that escapes names an account.
+
+    Nothing here stops the file being saved, and nothing could — a teacher
+    entitled to open a lesson can pull it from the address bar in two steps. So
+    the bytes she is served carry her name and the date, and a PDF that turns
+    up where it should not says which account it came from.
+    """
+    c, holder = client
+    uploaded = _lesson_pdf(db)
+    lesson = db.get(Lesson, uploaded.linked_lesson_id)
+    teacher = _assigned_teacher(db, lesson)
+    holder["user"] = teacher
+
+    response = c.get(f"/api/files/{uploaded.id}/view")
+
+    assert response.status_code == 200
+    assert response.content != PDF_BYTES, "she was served the unstamped original"
+    text = _text_of(response.content)
+    # Collapsed: a name is free text, this one has two spaces in it, and
+    # stamped verbatim it would not match what comes back out.
+    assert "Rania Haddad" in text
+    assert teacher.email in text
+    assert date.today().strftime("%d %b %Y") in text
+
+
+def test_every_page_carries_it_not_only_the_first(client, db):
+    """Page two is the one that gets shared on its own."""
+    c, holder = client
+    uploaded = _lesson_pdf(db, pages=2)
+    lesson = db.get(Lesson, uploaded.linked_lesson_id)
+    holder["user"] = _assigned_teacher(db, lesson)
+
+    response = c.get(f"/api/files/{uploaded.id}/view")
+
+    import pymupdf
+
+    with pymupdf.open(stream=response.content, filetype="pdf") as doc:
+        assert doc.page_count == 2
+        assert all("Rania Haddad" in page.get_text() for page in doc)
+
+
+def test_the_custodians_copy_is_left_alone(client, db):
+    """A super-admin holds the master. Stamping what they download to re-upload
+    or send on would put one person's name onto every copy made from it."""
+    c, holder = client
+    holder["user"] = _boss(db)
+    uploaded = _lesson_pdf(db)
+
+    view = c.get(f"/api/files/{uploaded.id}/view")
+    download = c.get(f"/api/files/{uploaded.id}/download")
+
+    assert view.content == PDF_BYTES
+    assert download.content == PDF_BYTES
+
+
+def test_a_stamped_download_is_still_named(client, db):
+    """The stamped path writes its own disposition header instead of letting
+    ``FileResponse`` do it, so the name has to be checked on that path too."""
+    c, holder = client
+    uploaded = _lesson_pdf(db)
+    lesson = db.get(Lesson, uploaded.linked_lesson_id)
+    holder["user"] = _assigned_teacher(db, lesson)
+
+    response = c.get(f"/api/files/{uploaded.id}/download")
+
+    assert response.status_code == 200
+    assert response.content != PDF_BYTES
+    disposition = response.headers["content-disposition"]
+    assert "inline" in disposition
+    assert uploaded.filename in unquote(disposition)
+
+
+def test_a_stamped_view_still_sends_no_disposition(client, db):
+    """The IDM rule has to hold on the stamped path as well — it is a second
+    way out of the same route, and so a second place for the header to return."""
+    c, holder = client
+    uploaded = _lesson_pdf(db)
+    lesson = db.get(Lesson, uploaded.linked_lesson_id)
+    holder["user"] = _assigned_teacher(db, lesson)
+
+    response = c.get(f"/api/files/{uploaded.id}/view")
+
+    assert "content-disposition" not in response.headers
