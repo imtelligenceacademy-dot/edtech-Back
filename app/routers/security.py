@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
@@ -23,6 +24,16 @@ router = APIRouter(prefix="/api/security-logs", tags=["security"])
 # How many distinct addresses one page view will resolve. A first look at a long
 # history shouldn't hang on a few hundred lookups; the rest fill in next time.
 MAX_LOOKUPS_PER_REQUEST = 25
+
+# Every other event here is a moment of risk and happens rarely. These two are
+# a teacher opening her lesson, which happens all day — unfiltered they would
+# fill the first page and push every sign-in off a screen that exists to show
+# the rare thing. They are kept out of the default listing and fetched by
+# asking for them by name.
+FILE_ACCESS_EVENTS = (
+    SecurityEvent.lesson_file_served,
+    SecurityEvent.lesson_file_refused,
+)
 
 
 def _scope(stmt, current: User):
@@ -117,8 +128,17 @@ def list_security_logs(
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
     limit: int = Query(default=100, ge=1, le=500),
+    # `Annotated`, so that the Python default is a real `None`. Written as
+    # `= Query(default=None)` the default is the Query object itself, which
+    # FastAPI resolves over HTTP but the tests that call this as a plain
+    # function would hand straight to the database.
+    event: Annotated[SecurityEvent | None, Query()] = None,
 ) -> list[SecurityLogOut]:
     stmt = _scope(select(SecurityLog), current)
+    if event is not None:
+        stmt = stmt.where(SecurityLog.event == event)
+    else:
+        stmt = stmt.where(SecurityLog.event.notin_(FILE_ACCESS_EVENTS))
     logs = list(db.scalars(stmt.order_by(SecurityLog.timestamp.desc()).limit(limit)))
     _resolve_locations(db, logs)
     return [_out(log) for log in logs]

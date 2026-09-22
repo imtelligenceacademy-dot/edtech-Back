@@ -21,12 +21,21 @@ from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import delete, select
 
 from app.database import get_db
 from app.deps import get_current_user
 from app.main import app
-from app.models import Lesson, School, UploadedFile, User
-from app.models.enums import Role, UserStatus
+from app.models import (
+    Lesson,
+    LessonAssignment,
+    Progress,
+    School,
+    SecurityLog,
+    UploadedFile,
+    User,
+)
+from app.models.enums import Role, SecurityEvent, SecurityStatus, UserStatus
 from app.services.auto_assign import sync_teacher_assignments
 from app.services.file_storage import upload_root
 from app.services.lesson_access import is_lesson_available
@@ -58,6 +67,37 @@ def _text_of(pdf: bytes) -> str:
 
     with pymupdf.open(stream=pdf, filetype="pdf") as doc:
         return "\n".join(page.get_text() for page in doc)
+
+
+LESSON_TITLE = "grade 1 microbit lesson 01 name badge"
+
+
+@pytest.fixture(autouse=True)
+def _leave_no_lesson_behind(db):
+    """Take the lessons back out, because the routes here now commit.
+
+    Both read routes write a line to the security log and commit it, and the
+    app is handed this test's own session — so that commit also persists
+    whatever the fixtures had merely flushed. The suite shares one database and
+    never truncates it, so a Grade 1 lesson left here joins the ``(1, en, 2)``
+    track and takes the open slot from the lesson a test three modules away is
+    relying on. That failure surfaced in ``test_kindergarten`` the first time,
+    which is nowhere near the cause.
+
+    Only the lessons and what hangs off them: a spare teacher or school is
+    found by nothing, but a lesson is found by every teacher of its grade.
+    """
+    yield
+    db.rollback()
+    lesson_ids = list(
+        db.scalars(select(Lesson.id).where(Lesson.title == LESSON_TITLE))
+    )
+    if lesson_ids:
+        db.execute(delete(Progress).where(Progress.lesson_id.in_(lesson_ids)))
+        db.execute(delete(LessonAssignment).where(LessonAssignment.lesson_id.in_(lesson_ids)))
+        db.execute(delete(UploadedFile).where(UploadedFile.linked_lesson_id.in_(lesson_ids)))
+        db.execute(delete(Lesson).where(Lesson.id.in_(lesson_ids)))
+        db.commit()
 
 
 @pytest.fixture(autouse=True)
@@ -156,7 +196,7 @@ def _assigned_teacher(db, lesson: Lesson) -> User:
 def _lesson_pdf(db, pages: int = 1) -> UploadedFile:
     lesson = Lesson(
         id=new_id("les"),
-        title="grade 1 microbit lesson 01 name badge",
+        title=LESSON_TITLE,
         grade=1,
         subject="STEAM",
         language="en",
@@ -174,7 +214,7 @@ def _lesson_pdf(db, pages: int = 1) -> UploadedFile:
     uploaded = UploadedFile(
         id=file_id,
         # The name IDM offered to save, taken from the screenshot that started this.
-        filename="grade 1 microbit lesson 01 name badge",
+        filename=LESSON_TITLE,
         content_type="application/pdf",
         size_bytes=len(data),
         storage_path=f"{file_id}.pdf",
@@ -330,3 +370,108 @@ def test_a_stamped_view_still_sends_no_disposition(client, db):
     response = c.get(f"/api/files/{uploaded.id}/view")
 
     assert "content-disposition" not in response.headers
+
+
+# --------------------------------------------------------------------------- #
+# What was taken, and by whom
+# --------------------------------------------------------------------------- #
+
+def _access_rows(db, user: User) -> list[SecurityLog]:
+    return list(
+        db.scalars(
+            select(SecurityLog)
+            .where(SecurityLog.user_id == user.id)
+            .order_by(SecurityLog.timestamp)
+        )
+    )
+
+
+def test_opening_a_lesson_is_written_down(client, db):
+    """The half the watermark cannot give you.
+
+    A stamped copy names an account once a copy surfaces. This says what was
+    taken and when, which can be looked at before anything has surfaced at all:
+    a teacher opening her lesson and an account pulling the curriculum look
+    identical in the access log's absence, and nothing recorded either.
+    """
+    c, holder = client
+    uploaded = _lesson_pdf(db)
+    lesson = db.get(Lesson, uploaded.linked_lesson_id)
+    teacher = _assigned_teacher(db, lesson)
+    holder["user"] = teacher
+
+    assert _access_rows(db, teacher) == []
+
+    c.get(f"/api/files/{uploaded.id}/view")
+
+    rows = _access_rows(db, teacher)
+    assert len(rows) == 1
+    assert rows[0].event == SecurityEvent.lesson_file_served
+    assert rows[0].status == SecurityStatus.ok
+    # The lesson by name, not only the id: a log you have to join by hand to
+    # read is a log nobody reads.
+    assert LESSON_TITLE in rows[0].detail
+    assert uploaded.id in rows[0].detail
+
+
+def test_downloading_is_written_down_too(client, db):
+    """Two routes reach the same bytes, and both have to say so."""
+    c, holder = client
+    uploaded = _lesson_pdf(db)
+    lesson = db.get(Lesson, uploaded.linked_lesson_id)
+    teacher = _assigned_teacher(db, lesson)
+    holder["user"] = teacher
+
+    c.get(f"/api/files/{uploaded.id}/download")
+
+    rows = _access_rows(db, teacher)
+    assert [r.event for r in rows] == [SecurityEvent.lesson_file_served]
+
+
+def test_a_refusal_is_written_down_and_marked_blocked(client, db):
+    """The rarer and more interesting row. A file id that is not yours is not
+    somewhere the site can take you, so arriving at one is worth a line."""
+    c, holder = client
+    stranger = _unassigned_teacher(db)
+    holder["user"] = stranger
+    uploaded = _lesson_pdf(db)
+
+    response = c.get(f"/api/files/{uploaded.id}/view")
+
+    assert response.status_code == 403
+    rows = _access_rows(db, stranger)
+    assert len(rows) == 1
+    assert rows[0].event == SecurityEvent.lesson_file_refused
+    assert rows[0].status == SecurityStatus.blocked
+
+
+def test_an_id_matching_nothing_writes_no_row(client, db):
+    """A 404 names nobody's material. Logging it would record only that
+    somebody typed something wrong, and bury the refusals that matter."""
+    c, holder = client
+    teacher = _unassigned_teacher(db)
+    holder["user"] = teacher
+
+    assert c.get("/api/files/file_nothing_here/view").status_code == 404
+
+    assert _access_rows(db, teacher) == []
+
+
+def test_file_access_stays_out_of_the_security_screen(client, db):
+    """Every other event there is rare and is a moment of risk. This one is a
+    teacher opening a lesson, all day — unfiltered it would push the sign-ins
+    off the first page of the screen that exists to show them."""
+    c, holder = client
+    uploaded = _lesson_pdf(db)
+    lesson = db.get(Lesson, uploaded.linked_lesson_id)
+    teacher = _assigned_teacher(db, lesson)
+    holder["user"] = teacher
+    c.get(f"/api/files/{uploaded.id}/view")
+
+    default = c.get("/api/security-logs")
+    asked_for = c.get("/api/security-logs?event=lesson-file-served")
+
+    assert default.status_code == 200
+    assert all(r["event"] != "lesson-file-served" for r in default.json())
+    # But reachable, which is the point of writing it down at all.
+    assert any(LESSON_TITLE in r["detail"] for r in asked_for.json())

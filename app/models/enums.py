@@ -84,6 +84,15 @@ class SecurityEvent(str, enum.Enum):
     # and not reconstructable, so it is written down with who did it and how
     # much it covered.
     progress_reset = "progress-reset"
+    # A lesson PDF handed to an account. The only event here that happens in
+    # the ordinary course of teaching rather than at a moment of risk, and so
+    # the only one written many times a day: the question it answers is not
+    # "did something go wrong" but "does this pattern look like teaching".
+    # `list_security_logs` leaves it out unless it is asked for by name.
+    lesson_file_served = "lesson-file-served"
+    # The same request refused. Rarer and more interesting: a file id that is
+    # not yours is not a thing you arrive at by using the site.
+    lesson_file_refused = "lesson-file-refused"
 
 
 class SecurityStatus(str, enum.Enum):

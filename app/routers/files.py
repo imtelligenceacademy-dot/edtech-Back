@@ -11,12 +11,23 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
+from app.audit import record_event
 from app.config import settings
 from app.database import get_db
 from app.deps import get_current_user, require_capability
@@ -30,7 +41,7 @@ from app.models import (
     UploadedFile,
     User,
 )
-from app.models.enums import LessonStatus, Role
+from app.models.enums import LessonStatus, Role, SecurityEvent, SecurityStatus
 from app.schemas.file import (
     BulkDeleteResult,
     DeletionImpact,
@@ -51,7 +62,7 @@ from app.services.file_storage import (
 )
 from app.services.fair_access import can_open_fair_file, refuse_fair_backed
 from app.services.lesson_access import is_lesson_available
-from app.utils import new_id
+from app.utils import client_ip, new_id, user_agent
 
 router = APIRouter(prefix="/api/files", tags=["files"])
 
@@ -421,26 +432,70 @@ def _traceable_copy(current: User, uploaded: UploadedFile, path: Path) -> bytes 
     return pdf_watermark.stamp(path, pdf_watermark.mark_for(current))
 
 
-def _readable_file(db: Session, current: User, file_id: str) -> tuple[UploadedFile, Path]:
-    """The lookup and both permission checks the two read routes share."""
+def _record_access(
+    db: Session,
+    request: Request,
+    current: User,
+    uploaded: UploadedFile,
+    *,
+    served: bool,
+) -> None:
+    """Write down that this account asked for this file.
+
+    The watermark says whose a copy is once a copy turns up. This says what
+    was taken and when, which is the half you can look at before anything has
+    gone wrong: forty lessons pulled in an afternoon is not what teaching one
+    looks like, and nothing recorded that until now.
+    """
+    lesson = db.get(Lesson, uploaded.linked_lesson_id) if uploaded.linked_lesson_id else None
+    what = (lesson.title if lesson else "") or uploaded.filename or uploaded.id
+    record_event(
+        db,
+        event=SecurityEvent.lesson_file_served if served else SecurityEvent.lesson_file_refused,
+        status=SecurityStatus.ok if served else SecurityStatus.blocked,
+        user=current,
+        user_name=current.name,
+        ip=client_ip(request),
+        device=user_agent(request),
+        detail=f'{"Opened" if served else "Refused"} "{what}" ({uploaded.id})',
+    )
+
+
+def _readable_file(
+    db: Session, request: Request, current: User, file_id: str
+) -> tuple[UploadedFile, Path]:
+    """The lookup, both permission checks, and the line in the log.
+
+    All three live here rather than in the routes so that a third way of
+    reading a file cannot be added without them.
+    """
     uploaded = db.get(UploadedFile, file_id)
     if uploaded is None or not uploaded.storage_path:
+        # Not written down: an id matching nothing names nobody's material, and
+        # the row would record only that somebody typed something wrong.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found")
     if not _can_access(db, current, uploaded):
+        # The refusal is the more interesting of the two. A file id that is not
+        # yours is not somewhere the site can take you.
+        _record_access(db, request, current, uploaded, served=False)
+        db.commit()
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not permitted")
 
     path = resolve_stored_file(uploaded.storage_path)
     if path is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Stored file missing")
+    _record_access(db, request, current, uploaded, served=True)
+    db.commit()
     return uploaded, path
 
 
 @router.get("/{file_id}/view")
 def view_file(
     file_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
-) -> FileResponse:
+) -> Response:
     """The same bytes as ``/download``, with nothing on them that says "download".
 
     Download-manager extensions — IDM is the one that reached us — watch for a
@@ -453,7 +508,7 @@ def view_file(
     header at all. ``/download`` keeps its filename, because the admin file list
     offers it as a real download and the saved file should be named properly.
     """
-    uploaded, path = _readable_file(db, current, file_id)
+    uploaded, path = _readable_file(db, request, current, file_id)
     traced = _traceable_copy(current, uploaded, path)
     if traced is None:
         # No `filename=`: Starlette sends Content-Disposition only when given
@@ -467,10 +522,11 @@ def view_file(
 @router.get("/{file_id}/download")
 def download_file(
     file_id: str,
+    request: Request,
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
-) -> FileResponse:
-    uploaded, path = _readable_file(db, current, file_id)
+) -> Response:
+    uploaded, path = _readable_file(db, request, current, file_id)
     traced = _traceable_copy(current, uploaded, path)
     if traced is None:
         return FileResponse(
