@@ -17,7 +17,6 @@ has written it.
 
 from __future__ import annotations
 
-from datetime import date
 from urllib.parse import unquote
 
 import pytest
@@ -135,7 +134,7 @@ def _assigned_teacher(db, lesson: Lesson) -> User:
     db.add(school)
     user = User(
         id=new_id("u"),
-        name="Rania  Haddad",  # the double space is deliberate; see the stamp test
+        name="Rania Haddad",
         email=f"{new_id('e')}@example.com",
         password_hash="x",
         role=Role.teacher,
@@ -252,8 +251,8 @@ def test_the_teachers_copy_says_whose_copy_it_is(client, db):
 
     Nothing here stops the file being saved, and nothing could — a teacher
     entitled to open a lesson can pull it from the address bar in two steps. So
-    the bytes she is served carry her name and the date, and a PDF that turns
-    up where it should not says which account it came from.
+    the bytes she is served carry her address, and a PDF that turns up where it
+    should not says which account it came from.
     """
     c, holder = client
     uploaded = _lesson_pdf(db)
@@ -266,11 +265,10 @@ def test_the_teachers_copy_says_whose_copy_it_is(client, db):
     assert response.status_code == 200
     assert response.content != PDF_BYTES, "she was served the unstamped original"
     text = _text_of(response.content)
-    # Collapsed: a name is free text, this one has two spaces in it, and
-    # stamped verbatim it would not match what comes back out.
-    assert "Rania Haddad" in text
     assert teacher.email in text
-    assert date.today().strftime("%d %b %Y") in text
+    # The address is the whole mark. A display name is not unique and is not
+    # what anyone would be traced by, so it is not stamped.
+    assert "Rania Haddad" not in text
 
 
 def test_every_page_carries_it_not_only_the_first(client, db):
@@ -278,7 +276,8 @@ def test_every_page_carries_it_not_only_the_first(client, db):
     c, holder = client
     uploaded = _lesson_pdf(db, pages=2)
     lesson = db.get(Lesson, uploaded.linked_lesson_id)
-    holder["user"] = _assigned_teacher(db, lesson)
+    teacher = _assigned_teacher(db, lesson)
+    holder["user"] = teacher
 
     response = c.get(f"/api/files/{uploaded.id}/view")
 
@@ -286,7 +285,7 @@ def test_every_page_carries_it_not_only_the_first(client, db):
 
     with pymupdf.open(stream=response.content, filetype="pdf") as doc:
         assert doc.page_count == 2
-        assert all("Rania Haddad" in page.get_text() for page in doc)
+        assert all(teacher.email in page.get_text() for page in doc)
 
 
 def test_the_custodians_copy_is_left_alone(client, db):

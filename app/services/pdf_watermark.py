@@ -14,7 +14,6 @@ means to; someone who means to has easier routes than cropping.
 
 from __future__ import annotations
 
-from datetime import date
 from pathlib import Path
 
 from app.models import User
@@ -26,13 +25,15 @@ _SIZE = 7.0
 _GREY = (0.45, 0.45, 0.45)
 
 
-def mark_for(user: User, on: date | None = None) -> str:
-    """The line stamped onto every page: who this copy went to, and when."""
-    when = (on or date.today()).strftime("%d %b %Y")
-    # A name is free text and has arrived with newlines in it before now; a
-    # newline here would end the stamp early and take the email with it.
-    who = " ".join((user.name or "").split()) or "Unnamed account"
-    return f"Served to {who} <{user.email}> · {when} · IM-Telligence"
+def mark_for(user: User) -> str:
+    """The line stamped onto every page: the account this copy went to.
+
+    The address alone, deliberately. A display name is free text, is not unique
+    and can be edited; the address is the account. Nothing else is in the line
+    because everything else made it longer without making it identify anyone
+    more precisely.
+    """
+    return f"Served to {user.email} · IM-Telligence"
 
 
 def stamp(path: Path, mark: str) -> bytes | None:
