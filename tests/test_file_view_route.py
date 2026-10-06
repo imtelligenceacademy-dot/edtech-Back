@@ -21,20 +21,12 @@ from urllib.parse import unquote
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.database import get_db
 from app.deps import get_current_user
 from app.main import app
-from app.models import (
-    Lesson,
-    LessonAssignment,
-    Progress,
-    School,
-    SecurityLog,
-    UploadedFile,
-    User,
-)
+from app.models import Lesson, School, SecurityLog, UploadedFile, User
 from app.models.enums import Role, SecurityEvent, SecurityStatus, UserStatus
 from app.services.auto_assign import sync_teacher_assignments
 from app.services.file_storage import upload_root
@@ -73,34 +65,6 @@ LESSON_TITLE = "grade 1 microbit lesson 01 name badge"
 
 
 @pytest.fixture(autouse=True)
-def _leave_no_lesson_behind(db):
-    """Take the lessons back out, because the routes here now commit.
-
-    Both read routes write a line to the security log and commit it, and the
-    app is handed this test's own session — so that commit also persists
-    whatever the fixtures had merely flushed. The suite shares one database and
-    never truncates it, so a Grade 1 lesson left here joins the ``(1, en, 2)``
-    track and takes the open slot from the lesson a test three modules away is
-    relying on. That failure surfaced in ``test_kindergarten`` the first time,
-    which is nowhere near the cause.
-
-    Only the lessons and what hangs off them: a spare teacher or school is
-    found by nothing, but a lesson is found by every teacher of its grade.
-    """
-    yield
-    db.rollback()
-    lesson_ids = list(
-        db.scalars(select(Lesson.id).where(Lesson.title == LESSON_TITLE))
-    )
-    if lesson_ids:
-        db.execute(delete(Progress).where(Progress.lesson_id.in_(lesson_ids)))
-        db.execute(delete(LessonAssignment).where(LessonAssignment.lesson_id.in_(lesson_ids)))
-        db.execute(delete(UploadedFile).where(UploadedFile.linked_lesson_id.in_(lesson_ids)))
-        db.execute(delete(Lesson).where(Lesson.id.in_(lesson_ids)))
-        db.commit()
-
-
-@pytest.fixture(autouse=True)
 def _isolated_upload_dir(tmp_path, monkeypatch):
     """Write the fake PDF to a temp dir, not the developer's storage volume."""
     from app.config import settings
@@ -116,9 +80,6 @@ def client(db):
     migrations, and that DDL deadlocks against an open write transaction.
 
     The route is handed this same session, so the helpers below only flush.
-    Committing would work too, and would also outlive the test: the suite shares
-    one database that is never truncated, and a stray Grade 1 lesson left behind
-    here locks the next lesson in that track for a test three modules away.
     """
     holder: dict[str, User] = {}
     app.dependency_overrides[get_db] = lambda: db

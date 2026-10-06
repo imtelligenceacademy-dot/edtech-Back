@@ -99,8 +99,26 @@ def test_the_check_holds_the_account_row(db):
 ON_POSTGRES = "postgresql" in os.environ.get("TEST_DATABASE_URL", "")
 
 
+@pytest.fixture()
+def racing_teacher(db):
+    """A teacher whose rows really are committed, and are removed afterwards.
+
+    The six threads below each open their own connection, and a connection can
+    only see what has actually been committed — so this test opts out of the
+    rolled-back session every other test gets (``real_commits``), and takes on
+    the cleanup that session would otherwise have done for it.
+    """
+    teacher = _teacher(db)
+    yield teacher
+    db.rollback()
+    db.query(AiUsage).filter(AiUsage.user_id == teacher.id).delete()
+    db.query(User).filter(User.id == teacher.id).delete()
+    db.commit()
+
+
+@pytest.mark.real_commits
 @pytest.mark.skipif(not ON_POSTGRES, reason="needs TEST_DATABASE_URL on Postgres")
-def test_parallel_questions_cannot_outrun_the_cap(db):
+def test_parallel_questions_cannot_outrun_the_cap(db, racing_teacher):
     """Six Sends at once, from one question below the cap.
 
     Before the lock this inserted six rows against one remaining question. It
@@ -108,7 +126,7 @@ def test_parallel_questions_cannot_outrun_the_cap(db):
     transactions for free and hides the defect completely — the same blind spot
     that let the login-counter version of this ship.
     """
-    teacher = _teacher(db)
+    teacher = racing_teacher
     limit = settings.ai_teacher_hourly_limit
     for _ in range(limit - 1):
         enforce_ai_limit(db, teacher, "teacher")

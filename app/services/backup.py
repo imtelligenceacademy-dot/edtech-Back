@@ -23,10 +23,9 @@ from typing import Any, Collection
 
 import httpx
 from sqlalchemy import Date, DateTime, Enum as SAEnum, Time, false as sa_false, select
-from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import Base, IS_SQLITE, engine
+from app.database import Base, IS_SQLITE, SessionLocal, engine
 from app.models import User
 from app.models.base import utcnow
 from app.services.grades import grade_token, is_kindergarten
@@ -236,7 +235,11 @@ def build_files_archive(file_ids: Collection[str] | None = None) -> tuple[str, i
     missing: list[dict[str, Any]] = []
     manifest: list[dict[str, Any]] = []
 
-    with Session(engine) as db:
+    # The app's session factory, like everything else that reads rows here. A
+    # bare `Session(engine)` worked the same in production but was the one
+    # reader the test harness could not reach, so its tests could only see
+    # rows another test had left behind.
+    with SessionLocal() as db:
         fair_file_ids = {
             fid for fid in db.scalars(select(FairProject.file_id)) if fid is not None
         }
