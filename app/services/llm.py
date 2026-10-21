@@ -107,15 +107,38 @@ def _transport_error(exc: Exception) -> LLMError:
     return LLMError("unavailable", "provider connection failed")
 
 
+def _timeout(long_answer: bool) -> int:
+    """How long to wait. A full exam with its answer key can take longer than a
+    chat answer to arrive, and a non-streamed reply arrives all at once."""
+    return (
+        settings.ai_assessment_timeout_seconds if long_answer else settings.ai_timeout_seconds
+    )
+
+
+def _max_tokens(long_answer: bool) -> int:
+    """Anthropic requires a cap; 1024 cut an exam off before its answer key."""
+    return settings.ai_assessment_max_output_tokens if long_answer else 1024
+
+
+def long_answer_kwargs(long_answer: bool) -> dict:
+    """Passed only when set, so every provider written before this existed — and
+    every test double of one — is called exactly as it always was."""
+    return {"long_answer": True} if long_answer else {}
+
+
 class LLMProvider(Protocol):
     name: str
     model: str | None
     # True only when the provider can accept an image alongside the question.
     supports_vision: bool
 
-    def chat(self, system: str, messages: list[ChatMessage]) -> str: ...
+    def chat(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> str: ...
 
-    def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]: ...
+    def chat_stream(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> Iterator[str]: ...
 
 
 # --------------------------------------------------------------------------- #
@@ -126,7 +149,9 @@ class MockProvider:
     model = None
     supports_vision = False
 
-    def chat(self, system: str, messages: list[ChatMessage]) -> str:
+    def chat(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> str:
         last = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
         grounded = "based on this lesson's material, " if "LESSON MATERIAL" in system else ""
         return (
@@ -135,7 +160,9 @@ class MockProvider:
             "classroom activity. Add a real provider API key in backend/.env for live answers."
         )
 
-    def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+    def chat_stream(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> Iterator[str]:
         for word in self.chat(system, messages).split(" "):
             yield word + " "
 
@@ -253,13 +280,15 @@ class OpenAICompatProvider:
             "stream": stream,
         }
 
-    def chat(self, system: str, messages: list[ChatMessage]) -> str:
+    def chat(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> str:
         try:
             resp = httpx.post(
                 f"{self._base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json=self._payload(system, messages, stream=False),
-                timeout=settings.ai_timeout_seconds,
+                timeout=_timeout(long_answer),
             )
             _raise_for_status(resp.status_code)
             # `content` is null whenever the turn carried no text — a content
@@ -279,23 +308,25 @@ class OpenAICompatProvider:
         except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError("unavailable", "provider sent an unreadable reply") from exc
 
-    def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+    def chat_stream(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> Iterator[str]:
         try:
-            yield from self._stream_completions(system, messages)
+            yield from self._stream_completions(system, messages, long_answer)
         except LLMError:
             raise
         except httpx.HTTPError as exc:
             raise _transport_error(exc) from exc
 
     def _stream_completions(
-        self, system: str, messages: list[ChatMessage]
+        self, system: str, messages: list[ChatMessage], long_answer: bool = False
     ) -> Iterator[str]:
         with httpx.stream(
             "POST",
             f"{self._base_url}/chat/completions",
             headers={"Authorization": f"Bearer {self._api_key}"},
             json=self._payload(system, messages, stream=True),
-            timeout=settings.ai_timeout_seconds,
+            timeout=_timeout(long_answer),
         ) as resp:
             _raise_for_status(resp.status_code)
             for line in resp.iter_lines():
@@ -343,18 +374,20 @@ class AnthropicProvider:
             "content-type": "application/json",
         }
 
-    def chat(self, system: str, messages: list[ChatMessage]) -> str:
+    def chat(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> str:
         try:
             resp = httpx.post(
                 "https://api.anthropic.com/v1/messages",
                 headers=self._headers(),
                 json={
                     "model": self.model,
-                    "max_tokens": 1024,
+                    "max_tokens": _max_tokens(long_answer),
                     "system": system,
                     "messages": messages,
                 },
-                timeout=settings.ai_timeout_seconds,
+                timeout=_timeout(long_answer),
             )
             _raise_for_status(resp.status_code)
             blocks = resp.json()["content"]
@@ -375,16 +408,18 @@ class AnthropicProvider:
         except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
             raise LLMError("unavailable", "provider sent an unreadable reply") from exc
 
-    def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+    def chat_stream(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> Iterator[str]:
         try:
-            yield from self._stream_messages(system, messages)
+            yield from self._stream_messages(system, messages, long_answer)
         except LLMError:
             raise
         except httpx.HTTPError as exc:
             raise _transport_error(exc) from exc
 
     def _stream_messages(
-        self, system: str, messages: list[ChatMessage]
+        self, system: str, messages: list[ChatMessage], long_answer: bool = False
     ) -> Iterator[str]:
         with httpx.stream(
             "POST",
@@ -392,12 +427,12 @@ class AnthropicProvider:
             headers=self._headers(),
             json={
                 "model": self.model,
-                "max_tokens": 1024,
+                "max_tokens": _max_tokens(long_answer),
                 "system": system,
                 "messages": messages,
                 "stream": True,
             },
-            timeout=settings.ai_timeout_seconds,
+            timeout=_timeout(long_answer),
         ) as resp:
             _raise_for_status(resp.status_code)
             for line in resp.iter_lines():
@@ -457,11 +492,13 @@ class ProviderChain:
         # built — before anyone knows a fallback will be needed.
         return getattr(self._providers[0], "supports_vision", False)
 
-    def chat(self, system: str, messages: list[ChatMessage]) -> str:
+    def chat(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> str:
         last: LLMError | None = None
         for provider in self._providers:
             try:
-                answer = provider.chat(system, messages)
+                answer = provider.chat(system, messages, **long_answer_kwargs(long_answer))
                 self.last_used = provider
                 return answer
             except LLMError as exc:
@@ -471,11 +508,15 @@ class ProviderChain:
                 _log_fallthrough(provider, exc)
         raise last if last else LLMError("unavailable", "no provider answered")
 
-    def chat_stream(self, system: str, messages: list[ChatMessage]) -> Iterator[str]:
+    def chat_stream(
+        self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
+    ) -> Iterator[str]:
         last: LLMError | None = None
         for provider in self._providers:
             try:
-                stream = provider.chat_stream(system, messages)
+                stream = provider.chat_stream(
+                    system, messages, **long_answer_kwargs(long_answer)
+                )
                 first = next(stream, None)
                 if first is None:
                     # A 200 carrying no content at all. It happens — a filter

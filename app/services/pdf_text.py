@@ -45,8 +45,12 @@ def _pdf_to_text(path: Path) -> str:
         return ""
 
 
-def lesson_context(lesson: Lesson) -> str:
-    """Return grounding text for a lesson, capped to ai_max_context_chars."""
+def lesson_context(lesson: Lesson, max_chars: int | None = None) -> str:
+    """Return grounding text for a lesson, capped to ai_max_context_chars.
+
+    An assessment across several lessons passes its own cap, so the lessons
+    share one budget instead of each claiming the whole of it.
+    """
     text = ""
     files = getattr(lesson, "uploaded_files", []) or []
     if files and files[0].storage_path:
@@ -59,7 +63,7 @@ def lesson_context(lesson: Lesson) -> str:
             f"--- Slide {s.index} ---\n{s.title}\n{s.body}" for s in lesson.slides
         )
 
-    return text.strip()[: settings.ai_max_context_chars]
+    return text.strip()[: max_chars or settings.ai_max_context_chars]
 
 
 def uploaded_file_context(uploaded: UploadedFile | None) -> str:

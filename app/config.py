@@ -119,6 +119,13 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-5.6-luna"
     anthropic_model: str = "claude-sonnet-4-6"
     ai_max_context_chars: int = 24000
+    # A quiz or exam across several lessons. Its material is every lesson the
+    # teacher named, so it gets its own budget, split evenly between them; an
+    # answer key makes the reply long, so it gets more room and more time too.
+    ai_assessment_context_chars: int = 60000
+    ai_assessment_max_lessons: int = 10
+    ai_assessment_max_output_tokens: int = 6000
+    ai_assessment_timeout_seconds: int = 90
     ai_timeout_seconds: int = 30
 
     # --- Teacher assistant: visual slide inspection ------------------------ #

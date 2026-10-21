@@ -33,6 +33,11 @@ from app.schemas.ai import (
     AIUsageStats,
     VisionProbe,
 )
+from app.services.assessment_request import (
+    is_assessment_request,
+    parse_lesson_numbers,
+    resolve_lessons_with_model,
+)
 from app.services.ai_usage import (
     AILimitExceeded,
     enforce_ai_limit,
@@ -44,11 +49,11 @@ from app.services.ai_usage import (
 )
 from app.services.chat_history import save_exchange
 from app.services.fair_access import visible_project
-from app.services.grades import is_kindergarten
-from app.services.lesson_access import is_lesson_available
+from app.services.grades import grade_label, is_kindergarten
+from app.services.lesson_access import is_lesson_available, lesson_order_key
 from app.services.sections import resolve_section, sections_for
 from app.services.file_storage import resolve_stored_file
-from app.services.llm import ChatMessage, LLMError, get_provider
+from app.services.llm import ChatMessage, LLMError, get_provider, long_answer_kwargs
 from app.services.pdf_render import SlideRenderError, render_page_data_url
 from app.services.pdf_text import lesson_context, uploaded_file_context
 from app.services import hardware, kits, slide_vision
@@ -124,6 +129,20 @@ _FORMAT = """FORMAT - plain text a teacher can read at a glance, mid-lesson, wit
 - No Markdown tables, no Markdown headings, and never put ** or __ around words. Those markers are shown literally to the teacher and look broken.
 - Use short paragraphs, or simple numbered steps for procedures.
 - Use a fenced code block ONLY when actually showing code."""
+
+_ASSESSMENT = """ASSESSMENT - the teacher has asked for a quiz, test or exam. The material below holds every lesson it is to cover, each under its own "=== Lesson N: title ===" heading.
+- Write questions ONLY about what that material teaches. Do not test anything the lessons do not cover, however closely related.
+- Cover every lesson listed, in proportion to how much it teaches, and tag every question with its lesson, for example (L2).
+- A lesson marked as having no readable text gets no questions; say so in one line at the top instead of guessing what it taught.
+- Pitch the wording and difficulty at {grade} students.
+- Follow the teacher's request on the number of questions, the question types and the difficulty. If she did not say, write about 15 questions mixing multiple choice (four options), true/false, short answer and - where the lessons teach code - predict-the-output or write-a-short-program questions.
+- Number the questions, give each one's marks in brackets, and state the total marks at the top.
+- After the last question write a line reading "ANSWER KEY (teacher only)", then the answer to every question, with a one-line marking guide for written answers.
+- Plain text: no Markdown tables, no # headings, and never put ** or __ around words - they are shown literally. Use a fenced code block only for code the students must read or write."""
+
+_LESSON_INDEX = """LESSONS THIS TEACHER HAS IN THIS COURSE - for reference only; the material above is the open lesson's alone:
+{lessons}
+If she is asking for a quiz or exam and it is not clear which of these lessons it should cover, ask her which, by number. Never ask her to paste or upload a lesson: they are all on the platform, and naming them by number is enough."""
 
 _LANGUAGE = """LANGUAGE - always reply in the same language the teacher wrote their question in. If that is unclear, use {lang}. Keep technical component names (micro:bit, GPIO, servo) in their usual form."""
 
@@ -259,6 +278,127 @@ class PromptBundle:
     # the source reference that is honest about it — the rebuild may or may not
     # find a reading, and that decides whether the slide was consulted at all.
     text_fallback: Callable[[], tuple[str, str | None]] | None = None
+    # A quiz or exam with its answer key: more output, and more time, than a
+    # chat answer is allowed.
+    long_answer: bool = False
+
+
+@dataclass
+class AssessmentPlan:
+    """The lessons a quiz request covers, and the ones it could have named."""
+
+    lessons: list[Lesson]
+    index: list[Lesson]
+    capped: bool = False
+
+
+# A course named in the request wins over the open lesson's: "a quiz on the
+# micro:bit lessons 1-3" asked from a Python page means the micro:bit ones.
+_COURSE_NAMED = (("microbit", ("micro:bit", "microbit", "micro bit")), ("python", ("python",)))
+
+
+def _named_course(message: str) -> str | None:
+    text = (message or "").lower()
+    for course, spellings in _COURSE_NAMED:
+        if any(s in text for s in spellings):
+            return course
+    return None
+
+
+def _assessable_lessons(
+    db: Session, teacher: User, open_lesson: Lesson, course: str | None
+) -> list[Lesson]:
+    """Every lesson of this course that is assigned to this teacher, in order.
+
+    Assigned is the whole rule, deliberately: locked or not does not enter into
+    it. Teachers skip "Mark complete", and Year 2 teachers have most of their
+    lessons unlocked, so a lesson's status says little about whether it was
+    taught — the teacher naming it says more. What stays fixed is whose lessons
+    they are: her own assignments, in the open lesson's grade, language and
+    curriculum year, and never kindergarten.
+    """
+    rows = db.scalars(
+        select(Lesson)
+        .options(selectinload(Lesson.uploaded_files), selectinload(Lesson.slides))
+        .join(LessonAssignment, LessonAssignment.lesson_id == Lesson.id)
+        .where(
+            LessonAssignment.teacher_id == teacher.id,
+            Lesson.grade == open_lesson.grade,
+            Lesson.language == open_lesson.language,
+            Lesson.year == open_lesson.year,
+            Lesson.course == course if course is not None else Lesson.course.is_(None),
+        )
+    ).unique()
+    return sorted(
+        (l for l in rows if not is_kindergarten(l.grade) and l.lesson_no is not None),
+        key=lesson_order_key,
+    )
+
+
+def _plan_assessment(db: Session, teacher: User, open_lesson: Lesson, message: str) -> AssessmentPlan:
+    """Work out which of her lessons a quiz request covers.
+
+    The parser first, which is free; a model only for what it cannot read.
+    Nothing resolved is not a failure — the question is answered from the open
+    lesson as before, with the list of her lessons beside it, so the answer can
+    ask which ones she meant instead of asking her to paste them.
+    """
+    course = _named_course(message) or open_lesson.course
+    index = _assessable_lessons(db, teacher, open_lesson, course)
+    current_no = open_lesson.lesson_no if open_lesson.course == course else None
+    numbers = parse_lesson_numbers(message, current_no=current_no)
+    if numbers is None:
+        numbers = resolve_lessons_with_model(
+            message, [(l.lesson_no, l.title) for l in index], get_provider()
+        )
+    wanted = set(numbers or [])
+    picked = [l for l in index if l.lesson_no in wanted]
+    limit = settings.ai_assessment_max_lessons
+    return AssessmentPlan(lessons=picked[:limit], index=index, capped=len(picked) > limit)
+
+
+def _lessons_label(lessons: list[Lesson]) -> str:
+    """"Lessons 1–4", or "Lessons 1, 3, 4" when they are not a run."""
+    numbers = [l.lesson_no for l in lessons]
+    if len(numbers) == 1:
+        return f"Lesson {numbers[0]}"
+    if numbers == list(range(numbers[0], numbers[0] + len(numbers))):
+        return f"Lessons {numbers[0]}–{numbers[-1]}"
+    return "Lessons " + ", ".join(str(n) for n in numbers)
+
+
+def _assessment_system(teacher: User, plan: AssessmentPlan) -> tuple[str, str]:
+    """The prompt for a quiz across ``plan.lessons``, and its source line.
+
+    The lessons share one budget, split evenly, so naming ten of them cannot
+    make the prompt ten times the size of a question about one.
+    """
+    share = settings.ai_assessment_context_chars // len(plan.lessons)
+    sections = []
+    for lesson in plan.lessons:
+        text = lesson_context(lesson, max_chars=share)
+        heading = f"=== Lesson {lesson.lesson_no}: {lesson.title} ==="
+        sections.append(
+            f"{heading}\n{text}" if text.strip() else f"{heading}\n(This lesson has no readable text.)"
+        )
+    grade = grade_label(plan.lessons[0].grade)
+    policy = "\n\n".join(
+        [
+            _ROLE,
+            _SCOPE,
+            _ASSESSMENT.format(grade=grade),
+            _LANGUAGE.format(lang=_language_name(teacher)),
+        ]
+    )
+    note = (
+        f"\n\nShe named more lessons than fit in one assessment; it covers the first "
+        f"{len(plan.lessons)}. Say so in one line at the top."
+        if plan.capped
+        else ""
+    )
+    material = "\n\n".join(sections)
+    system = f"{policy}{note}\n\nLESSON MATERIAL:\n<material>\n{material}\n</material>"
+    return system, _lessons_label(plan.lessons)
 
 
 def _uploaded_for(
@@ -402,6 +542,21 @@ def _build_prompt(
     if before_work is not None:
         before_work()
 
+    # A quiz or exam across lessons. Built from the lessons she named rather
+    # than the open one, and without the slide image or its reading: one slide's
+    # picture adds nothing to an exam, and both cost money.
+    if lesson is not None and is_assessment_request(payload.message):
+        plan = _plan_assessment(db, current, lesson, payload.message)
+        if plan.lessons:
+            system, source_ref = _assessment_system(current, plan)
+            return PromptBundle(
+                system=system,
+                messages=messages,
+                source_ref=source_ref,
+                grounded=True,
+                long_answer=True,
+            )
+
     image_data_url, attempted = _slide_image(
         db, lesson=lesson, project=project, current_slide=payload.current_slide
     )
@@ -499,6 +654,17 @@ def _assemble_system(
             "be extracted, so rely on the slide image (if attached), the title, and "
             "your robotics knowledge - and say when you are doing so."
         )
+
+    # A quiz request whose lessons could not be read. Answered from the open
+    # lesson as before, but with her lessons listed, so the reply can ask which
+    # she meant by number — the alternative it reached for was asking her to
+    # paste lessons the platform already holds.
+    if lesson is not None and is_assessment_request(payload.message):
+        course = _named_course(payload.message) or lesson.course
+        index = _assessable_lessons(db, current, lesson, course)
+        if index:
+            listing = "\n".join(f"Lesson {l.lesson_no}: {l.title}" for l in index)
+            system += "\n\n" + _LESSON_INDEX.format(lessons=listing)
 
     if reading:
         system += (
@@ -699,7 +865,9 @@ def _stream_answer(bundle: PromptBundle):
         yield from provider.chat_stream(_without_image(bundle), bundle.messages)
         return
 
-    yield from provider.chat_stream(bundle.system, bundle.messages)
+    yield from provider.chat_stream(
+        bundle.system, bundle.messages, **long_answer_kwargs(bundle.long_answer)
+    )
 
 
 def _without_image(bundle: PromptBundle) -> str:
@@ -755,7 +923,7 @@ def chat(
         # routes the slide through the Gemini reader instead, which is the same
         # thing the streaming path does when its seeing provider drops out.
         system = _without_image(bundle) if bundle.image_data_url else bundle.system
-        content = provider.chat(system, bundle.messages)
+        content = provider.chat(system, bundle.messages, **long_answer_kwargs(bundle.long_answer))
     except Exception as exc:
         # Nothing was said, so nothing is charged for.
         refund_ai_usage(db, usage_id)
