@@ -47,7 +47,8 @@ class ChatMessage(Base):
         String(16), nullable=False, default="", server_default=""
     )
 
-    # "user" or "assistant" — the same two roles the chat UI renders.
+    # "user" or "assistant" — the two roles the chat UI renders — or "error", a
+    # failed answer kept for the owner's view only (see `chat_history`).
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     # The lesson label the assistant answered against, shown as a chip in the UI.

@@ -96,14 +96,13 @@ def test_a_provider_that_dies_mid_stream_is_not_restarted():
     assert backup.calls == 0, "the backup must not re-answer over a started reply"
 
 
-def test_a_bad_request_is_not_retried_anywhere_else():
-    """A 400 fails identically everywhere; retrying only spends more quota."""
+def test_a_refused_request_is_offered_to_the_next_provider():
+    """What one provider refuses another may accept. Stopping at the first 400
+    left teachers with an error and working backups never asked."""
     primary = FakeProvider("openai", fails="bad_request")
     backup = FakeProvider("groq")
 
-    with pytest.raises(LLMError):
-        ProviderChain([primary, backup]).chat("sys", [])
-    assert backup.calls == 0
+    assert ProviderChain([primary, backup]).chat("sys", []) == "answer from groq"
 
 
 def test_a_dead_key_falls_through_rather_than_breaking_the_lesson():

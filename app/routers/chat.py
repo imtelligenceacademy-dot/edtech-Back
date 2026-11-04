@@ -69,7 +69,12 @@ def list_messages(
     """
     subject = _resolve_subject(current, teacher_id)
     return thread_messages(
-        db, teacher_id=subject, lesson_id=lesson_id, section=section, limit=limit
+        db,
+        teacher_id=subject,
+        lesson_id=lesson_id,
+        section=section,
+        limit=limit,
+        include_failures=current.role == Role.super_admin,
     )
 
 

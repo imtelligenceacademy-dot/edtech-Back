@@ -794,12 +794,13 @@ _ERROR_TEXT = {
     "quota": "The AI assistant has reached its usage quota. Please tell your administrator.",
     "timeout": "The AI assistant took too long to respond. Please try again.",
     "unavailable": "The AI assistant is unavailable right now. Please try again.",
-    # "Please try again" would be a lie here: the request itself was refused, so
-    # sending the same one gets the same answer. Usually it is length — a long
-    # lesson plus a long question — which is something the teacher can act on.
+    # "Please try again" would be a lie here: every provider refused the request,
+    # so sending the same one gets the same answer. It used to tell her to shorten
+    # the question, and said so to a teacher who had typed "hi". The cause is not
+    # hers to fix.
     "bad_request": (
-        "The AI assistant couldn't handle that request. Try a shorter question, "
-        "and tell your administrator if it keeps happening."
+        "The AI assistant couldn't answer that. Please tell your administrator "
+        "if it keeps happening."
     ),
 }
 
@@ -1022,6 +1023,7 @@ def chat_stream(
 
     def event_stream():
         answer: list[str] = []
+        failure = ""
         try:
             announced = bundle.source_ref
             if announced:
@@ -1032,6 +1034,7 @@ def chat_stream(
                     yield f"data: {json.dumps({'delta': delta})}\n\n"
             except Exception as exc:
                 logger.warning("teacher chat stream failed: %s", type(exc).__name__)
+                failure = _error_text(exc)
                 yield _provider_error_frame(exc)
             # The reference is announced before any provider work, on the
             # strength of a slide image having been *rendered*. If the seeing
@@ -1053,6 +1056,7 @@ def chat_stream(
                 question=question,
                 answer="".join(answer),
                 source_ref=bundle.source_ref,
+                failure=failure,
             )
             # A reply that never produced a word cost the teacher a question
             # and told her nothing. A partial one is an answer and stands.

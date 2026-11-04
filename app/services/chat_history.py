@@ -26,6 +26,11 @@ from app.utils import new_id
 
 logger = logging.getLogger("app.chat")
 
+# A question the assistant failed to answer, stored beside it so the owner can
+# tell it from one nobody replied to. Only the owner's view reads these: back in
+# a teacher's thread it would be sent to the model as part of the conversation.
+FAILURE_ROLE = "error"
+
 
 def save_exchange(
     *,
@@ -35,6 +40,7 @@ def save_exchange(
     answer: str,
     source_ref: str | None,
     section: str = "",
+    failure: str = "",
 ) -> None:
     """Record one question and its reply against the lesson and class it was
     asked in.
@@ -73,6 +79,18 @@ def save_exchange(
                         created_at=now + timedelta(microseconds=1),
                     )
                 )
+            if failure:
+                db.add(
+                    ChatMessage(
+                        id=new_id("msg"),
+                        teacher_id=teacher_id,
+                        lesson_id=lesson_id,
+                        section=section,
+                        role=FAILURE_ROLE,
+                        content=failure,
+                        created_at=now + timedelta(microseconds=2),
+                    )
+                )
             db.commit()
     except Exception:
         # The teacher already has their answer on screen; a failed write is a
@@ -81,17 +99,26 @@ def save_exchange(
 
 
 def thread_messages(
-    db: Session, *, teacher_id: str, lesson_id: str, section: str = "", limit: int = 50
+    db: Session,
+    *,
+    teacher_id: str,
+    lesson_id: str,
+    section: str = "",
+    limit: int = 50,
+    include_failures: bool = False,
 ) -> list[ChatMessage]:
     """The tail of one class's thread, oldest first — the order the chat renders
-    in."""
+    in. Failures only when asked for: see `FAILURE_ROLE`."""
+    conditions = [
+        ChatMessage.teacher_id == teacher_id,
+        ChatMessage.lesson_id == lesson_id,
+        ChatMessage.section == section,
+    ]
+    if not include_failures:
+        conditions.append(ChatMessage.role != FAILURE_ROLE)
     newest = db.scalars(
         select(ChatMessage)
-        .where(
-            ChatMessage.teacher_id == teacher_id,
-            ChatMessage.lesson_id == lesson_id,
-            ChatMessage.section == section,
-        )
+        .where(*conditions)
         .order_by(ChatMessage.created_at.desc())
         .limit(limit)
     ).all()
@@ -123,7 +150,7 @@ def threads_for_teacher(db: Session, *, teacher_id: str) -> list[dict]:
             func.count(ChatMessage.id),
             func.max(ChatMessage.created_at),
         )
-        .where(ChatMessage.teacher_id == teacher_id)
+        .where(ChatMessage.teacher_id == teacher_id, ChatMessage.role != FAILURE_ROLE)
         .group_by(ChatMessage.lesson_id, ChatMessage.section)
     ).all()
     threads = [

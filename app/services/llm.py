@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Iterator
 from typing import Protocol, TypedDict
 
@@ -39,11 +40,9 @@ def _raise_for_status(status_code: int) -> None:
     """Map a provider HTTP status onto our own error kinds.
 
     The only status treated as the request's own fault is one that says so.
-    `RETRYABLE_KINDS` excludes `bad_request` because a malformed request fails
-    identically at the next provider, and walking the chain to find that out
-    spends four timeouts of a teacher's lesson — but until now no status
-    produced that kind at all. Every 4xx landed on `unavailable`, which is
-    retryable, so the exclusion described a case that could not occur.
+    A 400 or 422 is `bad_request`, which the chain falls through on like any
+    other failure: what one provider refuses, another may accept, and a refusal
+    comes back at once rather than costing a timeout.
 
     What is deliberately *not* in it:
 
@@ -64,6 +63,44 @@ def _raise_for_status(status_code: int) -> None:
         raise LLMError("bad_request", f"provider returned {status_code}")
     if status_code >= 400:
         raise LLMError("unavailable", f"provider returned {status_code}")
+
+
+_KEY_SHAPED = re.compile(r"(?:sk-|gsk_|xai-|AIza)[A-Za-z0-9_*.\-]+")
+
+
+def _provider_said(resp) -> str:
+    """The provider's own explanation of a failure, safe to write to a log.
+
+    Only the error message is read, never the request, and it is cut short with
+    anything key-shaped removed: a rejected key's message quotes part of the key.
+    Never raises, because the failure being reported matters more than this.
+    """
+    try:
+        resp.read()
+        error = resp.json().get("error")
+        message = error.get("message") if isinstance(error, dict) else error
+        if not isinstance(message, str):
+            return ""
+        return _KEY_SHAPED.sub("[key]", message)[:300]
+    except Exception:
+        return ""
+
+
+def _raise_for_response(resp, provider_name: str) -> None:
+    """`_raise_for_status`, keeping the reason.
+
+    Only the status used to survive, so a provider rejecting every text question
+    with a sentence explaining why looked identical in the logs to any other
+    failure, and the rejection went undiagnosed for weeks.
+    """
+    if resp.status_code >= 400:
+        logger.warning(
+            "AI provider %s returned %s: %s",
+            provider_name,
+            resp.status_code,
+            _provider_said(resp) or "(no message)",
+        )
+    _raise_for_status(resp.status_code)
 
 
 def _raise_for_stream_error(obj: object) -> None:
@@ -179,8 +216,14 @@ class OpenAICompatProvider:
         api_key: str,
         model: str,
         supports_vision: bool = False,
+        use_responses_api: bool = False,
     ):
         self.name = name
+        # Every question goes through the Responses API rather than only those
+        # with a slide attached. Text questions sent through `/chat/completions`
+        # were being refused while `/responses` answered, so teachers with a
+        # slide on screen got answers and teachers without one got an error.
+        self._use_responses_api = use_responses_api
         self.model = model
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
@@ -194,11 +237,30 @@ class OpenAICompatProvider:
         """Build a Responses-API payload with the slide image attached to the
         latest user turn. Kept separate so it can be asserted in tests without
         making a paid API call."""
+        return self._responses_payload(system, messages, image_data_url=image_data_url)
+
+    def _responses_payload(
+        self,
+        system: str,
+        messages: list[ChatMessage],
+        *,
+        image_data_url: str | None = None,
+        stream: bool = True,
+    ) -> dict:
         history = messages[:-1] if messages else []
         last_user = messages[-1]["content"] if messages else ""
+        last_content: list[dict] = [{"type": "input_text", "text": last_user}]
+        if image_data_url is not None:
+            last_content.append(
+                {
+                    "type": "input_image",
+                    "image_url": image_data_url,
+                    "detail": settings.ai_image_detail,
+                }
+            )
         return {
             "model": self.model,
-            "stream": True,
+            "stream": stream,
             "input": [
                 {
                     "role": "system",
@@ -220,17 +282,7 @@ class OpenAICompatProvider:
                     }
                     for m in history
                 ],
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": last_user},
-                        {
-                            "type": "input_image",
-                            "image_url": image_data_url,
-                            "detail": settings.ai_image_detail,
-                        },
-                    ],
-                },
+                {"role": "user", "content": last_content},
             ],
         }
 
@@ -238,16 +290,18 @@ class OpenAICompatProvider:
         self, system: str, messages: list[ChatMessage], image_data_url: str
     ) -> Iterator[str]:
         """Stream an answer that also considers the rendered slide image."""
-        payload = self._vision_payload(system, messages, image_data_url)
+        yield from self._stream_responses(self._vision_payload(system, messages, image_data_url))
+
+    def _stream_responses(self, payload: dict, long_answer: bool = False) -> Iterator[str]:
         try:
             with httpx.stream(
                 "POST",
                 f"{self._base_url}/responses",
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json=payload,
-                timeout=settings.ai_timeout_seconds,
+                timeout=_timeout(long_answer),
             ) as resp:
-                _raise_for_status(resp.status_code)
+                _raise_for_response(resp, self.name)
                 for line in resp.iter_lines():
                     if not line or not line.startswith("data: "):
                         continue
@@ -280,9 +334,40 @@ class OpenAICompatProvider:
             "stream": stream,
         }
 
+    def _chat_responses(
+        self, system: str, messages: list[ChatMessage], long_answer: bool
+    ) -> str:
+        """One whole answer from the Responses API."""
+        try:
+            resp = httpx.post(
+                f"{self._base_url}/responses",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=self._responses_payload(system, messages, stream=False),
+                timeout=_timeout(long_answer),
+            )
+            _raise_for_response(resp, self.name)
+            # `output` also holds the model's reasoning, which is not the answer.
+            text = "".join(
+                part.get("text", "")
+                for item in resp.json()["output"]
+                for part in item.get("content", [])
+                if part.get("type") == "output_text"
+            ).strip()
+            if not text:
+                raise LLMError("unavailable", "provider sent an empty reply")
+            return text
+        except LLMError:
+            raise
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc) from exc
+        except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+            raise LLMError("unavailable", "provider sent an unreadable reply") from exc
+
     def chat(
         self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
     ) -> str:
+        if self._use_responses_api:
+            return self._chat_responses(system, messages, long_answer)
         try:
             resp = httpx.post(
                 f"{self._base_url}/chat/completions",
@@ -290,7 +375,7 @@ class OpenAICompatProvider:
                 json=self._payload(system, messages, stream=False),
                 timeout=_timeout(long_answer),
             )
-            _raise_for_status(resp.status_code)
+            _raise_for_response(resp, self.name)
             # `content` is null whenever the turn carried no text — a content
             # filter, a refusal, a tool call. `None.strip()` is an
             # AttributeError, which is neither LLMError nor httpx.HTTPError, so
@@ -311,6 +396,11 @@ class OpenAICompatProvider:
     def chat_stream(
         self, system: str, messages: list[ChatMessage], *, long_answer: bool = False
     ) -> Iterator[str]:
+        if self._use_responses_api:
+            yield from self._stream_responses(
+                self._responses_payload(system, messages), long_answer
+            )
+            return
         try:
             yield from self._stream_completions(system, messages, long_answer)
         except LLMError:
@@ -328,7 +418,7 @@ class OpenAICompatProvider:
             json=self._payload(system, messages, stream=True),
             timeout=_timeout(long_answer),
         ) as resp:
-            _raise_for_status(resp.status_code)
+            _raise_for_response(resp, self.name)
             for line in resp.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue
@@ -389,7 +479,7 @@ class AnthropicProvider:
                 },
                 timeout=_timeout(long_answer),
             )
-            _raise_for_status(resp.status_code)
+            _raise_for_response(resp, self.name)
             blocks = resp.json()["content"]
             if not isinstance(blocks, list):
                 raise LLMError("unavailable", "provider sent an unreadable reply")
@@ -434,7 +524,7 @@ class AnthropicProvider:
             },
             timeout=_timeout(long_answer),
         ) as resp:
-            _raise_for_status(resp.status_code)
+            _raise_for_response(resp, self.name)
             for line in resp.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue
@@ -450,12 +540,14 @@ class AnthropicProvider:
                         yield text
 
 
-# Failures the next provider might survive. A 400 is excluded deliberately: a
-# malformed request fails identically everywhere, so retrying it just spends
-# another provider's quota to get the same answer. `auth` is included because a
+# Failures the next provider might survive. A 400 is one of them: it was once
+# excluded on the theory that a malformed request fails identically everywhere,
+# but what a provider refuses depends on that provider's model and API, and a
+# teacher in front of a class got an error with working backups never asked.
+# `auth` is included because a
 # dead or revoked key must not take the assistant down mid-lesson — it is logged
 # loudly instead, since it is a misconfiguration rather than weather.
-RETRYABLE_KINDS = {"rate_limit", "quota", "timeout", "unavailable", "auth"}
+RETRYABLE_KINDS = {"rate_limit", "quota", "timeout", "unavailable", "auth", "bad_request"}
 
 
 class ProviderChain:
@@ -599,6 +691,7 @@ def _build(name: str) -> LLMProvider | None:
             api_key=settings.openai_api_key,
             model=settings.openai_model,
             supports_vision=True,
+            use_responses_api=True,
         )
     if name == "anthropic" and settings.anthropic_api_key:
         return AnthropicProvider(api_key=settings.anthropic_api_key, model=settings.anthropic_model)

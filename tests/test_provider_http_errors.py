@@ -175,23 +175,17 @@ def test_a_timeout_is_reported_as_a_timeout(monkeypatch):
 # --------------------------------------------------------------------------- #
 # Which statuses are worth asking somebody else about
 # --------------------------------------------------------------------------- #
-def test_a_400_is_the_requests_own_fault_and_stops_the_chain(failing_transport):
-    """`RETRYABLE_KINDS` has always excluded `bad_request`, on the grounds that a
-    malformed request fails identically everywhere and walking the chain to find
-    that out spends four timeouts of a lesson. No status produced that kind:
-    every 4xx landed on `unavailable`, which is retryable, so the exclusion
-    described a case that could not arise and the test for it built the error by
-    hand. This one comes off the wire.
-    """
+def test_a_400_is_named_for_what_it_is_and_still_reaches_the_backup(failing_transport):
+    """Off the wire: a 400 is `bad_request`, and the backup is asked anyway."""
     failing_transport(400)
-    backup = _Working()
-    chain = ProviderChain([_openai(), backup])
 
     with pytest.raises(LLMError) as err:
-        chain.chat("sys", [])
-
+        _openai().chat("sys", [])
     assert err.value.kind == "bad_request"
-    assert chain.name != "groq", "the backup must not have been asked"
+
+    chain = ProviderChain([_openai(), _Working()])
+    assert chain.chat("sys", []) == "answer from groq"
+    assert chain.name == "groq"
 
 
 @pytest.mark.parametrize("status", [404, 413, 418])
@@ -201,8 +195,7 @@ def test_the_rest_of_the_4xx_range_still_falls_through(failing_transport, status
     404 in particular: the model named in the configuration is missing at *this*
     provider, and the next one is configured with a different model that may
     well exist. That is the chain doing its job, not a request to refuse — and
-    it is the shape of the `/chat/completions` failure still under
-    investigation, which would have gone from falling through to fatal.
+    it is one shape a model-versus-endpoint mismatch takes.
     """
     failing_transport(status)
     chain = ProviderChain([_openai(), _Working()])
